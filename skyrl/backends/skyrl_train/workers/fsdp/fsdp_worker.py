@@ -29,6 +29,7 @@ from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import
 from skyrl.backends.skyrl_train.training_batch import (
     TrainingInputBatch,
 )
+from skyrl.backends.skyrl_train.utils.profiler import build_profiler_from_policy_cfg
 from skyrl.backends.skyrl_train.weight_sync import (
     LoraLoadRequest,
     WeightChunk,
@@ -197,6 +198,9 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             assert (
                 self.optimizer is not None and self.scheduler is not None
             ), "FSDP preparation should create optimizer and scheduler"
+
+        # create profiler (driven by the trainer via start/profile_step/stop RPCs)
+        self.profiler = build_profiler_from_policy_cfg(self.cfg)
 
     async def init_weight_sync_state(self, inference_engine_client, inference_engine_cfg: "InferenceEngineConfig"):
         # Call super first to set _transfer_strategy_cls and create sender/receivers
