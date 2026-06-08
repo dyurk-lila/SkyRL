@@ -16,11 +16,55 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
 from typing import Any, Optional
 
 import megatron.core.parallel_state as mpu
 import torch
 import torch.distributed as dist
+
+
+def _fused_linear_logprob_apply(
+    backend: str,
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    target: torch.Tensor,
+    vocab_start_index: int,
+    vocab_end_index: int,
+    chunk_size: int,
+    tp_group: torch.distributed.ProcessGroup,
+    inference_only: bool,
+) -> torch.Tensor:
+    """Dispatch the fused LM-head log-prob to the requested backend.
+
+    ``"torch"`` -> the pure-PyTorch :class:`FusedLinearLogprob` (default, runs anywhere).
+    ``"triton"`` -> the vendored flash-style Triton kernel (GPU only); transparently falls
+    back to the torch backend with a warning if Triton / its module is unavailable. Both
+    backends share the exact same call contract and are verified equivalent to the stock
+    logits path.
+    """
+    if backend == "triton":
+        try:
+            from skyrl.backends.skyrl_train.distributed.megatron.fused_linear_logprob_triton import (
+                FusedLinearLogprobTriton,
+                TRITON_AVAILABLE,
+            )
+
+            if not TRITON_AVAILABLE:
+                raise ImportError("triton is not installed")
+            return FusedLinearLogprobTriton.apply(
+                hidden, weight, target, vocab_start_index, vocab_end_index, chunk_size, tp_group, inference_only
+            )
+        except ImportError as e:
+            warnings.warn(
+                f"fused_linear_logprob_backend='triton' unavailable ({e}); falling back to the "
+                "pure-PyTorch backend. Install triton (and run on GPU) to use the fused Triton kernel.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+    return FusedLinearLogprob.apply(
+        hidden, weight, target, vocab_start_index, vocab_end_index, chunk_size, tp_group, inference_only
+    )
 
 
 @torch.no_grad()
@@ -265,6 +309,179 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
         return grad_input, None, None, None, None, None, None
 
 
+class FusedLinearLogprob(torch.autograd.Function):
+    """Fused LM-head + vocab-parallel log-prob of the target token.
+
+    A drop-in replacement for ``DistributedLogprob`` / ``ChunkedDistributedLogprob`` that
+    takes the *pre-projection hidden state* and the LM-head weight **shard** instead of
+    already-materialized ``[*, seq, vocab // TP]`` logits. The head GEMM is computed one
+    sequence-chunk at a time and is **recomputed in backward** (only ``hidden`` + ``weight``
+    are saved), so the full ``[*, seq, vocab // TP]`` logits tensor is never materialized.
+    For a 131k vocab at 32k context this is the dominant activation transient on the SFT
+    log-prob path, so eliminating it is the whole point.
+
+    Design ported from verl's fused linear-cross-entropy
+    (``verl/utils/kernel/linear_cross_entropy.py`` — the online-softmax TP all-reduce
+    scheme), re-implemented in pure PyTorch so it runs anywhere torch + NCCL/Gloo do
+    (no Triton / no specific GPU arch), with the per-chunk distributed log-softmax matching
+    SkyRL's existing ``_compute_distributed_log_softmax`` exactly.
+
+    Numerics (each are verified against the stock logits path in
+    ``tests/cpu/distributed/test_fused_linear_logprob.py``):
+      * forward: per seq-chunk, ``logits = (hidden_c @ weightᵀ).float()``; a vocab-parallel
+        stable log-softmax via ``all_reduce(MAX)`` then ``all_reduce(SUM of exp)``; gather the
+        target column (zeroed where the target is out-of-shard) and ``all_reduce(SUM)`` so
+        every rank holds the full-vocab log-prob. fp32 throughout (matches stock, which
+        upcasts logits to fp32 before the softmax).
+      * backward: recompute the per-chunk softmax in fp32, form ``dlogits = (onehot - softmax)
+        * grad_out`` (the gradient of ``log p(target)`` w.r.t. logits), then
+        ``grad_hidden = dlogits @ weight`` and ``grad_weight = dlogitsᵀ @ hidden``.
+
+    Tensor/sequence parallelism — IMPORTANT and the subtle part:
+      ``grad_hidden`` returned here is this rank's contribution **from its own vocab shard
+      only** (a partial; the full grad is the sum over TP shards). We deliberately do **NOT**
+      all-reduce it inside this Function. The TP reduction of the input gradient is the job of
+      the surrounding ``gather_from_sequence_parallel_region(..., tensor_parallel_output_grad=
+      True)`` call in the wrapper (its backward is a reduce-scatter over the TP group) — which
+      is *exactly* what stock ``ColumnParallelLinear`` does for its input gradient
+      (megatron ``tensor_parallel/layers.py``: ``gather_from_sequence_parallel_region(input,
+      tensor_parallel_output_grad=True, ...)``). So this Function + that gather together
+      reproduce the stock head's gradient bit-for-bit. When sequence-parallel is off (TP=1, or
+      a replicated-hidden layout), there is no gather and ``grad_hidden`` is already complete.
+      ``grad_weight`` is per-shard and needs no reduction (the DP all-reduce handles it), again
+      matching ``ColumnParallelLinear``.
+
+    Args (forward):
+        hidden: ``[B, S, H]`` pre-projection hidden state (TP-replicated, or SP-gathered by the
+            caller so it is replicated here).
+        weight: this rank's LM-head weight shard ``[vocab // TP, H]``.
+        target: ``[B, S]`` already-shifted target token ids (caller shifts, exactly as the
+            stock logits path expects).
+        vocab_start_index / vocab_end_index: this shard's global vocab range.
+        chunk_size: sequence-dim chunk size for the head GEMM (bounds the transient).
+        tp_group: tensor-parallel process group for the vocab all-reduces.
+        inference_only: if True, skip saving tensors for backward.
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx: Any,
+        hidden: torch.Tensor,
+        weight: torch.Tensor,
+        target: torch.Tensor,
+        vocab_start_index: int,
+        vocab_end_index: int,
+        chunk_size: int,
+        tp_group: torch.distributed.ProcessGroup,
+        inference_only: bool = False,
+    ) -> torch.Tensor:
+        # Mask of target ids NOT owned by this shard (1 == masked / not here).
+        target_mask = (target < vocab_start_index) | (target >= vocab_end_index)
+        masked_target = (target - vocab_start_index).clamp_(min=0)
+        masked_target[target_mask] = 0
+
+        partition_vocab_size = int(weight.shape[0])
+        seq_size = int(hidden.shape[1])
+        num_chunks = max(1, (seq_size + chunk_size - 1) // chunk_size)
+
+        all_log_probs = []
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * chunk_size
+            chunk_end = min(seq_size, (chunk_idx + 1) * chunk_size)
+
+            # Head GEMM for this chunk only, upcast to fp32 (cast hidden to the weight dtype
+            # first, exactly as ColumnParallelLinear would before the GEMM).
+            logits = (hidden[:, chunk_start:chunk_end, :].to(weight.dtype) @ weight.t()).float()
+
+            log_probs = _compute_distributed_log_softmax(logits, group=tp_group)
+
+            chunk_log_probs = torch.gather(
+                log_probs, -1, masked_target[:, chunk_start:chunk_end].unsqueeze(-1)
+            ).squeeze(-1)
+            chunk_log_probs[target_mask[:, chunk_start:chunk_end]] = 0.0
+            torch.distributed.all_reduce(
+                chunk_log_probs, op=torch.distributed.ReduceOp.SUM, group=tp_group
+            )
+            all_log_probs.append(chunk_log_probs)
+
+        log_probs = torch.cat(all_log_probs, dim=1)
+
+        if not inference_only:
+            ctx.save_for_backward(hidden, weight, target_mask, masked_target)
+            ctx.chunk_size = chunk_size
+            ctx.tp_group = tp_group
+            ctx.vocab_start_index = vocab_start_index
+            ctx.vocab_end_index = vocab_end_index
+
+        return log_probs
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        *grad_outputs: torch.Tensor,
+    ) -> tuple:
+        grad_output = grad_outputs[0]
+        hidden, weight, target_mask, masked_target = ctx.saved_tensors
+        chunk_size = ctx.chunk_size
+        tp_group = ctx.tp_group
+
+        partition_vocab_size = int(weight.shape[0])
+        seq_size = int(hidden.shape[1])
+        num_chunks = max(1, (seq_size + chunk_size - 1) // chunk_size)
+
+        grad_hidden = torch.zeros_like(hidden)
+        # weight grad is accumulated in fp32 for stability across chunks, then cast back.
+        grad_weight = torch.zeros_like(weight, dtype=torch.float32)
+
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * chunk_size
+            chunk_end = min(seq_size, (chunk_idx + 1) * chunk_size)
+
+            hidden_c = hidden[:, chunk_start:chunk_end, :]
+            # Recompute the per-chunk distributed softmax (NOT log-softmax) in fp32.
+            logits = (hidden_c.to(weight.dtype) @ weight.t()).float()
+            softmax = _compute_distributed_log_softmax(logits, group=tp_group).exp_()
+
+            # d(log p(target))/dlogits = onehot(target) - softmax, scaled by grad_output.
+            # Build the gradient as (-softmax) then add grad_output at the chosen positions —
+            # the same memory-efficient scatter-add as ChunkedDistributedLogprob.backward (no
+            # [B, chunk, V] one-hot materialized).
+            chunk_target_mask = target_mask[:, chunk_start:chunk_end]
+            chunk_masked_target = masked_target[:, chunk_start:chunk_end]
+            chunk_grad_output = grad_output[:, chunk_start:chunk_end]
+
+            batch_size = softmax.shape[0]
+            chunk_len = chunk_end - chunk_start
+            row = (
+                torch.arange(batch_size, device=softmax.device)
+                .view(-1, 1)
+                .expand(-1, chunk_len)
+                .reshape(-1)
+            )
+            col = torch.arange(chunk_len, device=softmax.device).expand(batch_size, -1).reshape(-1)
+            flat_idx = (row * chunk_len + col) * partition_vocab_size
+
+            valid_mask = ~chunk_target_mask
+            flat_chosen = flat_idx.masked_select(valid_mask.reshape(-1)) + chunk_masked_target.masked_select(
+                valid_mask
+            )
+
+            dlogits = softmax.neg_()
+            dlogits.mul_(chunk_grad_output.unsqueeze(-1))
+            grad_output_selected = chunk_grad_output.masked_select(valid_mask)
+            dlogits.view(-1).scatter_add_(0, flat_chosen, grad_output_selected)
+
+            # Project the chunk's logit-grad back. grad_hidden is this shard's PARTIAL
+            # contribution (TP reduction handled by the caller's SP-gather backward; see the
+            # class docstring). grad_weight is per-shard and needs no reduction.
+            grad_hidden[:, chunk_start:chunk_end, :] = (dlogits @ weight.float()).to(grad_hidden.dtype)
+            _h = hidden_c.float().reshape(-1, hidden_c.shape[-1])
+            grad_weight += dlogits.reshape(-1, partition_vocab_size).t() @ _h
+
+        # if you add an argument to the forward method, add a corresponding None here
+        return grad_hidden, grad_weight.to(weight.dtype), None, None, None, None, None, None
+
+
 def from_parallel_logits_to_logprobs(
     vocab_parallel_logits: torch.Tensor,
     target: torch.Tensor,
@@ -274,12 +491,15 @@ def from_parallel_logits_to_logprobs(
     inference_only: bool = False,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     chunk_size: Optional[int] = None,
+    lm_head_weight: Optional[torch.Tensor] = None,
+    fused_backend: str = "torch",
 ) -> torch.Tensor:
     """Get log probabilities from TP+CP sharded vocab logits.
 
     Args:
         vocab_parallel_logits (torch.Tensor): Logits tensor with shape [batch_size, seq_len // CP, vocab_size // TP]
-            where TP is the tensor parallel size.
+            where TP is the tensor parallel size. When ``lm_head_weight`` is provided this is instead the
+            *pre-projection hidden state* with shape [batch_size, seq_len // CP, hidden_size] (see below).
         target (torch.Tensor): Target token indices with shape [batch_size, seq_len].
             NOTE: Must be the unmodified targets as this function will shift them internally.
         vocab_start_index (int): Starting vocabulary index for this worker's partition.
@@ -288,6 +508,16 @@ def from_parallel_logits_to_logprobs(
         inference_only (bool, optional): If True, tensors won't be saved for backward pass. Defaults to False.
         cp_group (torch.distributed.ProcessGroup, optional): Context parallelism process group. Defaults to None.
         chunk_size (int, optional): Sequence dimension chunk size for computing the log probabilities.
+        lm_head_weight (torch.Tensor, optional): When provided, enables the fused LM-head path:
+            ``vocab_parallel_logits`` is interpreted as the pre-projection hidden state
+            [batch_size, seq_len // CP, hidden_size] and ``lm_head_weight`` is this rank's LM-head weight
+            shard [vocab_size // TP, hidden_size]. The head GEMM is fused into the chunked log-prob so the
+            full [*, seq, vocab // TP] logits are never materialized. ``vocab_start_index`` /
+            ``vocab_end_index`` must describe this shard's vocab range (i.e. derived from
+            ``lm_head_weight.shape[0]``). See :class:`FusedLinearLogprob`.
+        fused_backend (str, optional): Implementation for the fused path when ``lm_head_weight`` is set:
+            ``"torch"`` (default, pure-PyTorch, runs anywhere) or ``"triton"`` (vendored flash-style
+            kernel, GPU only, falls back to torch if unavailable). Ignored when ``lm_head_weight`` is None.
 
     Returns:
         torch.Tensor: Log probabilities tensor with shape [batch_size, seq_len-1].
@@ -314,7 +544,22 @@ def from_parallel_logits_to_logprobs(
     # vocab_parallel_logits and recomputes softmax in backward (~3x peak memory
     # vs DistributedLogprob's ~2x), so chunking actively hurts in that regime.
     seq_len_local = vocab_parallel_logits.shape[1]
-    if chunk_size is not None and chunk_size < seq_len_local:
+    if lm_head_weight is not None:
+        # Fused LM-head path: vocab_parallel_logits is the hidden state. Always chunk (the
+        # Function handles num_chunks==1); the whole point is to not materialize logits.
+        fused_chunk = chunk_size if (chunk_size is not None and chunk_size > 0) else seq_len_local
+        logprobs: torch.Tensor = _fused_linear_logprob_apply(
+            fused_backend,
+            vocab_parallel_logits,
+            lm_head_weight,
+            target,
+            vocab_start_index,
+            vocab_end_index,
+            fused_chunk,
+            tp_group,
+            inference_only,
+        ).contiguous()
+    elif chunk_size is not None and chunk_size < seq_len_local:
         logprobs: torch.Tensor = ChunkedDistributedLogprob.apply(  # type: ignore
             vocab_parallel_logits,
             target,
@@ -357,12 +602,17 @@ def from_parallel_logits_to_logprobs_packed_sequences(
     chunk_size: Optional[int] = None,
     attention_mask: Optional[torch.Tensor] = None,
     sub_seq_lengths: Optional[list[list[int]]] = None,
+    lm_head_weight: Optional[torch.Tensor] = None,
+    fused_backend: str = "torch",
 ) -> torch.Tensor:
     """Get log probabilities from TP sharded vocab logits for packed sequences.
 
     Args:
         vocab_parallel_logits (torch.Tensor): Packed logits tensor with shape [1, T // CP, vocab_size//TP]
-            where T is the total number of tokens across all packed sequences.
+            where T is the total number of tokens across all packed sequences. When ``lm_head_weight`` is
+            provided this is instead the packed pre-projection hidden state [1, T // CP, hidden_size]
+            (the fused LM-head path; see :func:`from_parallel_logits_to_logprobs` and
+            :class:`FusedLinearLogprob`).
         target (torch.Tensor): Packed target token indices with shape [1, T].
             NOTE: Must be the unmodified targets as this function will shift them internally.
         cu_seqlens (torch.Tensor): Cumulative sequence lengths tensor with shape [batch_size + 1].
@@ -423,7 +673,23 @@ def from_parallel_logits_to_logprobs_packed_sequences(
     # vocab_parallel_logits and recomputes softmax in backward (~3x peak memory
     # vs DistributedLogprob's ~2x), so chunking actively hurts in that regime.
     seq_len_local = vocab_parallel_logits.shape[1]
-    if chunk_size is not None and chunk_size < seq_len_local:
+    if lm_head_weight is not None:
+        # Fused LM-head path: vocab_parallel_logits is the packed hidden state [1, T // CP, H].
+        # rolled_targets is already shifted per-sequence above, so FusedLinearLogprob must NOT
+        # shift again — it doesn't (it takes pre-shifted targets, like DistributedLogprob here).
+        fused_chunk = chunk_size if (chunk_size is not None and chunk_size > 0) else seq_len_local
+        probs: torch.Tensor = _fused_linear_logprob_apply(
+            fused_backend,
+            vocab_parallel_logits,
+            lm_head_weight,
+            rolled_targets,
+            vocab_start_index,
+            vocab_end_index,
+            fused_chunk,
+            group,
+            inference_only,
+        ).contiguous()
+    elif chunk_size is not None and chunk_size < seq_len_local:
         probs: torch.Tensor = ChunkedDistributedLogprob.apply(  # type: ignore
             vocab_parallel_logits,
             rolled_targets,

@@ -34,6 +34,82 @@ from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
 from skyrl.train.config import TrainerConfig
 
 
+def _install_fused_lm_head_capture(actor_module: List[nn.Module], holder: dict) -> bool:
+    """Wrap each last-pipeline-stage model's ``output_layer.forward`` to return the
+    pre-projection hidden state (skipping the vocab GEMM) so the fused log-prob can apply the
+    head per sequence-chunk and never materialize the full ``[*, seq, vocab // TP]`` logits.
+
+    This is the SkyRL-side, megatron-source-free realisation of "return hidden instead of
+    logits" (cf. verl's ``model_forward_fused``): we replace only the ``output_layer.forward``
+    so the surrounding model forward (its ``_scale_logits`` + ``transpose`` to ``[b, s, h]``)
+    is unchanged. The replacement:
+      * resolves the LM-head weight from the ``weight=`` kwarg the model passes — which is
+        ``shared_embedding_or_output_weight()`` — so **tied embeddings are handled for free**
+        (no ``output_layer.weight is None`` crash); falls back to ``self.weight`` otherwise;
+      * when the layer is sequence-parallel, gathers the hidden across TP with
+        ``tensor_parallel_output_grad=True`` (its backward is a reduce-scatter — exactly what
+        stock ``ColumnParallelLinear`` does for its input gradient, so the fused function's
+        per-shard ``grad_hidden`` is reduced correctly without any extra all-reduce);
+      * stashes the resolved weight in ``holder["weight"]`` for ``loss_func`` to read, and
+        returns the (gathered) hidden in the logits position with a ``None`` bias.
+
+    Returns True if the capture was installed on at least one stage. Returns False (caller
+    falls back to the stock logits path) when the model uses MuP output scaling — the fused
+    path bypasses ``_scale_logits`` so it would be silently wrong — or has no ``output_layer``.
+    Raises on a genuinely unexpected megatron layout (fail loud, never silently mis-train).
+    """
+    from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
+    from megatron.core.utils import unwrap_model
+
+    installed = False
+    for vp_model in actor_module:
+        model = unwrap_model(vp_model)
+        output_layer = getattr(model, "output_layer", None)
+        if output_layer is None:
+            # Not the last pipeline stage (or no head here) — nothing to capture.
+            continue
+        # MuP / post-projection logit scaling is applied AFTER output_layer in the model
+        # forward; the fused path skips it, so it is unsupported — fall back to stock.
+        model_config = getattr(model, "config", None)
+        if model_config is not None and getattr(model_config, "use_mup", False):
+            return False
+        if getattr(output_layer, "_skyrl_fused_lm_head_wrapped", False):
+            installed = True
+            continue
+
+        orig_forward = output_layer.forward
+        tp_group = getattr(output_layer, "tp_group", None) or mpu.get_tensor_model_parallel_group()
+
+        def make_capture(layer, original, tpg):
+            def fused_output_layer_forward(input_, weight=None, runtime_gather_output=None):
+                w = weight if weight is not None else getattr(layer, "weight", None)
+                if w is None:
+                    # Tied-embedding stage with no allocated head weight AND none passed in:
+                    # we cannot fuse safely — defer to the original projection.
+                    return original(input_, weight=weight, runtime_gather_output=runtime_gather_output)
+                hidden = input_
+                if getattr(layer, "sequence_parallel", False):
+                    # Gather the sequence-parallel-scattered hidden across TP. Its backward is a
+                    # reduce-scatter (tensor_parallel_output_grad=True), which reduces the fused
+                    # function's per-shard grad_hidden exactly as ColumnParallelLinear would.
+                    hidden = gather_from_sequence_parallel_region(
+                        hidden, tensor_parallel_output_grad=True, group=tpg
+                    )
+                holder["weight"] = w
+                # Return hidden in the logits position (+ no bias). The model's _scale_logits is
+                # identity here (MuP excluded above) and its transpose yields [b, s, h].
+                return hidden, None
+
+            return fused_output_layer_forward
+
+        output_layer.forward = make_capture(output_layer, orig_forward, tp_group)
+        output_layer._skyrl_fused_lm_head_wrapped = True
+        output_layer._skyrl_fused_lm_head_orig_forward = orig_forward
+        installed = True
+
+    return installed
+
+
 def _build_packed_targets(
     sequences: torch.Tensor,
     attention_mask: torch.Tensor,
@@ -86,6 +162,18 @@ class MegatronModelWrapper:
         self.policy_loss_fn = policy_loss_fn
         self.remove_microbatch_padding = self.cfg.remove_microbatch_padding
 
+        # Fused LM-head log-prob (optional): when enabled, replace output_layer.forward so the
+        # model returns its pre-projection hidden state and the head GEMM is fused into the
+        # chunked log-prob (the full [*, seq, vocab // TP] logits never materialize). The
+        # captured LM-head weight shard for the current microbatch lands in
+        # ``self._fused_lm_head["weight"]``; it is None when fusion is off or unsupported
+        # (e.g. MuP), in which case every path uses the stock logits computation unchanged.
+        self.fused_linear_logprob = bool(getattr(self.cfg, "fused_linear_logprob", False))
+        self.fused_linear_logprob_backend = getattr(self.cfg, "fused_linear_logprob_backend", "torch")
+        self._fused_lm_head: dict = {"weight": None}
+        if self.fused_linear_logprob:
+            self.fused_linear_logprob = _install_fused_lm_head_capture(self.actor_module, self._fused_lm_head)
+
         config = get_model_config(self.actor_module[0])
         # This is set to None by default: https://github.com/NVIDIA/Megatron-LM/blob/07b22a05136a3cb08ece05f7de38cf6aeeb165fb/megatron/core/model_parallel_config.py#L95
         # use the build in finalize_model_grads function to all reduce gradients across parallelism dimensions
@@ -134,6 +222,14 @@ class MegatronModelWrapper:
             tp_grp = mpu.get_tensor_model_parallel_group()
             tp_rank = mpu.get_tensor_model_parallel_rank()
 
+            # Fused LM-head path: ``logits`` is actually the pre-projection hidden state and the
+            # head GEMM is fused into the chunked log-prob. The vocab range is derived from the
+            # captured weight shard (NOT logits.shape[-1], which is hidden_size here). Applying
+            # temperature to the hidden state is exact (the head is linear: (h/τ)·W = (h·W)/τ).
+            fused_w = self._fused_lm_head["weight"] if self.fused_linear_logprob else None
+            fused_backend = self.fused_linear_logprob_backend
+            shard_vocab = fused_w.shape[0] if fused_w is not None else logits.shape[-1]
+
             if temperature != 1.0:
                 logits.div_(temperature)
 
@@ -143,25 +239,29 @@ class MegatronModelWrapper:
                     packed_targets,
                     packed_seq_params.cu_seqlens_q_padded,
                     sequences.shape[1],
-                    vocab_start_index=tp_rank * logits.shape[-1],
-                    vocab_end_index=(tp_rank + 1) * logits.shape[-1],
+                    vocab_start_index=tp_rank * shard_vocab,
+                    vocab_end_index=(tp_rank + 1) * shard_vocab,
                     group=tp_grp,
                     inference_only=True,
                     cp_group=mpu.get_context_parallel_group(),
                     chunk_size=self.cfg.logprobs_chunk_size,
                     attention_mask=data["attention_mask"],
                     sub_seq_lengths=data.get("sub_seq_lengths_list"),
+                    lm_head_weight=fused_w,
+                    fused_backend=fused_backend,
                 )
             else:
                 token_logprobs = from_parallel_logits_to_logprobs(
                     logits,
                     sequences,
-                    vocab_start_index=tp_rank * logits.shape[-1],
-                    vocab_end_index=(tp_rank + 1) * logits.shape[-1],
+                    vocab_start_index=tp_rank * shard_vocab,
+                    vocab_end_index=(tp_rank + 1) * shard_vocab,
                     tp_group=tp_grp,
                     inference_only=True,
                     cp_group=None,
                     chunk_size=self.cfg.logprobs_chunk_size,  # chunk seq dim to bound peak memory
+                    lm_head_weight=fused_w,
+                    fused_backend=fused_backend,
                 )
             return torch.tensor(0.0, device=token_logprobs.device), {"log_probs": token_logprobs}
 
@@ -314,7 +414,23 @@ class MegatronModelWrapper:
             tp_grp = mpu.get_tensor_model_parallel_group()
             tp_rank = mpu.get_tensor_model_parallel_rank()
 
-            # temperature normalization
+            # Fused LM-head path: ``logits`` is the pre-projection hidden state; the head GEMM
+            # is fused into the chunked log-prob and the vocab range comes from the captured
+            # weight shard. The RL entropy/KL terms below need the full per-position logits,
+            # which the fused path deliberately never materializes — so fusion serves ONLY the
+            # cross_entropy (SFT) loss here. ``_install_fused_lm_head_capture`` already returns
+            # hidden in the logits slot, so a non-CE loss with fusion on would be wrong; guard
+            # it. (RL fusion that also fuses entropy is a possible follow-up.)
+            fused_w = self._fused_lm_head["weight"] if self.fused_linear_logprob else None
+            if fused_w is not None and resolved_loss_name != "cross_entropy":
+                raise RuntimeError(
+                    "fused_linear_logprob is only supported for the cross_entropy (SFT) loss; "
+                    f"got loss={resolved_loss_name!r}. Disable fused_linear_logprob for this loss."
+                )
+            fused_backend = self.fused_linear_logprob_backend
+            shard_vocab = fused_w.shape[0] if fused_w is not None else logits.shape[-1]
+
+            # temperature normalization (exact on hidden: the head is linear)
             if temperature != 1.0:
                 logits.div_(temperature)
 
@@ -324,25 +440,29 @@ class MegatronModelWrapper:
                     packed_targets,
                     packed_seq_params.cu_seqlens_q_padded,
                     sequences.shape[1],
-                    vocab_start_index=tp_rank * logits.shape[-1],
-                    vocab_end_index=(tp_rank + 1) * logits.shape[-1],
+                    vocab_start_index=tp_rank * shard_vocab,
+                    vocab_end_index=(tp_rank + 1) * shard_vocab,
                     group=tp_grp,
                     inference_only=False,
                     cp_group=mpu.get_context_parallel_group(),
                     chunk_size=self.cfg.logprobs_chunk_size,
                     attention_mask=data["attention_mask"],
                     sub_seq_lengths=data.get("sub_seq_lengths_list"),
+                    lm_head_weight=fused_w,
+                    fused_backend=fused_backend,
                 )
             else:
                 token_logprobs = from_parallel_logits_to_logprobs(
                     logits,
                     sequences,
-                    vocab_start_index=tp_rank * logits.shape[-1],
-                    vocab_end_index=(tp_rank + 1) * logits.shape[-1],
+                    vocab_start_index=tp_rank * shard_vocab,
+                    vocab_end_index=(tp_rank + 1) * shard_vocab,
                     tp_group=tp_grp,
                     inference_only=False,
                     cp_group=None,
                     chunk_size=self.cfg.logprobs_chunk_size,  # chunk seq dim to bound peak memory
+                    lm_head_weight=fused_w,
+                    fused_backend=fused_backend,
                 )
 
             action_log_probs = token_logprobs[:, -num_actions:]
