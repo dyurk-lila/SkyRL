@@ -290,11 +290,19 @@ def _stock_entropy(hidden, weight_shard, chunk_size, grad_ent):
 
 
 def _entropy_worker(rank, world_size, port, chunk_size, with_oov, dtype_str, ret_dict):
+    import megatron.core.parallel_state as mpu
+
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
+    # The stock entropy reference (vocab_parallel_entropy) all-reduces over
+    # mpu.get_tensor_model_parallel_group(), so we must initialize Megatron's model-parallel
+    # state. With tensor_model_parallel_size=world_size the TP group spans all ranks — the same
+    # membership as the WORLD group the fused path uses as its tp_group — so both sides reduce
+    # over identical ranks. (The logprob test sidesteps this by referencing dist.group.WORLD.)
+    mpu.initialize_model_parallel(tensor_model_parallel_size=world_size)
     _prev_force_ieee = fused_linear_logprob_triton.FORCE_FP32_IEEE_PRECISION
     fused_linear_logprob_triton.FORCE_FP32_IEEE_PRECISION = dtype_str == "fp32"
     try:
@@ -336,6 +344,7 @@ def _entropy_worker(rank, world_size, port, chunk_size, with_oov, dtype_str, ret
         }
     finally:
         fused_linear_logprob_triton.FORCE_FP32_IEEE_PRECISION = _prev_force_ieee
+        mpu.destroy_model_parallel()
         dist.destroy_process_group()
 
 
