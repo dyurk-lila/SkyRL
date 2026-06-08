@@ -416,17 +416,21 @@ class MegatronModelWrapper:
 
             # Fused LM-head path: ``logits`` is the pre-projection hidden state; the head GEMM
             # is fused into the chunked log-prob and the vocab range comes from the captured
-            # weight shard. The RL entropy/KL terms below need the full per-position logits,
-            # which the fused path deliberately never materializes — so fusion serves ONLY the
-            # cross_entropy (SFT) loss here. ``_install_fused_lm_head_capture`` already returns
-            # hidden in the logits slot, so a non-CE loss with fusion on would be wrong; guard
-            # it. (RL fusion that also fuses entropy is a possible follow-up.)
+            # weight shard. RL needs a per-token entropy term, which the fused path never
+            # materializes as logits — but verl's fused kernel ALSO returns per-token entropy
+            # (its dual (log_probs, entropy) output). So when fusion is on AND the loss needs
+            # entropy, we request entropy from the SAME fused call (return_entropy=True) and
+            # route the RL entropy term through it; KL stays on the already-fused logprobs.
+            # SFT cross_entropy does NOT need entropy, so it keeps requesting logprob-only to
+            # save the extra entropy all-reduce. ``_install_fused_lm_head_capture`` returns
+            # hidden in the logits slot.
             fused_w = self._fused_lm_head["weight"] if self.fused_linear_logprob else None
-            if fused_w is not None and resolved_loss_name != "cross_entropy":
-                raise RuntimeError(
-                    "fused_linear_logprob is only supported for the cross_entropy (SFT) loss; "
-                    f"got loss={resolved_loss_name!r}. Disable fused_linear_logprob for this loss."
-                )
+            # The RL branch always needs per-token entropy: even when use_entropy_loss is False it
+            # still reports the `policy_entropy` metric (computed under no-grad). With fusion on,
+            # `logits` is the hidden state, so the stock vocab_parallel_entropy(logits) path is
+            # invalid — we MUST get entropy from the fused kernel. SFT cross_entropy never needs
+            # entropy, so it keeps requesting logprob-only (skips the extra entropy all-reduce).
+            want_fused_entropy = fused_w is not None and resolved_loss_name != "cross_entropy"
             fused_backend = self.fused_linear_logprob_backend
             shard_vocab = fused_w.shape[0] if fused_w is not None else logits.shape[-1]
 
@@ -434,8 +438,12 @@ class MegatronModelWrapper:
             if temperature != 1.0:
                 logits.div_(temperature)
 
+            # Per-token entropy captured from the fused kernel when requested (RL + use_entropy_loss
+            # + fusion on). Raw per-(packed-)token, NOT shifted/trimmed — the RL branch slices it.
+            fused_entropy_packed = None  # [T // CP] raw per-packed-token entropy (packed path)
+            fused_entropy_full = None  # [B, S] raw per-position entropy (non-packed path)
             if packed_seq_params is not None and packed_targets is not None:
-                token_logprobs = from_parallel_logits_to_logprobs_packed_sequences(
+                packed_out = from_parallel_logits_to_logprobs_packed_sequences(
                     logits,
                     packed_targets,
                     packed_seq_params.cu_seqlens_q_padded,
@@ -450,9 +458,14 @@ class MegatronModelWrapper:
                     sub_seq_lengths=data.get("sub_seq_lengths_list"),
                     lm_head_weight=fused_w,
                     fused_backend=fused_backend,
+                    return_entropy=want_fused_entropy,
                 )
+                if want_fused_entropy:
+                    token_logprobs, fused_entropy_packed = packed_out
+                else:
+                    token_logprobs = packed_out
             else:
-                token_logprobs = from_parallel_logits_to_logprobs(
+                nonpacked_out = from_parallel_logits_to_logprobs(
                     logits,
                     sequences,
                     vocab_start_index=tp_rank * shard_vocab,
@@ -463,7 +476,12 @@ class MegatronModelWrapper:
                     chunk_size=self.cfg.logprobs_chunk_size,  # chunk seq dim to bound peak memory
                     lm_head_weight=fused_w,
                     fused_backend=fused_backend,
+                    return_entropy=want_fused_entropy,
                 )
+                if want_fused_entropy:
+                    token_logprobs, fused_entropy_full = nonpacked_out
+                else:
+                    token_logprobs = nonpacked_out
 
             action_log_probs = token_logprobs[:, -num_actions:]
 
@@ -524,11 +542,23 @@ class MegatronModelWrapper:
                 }
                 return loss, metrics
 
-            # RL path: add optional KL/entropy terms
+            # RL path: add optional KL/entropy terms.
+            #
+            # Entropy source:
+            #   * Fusion ON (want_fused_entropy): the per-token entropy already came back from the
+            #     fused log-prob kernel above (verl's dual output). We reuse it — slicing/masking/
+            #     normalization EXACTLY as the stock logits path does, so the loss is unchanged:
+            #       - non-packed: slice the SAME action positions [:, -num_actions-1:-1] then
+            #         masked_mean over loss_mask (the fused entropy is per-position over the full
+            #         pre-roll sequence, so the slice reproduces stock byte-for-byte).
+            #       - packed: feed the raw per-token entropy into vocab_parallel_entropy_packed_
+            #         sequences via precomputed_entropy_tokens; ALL action-weighting + global-count
+            #         normalization + CP all-reduce stay identical (only the entropy SOURCE changes).
+            #   * Fusion OFF (default): stock path — compute entropy from materialized logits.
             with torch.set_grad_enabled(loss_config.use_entropy_loss):
                 if packed_seq_params is not None and packed_targets is not None:
                     entropy, entropy_for_loss = vocab_parallel_entropy_packed_sequences(
-                        logits,
+                        None if want_fused_entropy else logits,
                         packed_seq_params.cu_seqlens_q_padded,
                         sequences.shape[1],
                         num_actions,
@@ -536,10 +566,16 @@ class MegatronModelWrapper:
                         loss_mask,
                         mpu.get_context_parallel_group(),
                         sub_seq_lengths=data.get("sub_seq_lengths_list"),
+                        precomputed_entropy_tokens=fused_entropy_packed if want_fused_entropy else None,
                     )
                 else:
-                    action_logits = logits[:, -num_actions - 1 : -1, :]
-                    entropy_BS = vocab_parallel_entropy(action_logits)
+                    if want_fused_entropy:
+                        # fused_entropy_full is per-position [B, S]; slice the SAME action window
+                        # the stock path slices from logits ([:, -num_actions-1:-1, :]).
+                        entropy_BS = fused_entropy_full[:, -num_actions - 1 : -1]
+                    else:
+                        action_logits = logits[:, -num_actions - 1 : -1, :]
+                        entropy_BS = vocab_parallel_entropy(action_logits)
                     entropy = masked_mean(entropy_BS, loss_mask)
                     entropy_for_loss = entropy
 

@@ -1911,7 +1911,9 @@ class FusedLinearLogprobTriton(torch.autograd.Function):
 
     Contract (must match ``FusedLinearLogprob`` exactly):
       * ``apply(hidden, weight, target, vocab_start_index, vocab_end_index, chunk_size,
-        tp_group, inference_only=False) -> log_probs``.
+        tp_group, inference_only=False, return_entropy=False) -> log_probs`` (or
+        ``(log_probs, entropy)`` when ``return_entropy=True`` — verl's kernel already returns
+        per-token entropy as its 2nd output; we surface it and wire ``dentropy`` in backward).
       * ``hidden``: ``[B, S, H]`` (TP-replicated / SP-already-gathered by the caller).
       * ``weight``: this rank's LM-head shard ``[V // TP, H]``.
       * ``target``: ``[B, S]`` ALREADY shifted by the caller (we do NOT roll).
@@ -1959,7 +1961,12 @@ class FusedLinearLogprobTriton(torch.autograd.Function):
         chunk_size: int,
         tp_group: torch.distributed.ProcessGroup,
         inference_only: bool = False,
-    ) -> torch.Tensor:
+        return_entropy: bool = False,
+    ):
+        if return_entropy:
+            # An unused entropy output should give a None grad (skip dentropy) rather than a
+            # materialized zero — mirrors verl's FusedLinearForPPOFunction.
+            ctx.set_materialize_grads(False)
         if not _verl_logprob_kernel_available():
             raise RuntimeError(
                 "FusedLinearLogprobTriton requires Triton (and a CUDA device), but triton is not "
@@ -1994,7 +2001,9 @@ class FusedLinearLogprobTriton(torch.autograd.Function):
         weight_c = weight.contiguous()
 
         # temperature is pre-baked into `hidden` by the caller -> pass 1.0 here.
-        logprobs_flat, _entropy, _maximum, _accumulate, _entropy_b = efficient_entropy_forward(
+        # verl ALREADY computes per-token entropy alongside logprob (its dual-output dual). We
+        # surface it when requested; the kernel math is unchanged either way.
+        logprobs_flat, entropy_flat, _maximum, _accumulate, _entropy_b = efficient_entropy_forward(
             hidden_2d,
             weight_c,
             labels_verl.reshape(-1),
@@ -2016,6 +2025,14 @@ class FusedLinearLogprobTriton(torch.autograd.Function):
         fully_oov = owned_anywhere == 0  # [B, S] bool, identical on all ranks
         log_probs = log_probs.masked_fill(fully_oov, 0.0)
 
+        # Entropy is a property of the logit DISTRIBUTION, not the target — verl's entropy
+        # accumulator (_entropy_b) is computed over the OOB-masked logits (#2656 logits_for_lse
+        # path), and the label mask only affects the LOGPROB accumulator. So a fully-OOV target
+        # position still has a VALID entropy. We therefore do NOT masked_fill entropy at OOV
+        # positions (only logprobs get forced to 0). This matches stock _VocabParallelEntropy,
+        # which is target-agnostic.
+        entropy = entropy_flat.reshape(B, S).to(torch.float32) if return_entropy else None
+
         if not inference_only:
             ctx.save_for_backward(
                 hidden_2d,
@@ -2029,7 +2046,10 @@ class FusedLinearLogprobTriton(torch.autograd.Function):
             ctx.B, ctx.S, ctx.H = B, S, H
             ctx.tp_group = tp_group
             ctx.hidden_dtype = ctx_hidden_dtype
+            ctx.return_entropy = return_entropy
 
+        if return_entropy:
+            return log_probs, entropy
         return log_probs
 
     @staticmethod
@@ -2060,10 +2080,25 @@ class FusedLinearLogprobTriton(torch.autograd.Function):
         # original bug) drops the ``-softmax * grad_output`` term and makes grad-hidden / grad-weight
         # diverge from the reference at every OOV row. (``fully_oov`` is kept saved only to document
         # the forward masking; it is intentionally not applied to the backward gradient.)
-        dlogprobs = grad_output.reshape(-1).to(torch.float32).contiguous()
+        #
+        # With set_materialize_grads(False) (return_entropy path), grad_output may be None if the
+        # log-prob output is unused downstream; treat it as zeros (logprobs are always used in
+        # practice, but stay robust to match the torch Function's contract).
+        if grad_output is None:
+            dlogprobs = torch.zeros(B * S, dtype=torch.float32, device=hidden_2d.device)
+        else:
+            dlogprobs = grad_output.reshape(-1).to(torch.float32).contiguous()
 
-        # verl's reduction="none" backward needs a dentropy buffer; we discard entropy so pass 0.
-        dentropy = torch.zeros_like(dlogprobs)
+        # verl's reduction="none" backward needs a dentropy buffer. When entropy was requested,
+        # wire the incoming entropy grad (grad_outputs[1]) into it; the kernel's d_entropy term
+        # (d_logits += d_entropy * (-exp*accu_rcp) * (logits - entropy_b)) is verl's exact
+        # entropy backward, already vendored. Otherwise pass zeros (logprob-only behavior).
+        return_entropy = getattr(ctx, "return_entropy", False)
+        grad_entropy = grad_outputs[1] if (return_entropy and len(grad_outputs) > 1) else None
+        if grad_entropy is not None:
+            dentropy = grad_entropy.reshape(-1).to(torch.float32).contiguous()
+        else:
+            dentropy = torch.zeros_like(dlogprobs)
 
         d_hidden_2d, d_weight = efficient_entropy_backward(
             dlogprobs,
@@ -2086,5 +2121,5 @@ class FusedLinearLogprobTriton(torch.autograd.Function):
         # ``.to(grad_hidden.dtype)``).
         d_hidden = d_hidden_2d.reshape(B, S, H).to(ctx.hidden_dtype)
 
-        # (hidden, weight, target, vstart, vend, chunk, tp_group, inference_only)
-        return d_hidden, d_weight, None, None, None, None, None, None
+        # (hidden, weight, target, vstart, vend, chunk, tp_group, inference_only, return_entropy)
+        return d_hidden, d_weight, None, None, None, None, None, None, None
