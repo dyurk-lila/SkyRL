@@ -26,9 +26,10 @@ import multiprocessing as mp
 import os
 import random
 import tempfile
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict
 from math import ceil
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import ray
 import torch
@@ -665,6 +666,103 @@ def collate_sft_batch(examples: list, tokenizer) -> TrainingInputBatch:
     )
     batch.metadata = {"response_length": max_num_actions}
     return batch
+
+
+# ---------------------------------------------------------------------------
+# Async batch prefetcher (double-buffering)
+# ---------------------------------------------------------------------------
+
+
+class _BatchPrefetcher:
+    """Single-slot async double-buffer for the per-step collate.
+
+    The per-step slice + packing collate is CPU-heavy (numpy/torch on the
+    controller, ~14.7s at bs=1024 before vectorization) and runs serially on the
+    main thread, blocking the GPU. The slice for any step is fully deterministic
+    from ``(global_step, batch_size, len(tokenized))`` *given the current
+    ``tokenized`` order*, and the data order only changes at epoch boundaries
+    (``rng.shuffle``). So while step N's forward/backward runs on the GPU we can
+    compute step N+1's batch on a background thread, then hand it back instantly.
+
+    Correctness contract:
+
+    * The producer is a single function ``compute(step) -> batch`` that the
+      caller supplies; it must read the *current* ``tokenized`` order. The
+      training loop only ever submits a step whose slice is knowable in advance
+      — i.e. a step in the *same epoch* as the step currently running (no
+      reshuffle happens between them). At an epoch boundary the loop does not
+      prefetch; it reshuffles and then computes the first step of the new epoch
+      synchronously, so the prefetcher never serves a stale pre-shuffle batch.
+    * At most one batch is in flight (``max_workers=1``). The submitted step is
+      recorded so :meth:`get` can assert the retrieved batch matches the step the
+      caller expects, turning any mis-wiring into a loud failure rather than a
+      silent training-order corruption.
+    * The producer (collate) constructs fresh tensors per call and mutates no
+      shared state (verified: ``collate_sft_batch`` / ``DefaultCollator`` /
+      ``PackedDataCollator`` / the FFD packer are all stateless per call), so a
+      worker thread genuinely overlaps with the GPU stream — numpy/torch release
+      the GIL during the heavy array ops.
+
+    This component owns only its executor + a one-slot future; it holds no
+    reference to trainer state, which keeps the threading surface tiny.
+    """
+
+    def __init__(self, compute: Callable[[int], Any]):
+        self._compute = compute
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sft-prefetch")
+        self._future: Optional[Future] = None
+        self._pending_step: Optional[int] = None
+
+    def submit(self, step: int) -> None:
+        """Schedule the collate for ``step`` on the background thread.
+
+        Must not be called while a batch is already in flight (the single-slot
+        invariant); the training loop drains via :meth:`get` before resubmitting.
+        """
+        assert self._future is None, (
+            f"prefetch slot already occupied (pending step {self._pending_step}); "
+            f"call get() before submitting step {step}"
+        )
+        self._pending_step = step
+        self._future = self._executor.submit(self._compute, step)
+
+    def has_pending(self) -> bool:
+        return self._future is not None
+
+    def pending_step(self) -> Optional[int]:
+        return self._pending_step
+
+    def get(self, expected_step: int) -> Any:
+        """Block until the in-flight batch is ready and return it.
+
+        Asserts the in-flight batch was produced for ``expected_step`` so a
+        mis-wired submit/get pairing fails loudly instead of silently feeding the
+        wrong batch into training.
+        """
+        assert self._future is not None, "get() called with no pending prefetch"
+        assert self._pending_step == expected_step, (
+            f"prefetched step {self._pending_step} != expected step {expected_step}; "
+            f"refusing to serve a mismatched batch"
+        )
+        future = self._future
+        self._future = None
+        self._pending_step = None
+        # Propagates any exception raised inside the worker thread.
+        return future.result()
+
+    def clear(self) -> None:
+        """Drop any in-flight batch (used at an epoch boundary so a prefetch
+        scheduled against the pre-shuffle order can never be consumed)."""
+        if self._future is not None:
+            # Wait for the worker to finish so we don't leave a dangling thread
+            # touching ``tokenized`` while the main thread reshuffles it.
+            self._future.result()
+        self._future = None
+        self._pending_step = None
+
+    def shutdown(self) -> None:
+        self.clear()
+        self._executor.shutdown(wait=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1541,6 +1639,59 @@ class SFTTrainer:
         self._fire("on_epoch_start")
         epoch_in_progress = True
 
+        # ------------------------------------------------------------------
+        # Async data prefetch (double-buffering) setup
+        # ------------------------------------------------------------------
+        # ``_epoch_of`` maps a step to the epoch whose (post-shuffle) data order
+        # it reads. Two consecutive steps in the same epoch see the SAME
+        # ``tokenized`` order, so step N+1's slice is knowable while step N runs.
+        n_examples = len(tokenized)
+
+        def _epoch_of(step: int) -> int:
+            return (step * batch_size) // n_examples
+
+        # ``_slice_examples`` reproduces the loop's deterministic wrap-around
+        # slice for ``step`` against the *current* ``tokenized`` order. It must
+        # only be called for a step in the epoch matching the current order.
+        def _slice_examples(step: int) -> list:
+            start_idx = (step * batch_size) % n_examples
+            end_idx = start_idx + batch_size
+            if end_idx > n_examples:
+                return tokenized[start_idx:] + tokenized[: end_idx - n_examples]
+            return tokenized[start_idx:end_idx]
+
+        # The producer run on the background thread: slice + collate. The slice
+        # is materialized inside the worker (list-slicing under the GIL is cheap
+        # and the heavy numpy/torch packing then releases the GIL). It reads the
+        # ``tokenized`` order live, so the caller guarantees no reshuffle happens
+        # between submit and consume by only prefetching within an epoch.
+        def _compute_batch(step: int):
+            return self.collator(_slice_examples(step), batch_size=batch_size)
+
+        # Resolve the toggle: config flag, overridable OFF via env var so a run
+        # can be A/B'd without editing config. ``SKYRL_SFT_PREFETCH_DATA=0``
+        # forces it off regardless of config.
+        env_pref = os.environ.get("SKYRL_SFT_PREFETCH_DATA")
+        if env_pref is not None:
+            prefetch_enabled = env_pref.strip().lower() not in ("0", "false", "no", "off", "")
+        else:
+            prefetch_enabled = self.sft_cfg.prefetch_data
+        prefetcher: Optional[_BatchPrefetcher] = _BatchPrefetcher(_compute_batch) if prefetch_enabled else None
+        logger.info(f"SFT data prefetch (double-buffering): {'ENABLED' if prefetch_enabled else 'disabled'}")
+
+        # Whether the step about to run can prefetch its successor. The loop
+        # reshuffles ``tokenized`` after step N iff ``_epoch_of(N) > cur_epoch``
+        # (the same predicate the epoch-boundary block below uses). When a
+        # reshuffle would occur, step N+1 reads a DIFFERENT order than step N, so
+        # we must not prefetch it against the pre-shuffle order. Mirroring the
+        # loop's own reshuffle decision via ``cur_epoch`` (the authoritative loop
+        # state) keeps the predicate exact regardless of wrap-around alignment.
+        def _can_prefetch_next(step: int, cur_epoch: int) -> bool:
+            if prefetcher is None or step + 1 > num_steps:
+                return False
+            reshuffle_after_step = _epoch_of(step) > cur_epoch
+            return not reshuffle_after_step
+
         if self._torch_profiler_enabled:
             self.dispatch.start_profile("policy")
         try:
@@ -1549,15 +1700,29 @@ class SFTTrainer:
 
                 with Timer("step", all_timings):
 
-                    # Data loading with wrap-around
+                    # Data loading with wrap-around. With prefetch enabled this
+                    # measures only the (ideally ~0) wait for the already-running
+                    # background collate; without it, the full serial collate.
                     with Timer("data_loading", all_timings):
-                        start_idx = (self.global_step * batch_size) % len(tokenized)
-                        end_idx = start_idx + batch_size
-                        if end_idx > len(tokenized):
-                            batch_examples = tokenized[start_idx:] + tokenized[: end_idx - len(tokenized)]
+                        if prefetcher is not None and prefetcher.pending_step() == self.global_step:
+                            # Consume the batch prefetched during the previous
+                            # step. ``get`` asserts the in-flight step matches, so
+                            # a stale/mismatched batch fails loudly.
+                            batch = prefetcher.get(self.global_step)
                         else:
-                            batch_examples = tokenized[start_idx:end_idx]
-                        batch = self.collator(batch_examples, batch_size=batch_size)
+                            # No valid prefetch in flight (first step, or the
+                            # first step after an epoch reshuffle): compute the
+                            # current slice synchronously against the live order.
+                            batch = _compute_batch(self.global_step)
+
+                        # Kick off the NEXT step's collate on the background
+                        # thread so it overlaps this step's GPU work. Only when
+                        # the successor is in the same epoch (no reshuffle between
+                        # them) — cross-epoch prefetch would read the pre-shuffle
+                        # order, so it's deferred to a synchronous compute after
+                        # the reshuffle below.
+                        if _can_prefetch_next(self.global_step, current_epoch):
+                            prefetcher.submit(self.global_step + 1)
 
                     self._fire("on_step_start", batch=batch)
 
@@ -1648,6 +1813,15 @@ class SFTTrainer:
                 if epoch > current_epoch:
                     self._fire("on_epoch_end")
                     epoch_in_progress = False
+                    # Drain any in-flight prefetch BEFORE reshuffling so a
+                    # background collate can never read ``tokenized`` while it is
+                    # being shuffled, and so the next epoch's first step is
+                    # computed synchronously against the post-shuffle order.
+                    # ``_can_prefetch_next`` already withholds cross-epoch
+                    # submits, so this is normally a no-op — it's defense in
+                    # depth against the reshuffle/prefetch race.
+                    if prefetcher is not None:
+                        prefetcher.clear()
                     for _ in range(epoch - current_epoch):
                         rng.shuffle(tokenized)
                     current_epoch = epoch
@@ -1658,8 +1832,12 @@ class SFTTrainer:
 
                 self.global_step += 1
         finally:
-            # Always stop/flush the profiler when the loop exits (including via
-            # an exception) so the open trace window isn't leaked. No-op when off.
+            # Always tear down the prefetch thread (drains any in-flight batch
+            # and joins the worker) and stop/flush the profiler when the loop
+            # exits — including via an exception — so neither the trace window
+            # nor the background thread is leaked. Both are no-ops when off.
+            if prefetcher is not None:
+                prefetcher.shutdown()
             if self._torch_profiler_enabled:
                 self.dispatch.stop_profile("policy")
         self.global_step = min(self.global_step, num_steps)
