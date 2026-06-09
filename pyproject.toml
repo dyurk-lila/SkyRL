@@ -170,6 +170,27 @@ megatron = [
     "fast-hadamard-transform; sys_platform == 'linux'",
 ]
 
+# Opt-in extra that unlocks the Megatron-only "emerging" optimizers
+# (lion/muon/adaptive_muon and any others the package exposes via its registry).
+# Standalone and lower-risk: compose with the megatron extra, e.g.
+#   uv sync --extra megatron --extra emerging-optimizers
+# It is intentionally NOT folded into the `megatron` extra so the default Megatron
+# install is unchanged (adam/sgd only) and this heavier git dep stays opt-in.
+# The PyPI `emerging-optimizers` name is an NVIDIA placeholder (only 999.9.9), so the
+# real package is git-installed via [tool.uv.sources] below (import name:
+# `emerging_optimizers`). Megatron-core requires >=0.2 to enable these optimizers.
+emerging-optimizers = [
+    "emerging-optimizers; sys_platform == 'linux' and python_version >= '3.12'",
+]
+flashrl = [
+    "skyrl[skyrl-train]",
+    # NOTE: Custom vLLM wheel must be installed separately.
+    # See examples/train/flash_rl/README.md for installation instructions.
+    "flash-attn==2.8.3; sys_platform == 'linux'",
+    "torch==2.7.0; sys_platform == 'linux'",
+    "flashinfer-python; sys_platform == 'linux'",
+    "torchvision; sys_platform == 'linux'",
+]
 miniswe = [
     "skyrl[skyrl-train]",
     # NOTE (sumanthrh): Needs to be a commit after https://github.com/SWE-agent/mini-swe-agent/commit/4f5d445e99d13b5482478c23508bf2fbf7c0670c
@@ -425,6 +446,9 @@ megatron-bridge = {git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge", rev =
 # `git ls-tree <bridge-rev> 3rdparty/Megatron-LM`. This one is on the Megatron-LM
 # main branch (https://github.com/NVIDIA/Megatron-LM/tree/main), dated 8/12/26.
 megatron-core = {git = "https://github.com/NVIDIA/Megatron-LM", rev = "14346b65a2d0790e451919858f7771078105c5f0", marker = "sys_platform == 'linux'"}
+# emerging-optimizers (Megatron-only lion/muon/adaptive_muon/...): opt-in via the
+# `emerging-optimizers` extra. Its PyPI name is a placeholder, so install from git.
+emerging-optimizers = {git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers", branch = "main", marker = "sys_platform == 'linux'"}
 # NOTE (sumanthrh): This custom wheel of vllm-router includes a fix for /chat/completions endpoint: https://github.com/vllm-project/router/pull/162  on top of 0.1.14 as well as a new `sticky_least_loaded` policy: https://github.com/SumanthRH/router/tree/session-aware-lb
 vllm-router = [
     { url = "https://github.com/SumanthRH/router/releases/download/0.1.14.post1/vllm_router-0.1.14.post1-cp38-abi3-manylinux_2_35_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
