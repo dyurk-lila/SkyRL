@@ -3,9 +3,8 @@
 Runs WITHOUT GPUs or megatron-core: it exercises ``FusedLinearLogprob`` /
 ``from_parallel_logits_to_logprobs(lm_head_weight=...)`` against the stock logits path
 (``from_parallel_logits_to_logprobs`` over fully-materialized logits) on a real Gloo
-tensor-parallel process group. This is the verification the original downstream
-monkey-patch lacked: it checks the forward log-prob, the gradient w.r.t. the hidden
-state, AND the gradient w.r.t. the LM-head weight all match the unfused reference,
+tensor-parallel process group. It checks the forward log-prob, the gradient w.r.t. the
+hidden state, AND the gradient w.r.t. the LM-head weight all match the unfused reference,
 at TP=1 and TP=2, with and without out-of-shard targets.
 
     uv run --isolated --extra dev -- pytest -s \
@@ -15,18 +14,37 @@ at TP=1 and TP=2, with and without out-of-shard targets.
 """
 
 import os
+import sys
+from unittest.mock import MagicMock
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-import skyrl.backends.skyrl_train.distributed.megatron.model_utils as model_utils
-from skyrl.backends.skyrl_train.distributed.megatron.model_utils import (
-    FusedLinearLogprob,
+# ``model_utils`` imports ``megatron.core.parallel_state`` at module scope, but this test only
+# uses the pure-torch fused path and the gloo WORLD group — no real megatron-core. When it is not
+# installed (the CPU CI env, which has no ``--extra megatron``), stub the module so the import
+# resolves. This block runs at import scope so it also takes effect in the ``mp.spawn`` workers,
+# which start fresh interpreters and re-import this module. It is a no-op when megatron-core is
+# genuinely present (GPU CI / dev environments).
+try:  # pragma: no cover - exercised only when megatron-core is absent
+    import megatron.core.parallel_state  # noqa: F401
+except ModuleNotFoundError:
+    _megatron = MagicMock()
+    sys.modules["megatron"] = _megatron
+    sys.modules["megatron.core"] = _megatron.core
+    sys.modules["megatron.core.parallel_state"] = _megatron.core.parallel_state
+
+import skyrl.backends.skyrl_train.distributed.megatron.model_utils as model_utils  # noqa: E402
+from skyrl.backends.skyrl_train.distributed.megatron.model_utils import (  # noqa: E402
     from_parallel_logits_to_logprobs,
     vocab_parallel_entropy,
 )
+
+# This is a megatron-backend test; mark it so ``-m megatron`` selects it where megatron-core is
+# installed. The CPU job does not filter by marker, so the pure-torch path still runs there.
+pytestmark = pytest.mark.megatron
 
 
 def _stock_logprobs(hidden, weight_shard, target, vstart, vend, chunk_size):
@@ -98,9 +116,7 @@ def _worker(rank, world_size, port, chunk_size, with_oov, ret_dict):
 
         # Reference and fused both run on the SAME shard over the SAME tp_group, so every
         # quantity compares per-rank with no cross-rank reduction needed.
-        lp_ref, gh_ref, gw_ref, grad_seed = _stock_logprobs(
-            hidden, weight_shard, target, vstart, vend, chunk_size
-        )
+        lp_ref, gh_ref, gw_ref, grad_seed = _stock_logprobs(hidden, weight_shard, target, vstart, vend, chunk_size)
         lp_fused, gh_fused, gw_fused = _fused_logprobs(
             hidden, weight_shard, target, vstart, vend, chunk_size, grad_seed
         )
@@ -172,14 +188,16 @@ def test_fused_matches_stock_logits_path(world_size, chunk_size, with_oov):
 
 
 def _point_entropy_tp_group_at_world():
-    """Make stock ``vocab_parallel_entropy`` reduce over the gloo WORLD group.
+    """Point stock ``vocab_parallel_entropy`` at the gloo WORLD group; return the original accessor.
 
-    ``_VocabParallelEntropy`` reduces over ``mpu.get_tensor_model_parallel_group()``. In this
-    CPU test the tensor-parallel group IS the WORLD process group, so point mpu's accessor at it
-    (works whether mpu is real megatron-core on CI/linux or a lightweight stub) so the reference
-    and the fused path reduce over the identical group.
+    ``_VocabParallelEntropy`` reduces over ``mpu.get_tensor_model_parallel_group()``. In this CPU
+    test the tensor-parallel group IS the WORLD process group, so point mpu's accessor at it (works
+    whether mpu is real megatron-core on CI/linux or the lightweight stub) so the reference and the
+    fused path reduce over the identical group. The caller restores the returned original.
     """
+    original = model_utils.mpu.get_tensor_model_parallel_group
     model_utils.mpu.get_tensor_model_parallel_group = lambda: dist.group.WORLD
+    return original
 
 
 def _entropy_worker(rank, world_size, port, chunk_size, with_oov, ret_dict):
@@ -188,8 +206,8 @@ def _entropy_worker(rank, world_size, port, chunk_size, with_oov, ret_dict):
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
+    _orig_tp_group_accessor = _point_entropy_tp_group_at_world()
     try:
-        _point_entropy_tp_group_at_world()
         torch.manual_seed(0)  # identical across ranks => identical hidden/weight/target
 
         batch_size, seq_len, hidden_size, vocab_size = 3, 24, 32, 256
@@ -265,6 +283,7 @@ def _entropy_worker(rank, world_size, port, chunk_size, with_oov, ret_dict):
             "gw_max_abs": float((gw_fused - gw_ref).abs().max()),
         }
     finally:
+        model_utils.mpu.get_tensor_model_parallel_group = _orig_tp_group_accessor
         dist.destroy_process_group()
 
 

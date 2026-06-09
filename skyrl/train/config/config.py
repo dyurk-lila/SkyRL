@@ -724,10 +724,11 @@ class TrainerConfig(BaseConfig):
     transient on the log-prob path at large vocab / long context). The model returns its
     pre-projection hidden state and the head GEMM is applied per sequence-chunk inside the fused
     log-prob (recomputed in backward). Numerically equivalent to the stock logits path (verified
-    in ``tests/.../megatron/test_fused_linear_logprob.py``); ``False`` keeps the byte-identical
-    stock behaviour. Uses ``logprobs_chunk_size`` for the chunk width.
+    in ``tests/backends/skyrl_train/cpu/megatron/test_fused_linear_logprob.py``); ``False`` keeps
+    the byte-identical stock behaviour. Uses ``logprobs_chunk_size`` for the chunk width.
     NOTE: not applied when the model uses MuP output scaling (``use_mup``) or any post-projection
-    logit transform — those fall back to the stock path automatically (see the Megatron worker)."""
+    logit transform — those fall back to the stock path automatically (see
+    ``_install_fused_lm_head_capture`` in the Megatron model wrapper)."""
     fused_linear_logprob_backend: str = "torch"
     """Implementation for ``fused_linear_logprob`` (ignored when that is ``False``):
     ``"torch"`` — pure-PyTorch chunked kernel; runs anywhere (CPU/GPU), no extra deps; bounds but
