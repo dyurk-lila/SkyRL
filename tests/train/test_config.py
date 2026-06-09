@@ -202,13 +202,25 @@ class TestOptimizerConfig:
         assert cfg.trainer.policy.optimizer_config.optimizer == "adam"
         assert cfg.trainer.critic.optimizer_config.optimizer == "adam"
 
-    @pytest.mark.parametrize("optimizer", ["adam", "sgd", "lion", "muon", "soap"])
-    def test_supported_optimizer_values_accepted(self, optimizer):
+    @pytest.mark.parametrize("optimizer", ["adam", "sgd", "lion", "muon", "adaptive_muon", "soap"])
+    def test_cross_backend_core_and_emerging_optimizers_accepted_at_config(self, optimizer):
+        # Config validation accepts the cross-backend core (adam/sgd) AND any emerging name:
+        # the emerging set is not statically owned by SkyRL, so the string is passed through and
+        # validated by the backend (Megatron-core / build_fsdp_optimizer), never silently dropped.
         assert OptimizerConfig(optimizer=optimizer).optimizer == optimizer
 
-    @pytest.mark.parametrize("optimizer", ["adamw", "Adam", "rmsprop", "", "lamb"])
-    def test_invalid_optimizer_rejected(self, optimizer):
-        with pytest.raises(ValueError, match="Invalid optimizer"):
+    @pytest.mark.parametrize("optimizer", ["arbitrary_emerging_name", "rmsprop", "lamb"])
+    def test_unknown_emerging_names_deferred_to_backend_not_rejected_at_config(self, optimizer):
+        # Per the chosen design (Option A), config validation does NOT hardcode an emerging
+        # allow-list. Plausible-but-unknown names are accepted here and fail later at the backend
+        # (Megatron-core construction or FSDP NotImplementedError) — never silently mis-dispatched.
+        assert OptimizerConfig(optimizer=optimizer).optimizer == optimizer
+
+    @pytest.mark.parametrize("optimizer", ["adamw", "", None, 123])
+    def test_clearly_invalid_optimizer_rejected_at_config(self, optimizer):
+        # The only names rejected at config time are ones SkyRL can authoritatively rule out:
+        # the `adamw` confusion (use `adam`), and non-string/empty values.
+        with pytest.raises(ValueError):
             OptimizerConfig(optimizer=optimizer)
 
     def test_optimizer_flows_through_build_nested_dataclass(self):
@@ -220,38 +232,45 @@ class TestOptimizerConfig:
         assert cfg.trainer.policy.optimizer_config.optimizer == "sgd"
 
     def test_invalid_optimizer_rejected_via_cli_override(self):
-        with pytest.raises(ValueError, match="Invalid optimizer"):
-            SkyRLTrainConfig.from_cli_overrides(["trainer.policy.optimizer_config.optimizer=rmsprop"])
+        # `adamw` is the one alias SkyRL authoritatively rejects at config time (use `adam`).
+        with pytest.raises(ValueError, match="adamw"):
+            SkyRLTrainConfig.from_cli_overrides(["trainer.policy.optimizer_config.optimizer=adamw"])
 
     def test_invalid_optimizer_rejected_via_from_dict_config(self):
         # Lock in the Hydra/OmegaConf entry (from_dict_config -> build_nested_dataclass
         # -> __post_init__) rejecting an invalid value, not just the CLI-override path.
-        cfg = OmegaConf.create({"optimizer": "rmsprop"})
-        with pytest.raises(ValueError, match="Invalid optimizer"):
+        cfg = OmegaConf.create({"optimizer": "adamw"})
+        with pytest.raises(ValueError, match="adamw"):
             OptimizerConfig.from_dict_config(cfg)
 
     def test_valid_optimizer_accepted_via_from_dict_config(self):
         cfg = OmegaConf.create({"optimizer": "sgd"})
         assert OptimizerConfig.from_dict_config(cfg).optimizer == "sgd"
 
+    def test_sgd_momentum_field_defaults_to_zero(self):
+        # Default 0.0 preserves the historical FSDP SGD (momentum-free) behavior and is the
+        # value forwarded to both backends; the default `adam` path is unaffected by it.
+        assert OptimizerConfig().sgd_momentum == 0.0
+        assert OptimizerConfig(optimizer="sgd", sgd_momentum=0.9).sgd_momentum == 0.9
+
     def test_optimizer_class_attrs_excluded_from_dataclass_fields(self):
-        # The allow-list tuples are plain (non-annotated) class attributes, so they must
-        # NOT be dataclass fields. This is what keeps them out of ``asdict()`` and the
-        # strict key validator, and is the basis for the byte-identical default claim:
-        # the only new serialized field is ``optimizer`` (default "adam").
+        # The informational tuples are plain (non-annotated) class attributes, so they must
+        # NOT be dataclass fields. This keeps them out of ``asdict()`` and the strict key
+        # validator. The new serialized fields are ``optimizer`` (default "adam") and
+        # ``sgd_momentum`` (default 0.0); neither perturbs the default adam path.
         import dataclasses
 
         field_names = {f.name for f in dataclasses.fields(OptimizerConfig)}
         assert "_CORE_OPTIMIZERS" not in field_names
-        assert "_EMERGING_OPTIMIZERS" not in field_names
+        assert "_KNOWN_EMERGING_OPTIMIZERS" not in field_names
         assert "optimizer" in field_names
+        assert "sgd_momentum" in field_names
 
         d = dataclasses.asdict(OptimizerConfig())
         assert d["optimizer"] == "adam"
+        assert d["sgd_momentum"] == 0.0
         assert "_CORE_OPTIMIZERS" not in d
-        assert "_EMERGING_OPTIMIZERS" not in d
-        # No momentum field is exposed yet (FSDP/Megatron SGD divergence is documented).
-        assert "sgd_momentum" not in d
+        assert "_KNOWN_EMERGING_OPTIMIZERS" not in d
 
 
 class TestMaxSeqLenValidation:

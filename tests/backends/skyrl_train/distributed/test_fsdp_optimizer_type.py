@@ -36,14 +36,21 @@ def test_sgd_maps_to_sgd():
     assert not isinstance(opt, optim.AdamW)
 
 
-def test_fsdp_sgd_has_no_momentum():
-    # Documented cross-backend divergence: FSDP SGD currently uses torch's default
-    # momentum=0 (vanilla SGD), unlike Megatron's 0.9. Pin it so the gap is intentional.
+def test_fsdp_sgd_default_momentum_is_zero():
+    # Default sgd_momentum=0.0 keeps FSDP SGD byte-identical to the historical behavior
+    # (torch's momentum=0 default, i.e. vanilla SGD). Pin it so the default does not drift.
     opt = build_fsdp_optimizer(OptimizerConfig(optimizer="sgd"), _params())
-    assert opt.param_groups[0]["momentum"] == 0
+    assert opt.param_groups[0]["momentum"] == 0.0
 
 
-@pytest.mark.parametrize("optimizer", ["lion", "muon", "soap"])
-def test_megatron_only_optimizers_raise_on_fsdp(optimizer):
-    with pytest.raises(NotImplementedError, match="only supports optimizer 'adam' or 'sgd'"):
+def test_fsdp_sgd_momentum_forwarded():
+    # The new sgd_momentum field must reach torch.optim.SGD on the FSDP backend.
+    opt = build_fsdp_optimizer(OptimizerConfig(optimizer="sgd", sgd_momentum=0.9), _params())
+    assert opt.param_groups[0]["momentum"] == pytest.approx(0.9)
+
+
+@pytest.mark.parametrize("optimizer", ["lion", "muon", "adaptive_muon", "soap", "arbitrary_emerging_name"])
+def test_emerging_optimizers_raise_on_fsdp(optimizer):
+    # FSDP cannot build any non-core optimizer; it must fail clearly rather than mis-dispatch.
+    with pytest.raises(NotImplementedError, match="cross-backend core optimizers 'adam' or 'sgd'"):
         build_fsdp_optimizer(OptimizerConfig(optimizer=optimizer), _params())

@@ -87,18 +87,48 @@ class ModelConfig(BaseConfig):
 @dataclass
 class OptimizerConfig(BaseConfig):
     optimizer: str = "adam"
-    """Optimizer type. ``"adam"`` (AdamW; the default) and ``"sgd"`` are honored by both the
-    FSDP and Megatron backends. ``"adam"`` already maps to AdamW (decoupled weight decay) on
-    both backends, so there is no separate ``"adamw"`` token. Additional types reachable on the
-    Megatron backend (``"lion"``, ``"muon"``, ``"soap"``) require the optional
-    ``emerging-optimizers>=0.2`` package and are not supported on FSDP. ``adam_betas`` is only
-    consumed by Adam-family optimizers. ``sgd`` momentum differs by backend: the Megatron backend
-    uses Megatron-core's default momentum (0.9), whereas the FSDP backend currently builds
-    ``torch.optim.SGD`` with its default ``momentum=0`` (vanilla SGD) since ``OptimizerConfig``
-    does not yet expose a momentum field."""
+    """Optimizer type.
+
+    .. warning::
+        Only the default ``"adam"`` path is exercised by SkyRL's existing tests and training
+        runs. ``"sgd"`` and every emerging optimizer (``"lion"``, ``"muon"``, ``"adaptive_muon"``,
+        ``"soap"``, ...) are WIRING-ONLY: the config and adapters route them through to the
+        backend, but they have NOT been convergence-validated on real GPU training here. Do not
+        rely on a non-``"adam"`` optimizer (and do not upstream this capability) until it has been
+        convergence-validated on a real GPU run.
+
+    ``"adam"`` (AdamW; the default) and ``"sgd"`` are the cross-backend core: both dispatch
+    natively on the FSDP and Megatron backends without any optional package. ``"adam"`` already
+    maps to AdamW (decoupled weight decay) on both backends, so there is no separate ``"adamw"``
+    token.
+
+    Any other name is treated as a Megatron-only "emerging" optimizer. SkyRL does NOT maintain its
+    own authoritative list of these (such a list inevitably drifts from Megatron-core); instead the
+    string is passed through to Megatron-core, which is the real authority and validates it at
+    construction time against the installed ``emerging-optimizers`` package. As of the pinned
+    Megatron-core dev revision, ``"lion"``, ``"muon"``, and ``"adaptive_muon"`` are reachable when
+    ``emerging-optimizers>=0.2`` is installed (see the ``emerging-optimizers`` extra in
+    ``pyproject.toml``); ``"soap"`` and other names are exposed dynamically by the installed
+    package's registry and so are package/version-dependent. The FSDP backend cannot build any of
+    these and raises ``NotImplementedError``.
+
+    ``adam_betas`` is only consumed by Adam-family optimizers. ``sgd_momentum`` is forwarded to both
+    backends (default ``0.0`` preserves the historical FSDP behavior; see its docstring for the
+    Megatron note). Optimizer-specific hyperparameters that do not have a first-class field here can
+    be passed to the Megatron backend via ``megatron_config.optimizer_config_kwargs``."""
     lr: float = 1e-6
     adam_betas: List[float] = field(default_factory=lambda: [0.9, 0.999])
     weight_decay: float = 1e-2
+    sgd_momentum: float = 0.0
+    """Momentum for ``optimizer="sgd"``. Only consumed by SGD on both backends.
+
+    Default ``0.0`` is chosen to be byte-identical to the pre-existing FSDP behavior (``torch.optim.SGD``
+    with its ``momentum=0`` default, i.e. vanilla SGD). NOTE: this changes the Megatron SGD default: the
+    Megatron adapter forwards ``sgd_momentum`` whenever the field is present (a real ``OptimizerConfig``
+    always provides it, default ``0.0``), so Megatron SGD also defaults to ``0.0`` here instead of falling
+    back to Megatron-core's internal ``0.9``. (A bare ``DictConfig`` without the field defers to
+    Megatron-core's default.) This only affects the UNVALIDATED ``"sgd"`` path; the default ``"adam"`` path
+    is unaffected. Set this explicitly to ``0.9`` to recover classic momentum-SGD on either backend."""
     max_grad_norm: float = 1.0
     offload_after_step: bool = True
     """Offload optimizer state to CPU after each full training step. Only applicable when ``colocate_all=True``."""
@@ -106,23 +136,39 @@ class OptimizerConfig(BaseConfig):
     """Number of mini-batch steps to warmup the optimizer."""
     scheduler: str = "constant_with_warmup"
 
-    # Optimizer types every backend can build natively without optional packages.
+    # Optimizer types every backend can build natively without any optional package. These are the
+    # only statically-guaranteed, cross-backend names and the only ones exercised by SkyRL today.
     _CORE_OPTIMIZERS = ("adam", "sgd")
-    # Optimizer types reachable on the Megatron backend only via the optional
-    # ``emerging-optimizers`` package (availability is install-dependent and validated
-    # by Megatron-core at construction time, so we accept them here rather than reject).
-    _EMERGING_OPTIMIZERS = ("lion", "muon", "soap")
+    # NON-EXHAUSTIVE, INFORMATIONAL list of emerging (Megatron-only) optimizers, used purely for
+    # error/doc messages. The authoritative set is owned by Megatron-core + the installed
+    # ``emerging-optimizers`` package and is validated there at construction time, NOT here.
+    # Per the pinned Megatron-core dev revision: lion/muon/adaptive_muon are reachable with
+    # emerging-optimizers>=0.2; soap and others are exposed dynamically by the package registry and
+    # are therefore package/version-dependent. Do NOT treat this tuple as a closed allow-list.
+    _KNOWN_EMERGING_OPTIMIZERS = ("lion", "muon", "adaptive_muon", "soap")
 
     def __post_init__(self):
-        valid = self._CORE_OPTIMIZERS + self._EMERGING_OPTIMIZERS
-        if self.optimizer not in valid:
+        # !!! DO-NOT-UPSTREAM / DO-NOT-RELY GATE !!!
+        # Only the DEFAULT optimizer="adam" path is exercised by SkyRL's existing tests and
+        # training runs. "sgd" and every emerging optimizer are WIRING-ONLY and UNVALIDATED on
+        # real GPU training. Convergence-validate a non-"adam" optimizer on a real GPU run before
+        # relying on it or upstreaming this capability. (See the `optimizer` field docstring.)
+        #
+        # Config-level validation deliberately enforces only what SkyRL can authoritatively know,
+        # to avoid maintaining an emerging allow-list that drifts from Megatron-core:
+        #   * non-empty string, and not the "adamw" alias (use "adam"), are the only hard rules;
+        #   * the cross-backend core (_CORE_OPTIMIZERS) dispatches natively on both backends;
+        #   * any other name is accepted here and deferred to the backend — FSDP rejects it in
+        #     ``build_fsdp_optimizer`` (NotImplementedError) and Megatron passes it to
+        #     Megatron-core, which validates it against the installed emerging-optimizers package.
+        # A truly bogus name therefore still fails clearly (at the backend), never silently
+        # mis-dispatched.
+        if not isinstance(self.optimizer, str) or not self.optimizer:
+            raise ValueError(f"optimizer must be a non-empty string, got {self.optimizer!r}.")
+        if self.optimizer == "adamw":
             raise ValueError(
-                f"Invalid optimizer {self.optimizer!r}. Valid options are {valid}. "
-                f"{self._CORE_OPTIMIZERS} are supported by both backends; "
-                f"{self._EMERGING_OPTIMIZERS} are Megatron-only and require the optional "
-                "emerging-optimizers>=0.2 package. "
-                "Note: 'adam' already means AdamW (decoupled weight decay), so use 'adam' "
-                "rather than 'adamw'."
+                "Invalid optimizer 'adamw'. Use 'adam', which already maps to AdamW "
+                "(decoupled weight decay) on both backends."
             )
 
 

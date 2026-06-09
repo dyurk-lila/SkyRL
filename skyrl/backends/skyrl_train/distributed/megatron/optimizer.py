@@ -46,9 +46,11 @@ def init_megatron_optim_config(
         "params_dtype": torch.bfloat16,
         "use_distributed_optimizer": True,
     }
-    # Forward SGD momentum when configured; otherwise Megatron-core's OptimizerConfig
-    # default (0.9) is used. SkyRLOptimizerConfig does not yet expose a momentum field
-    # (tracked as a follow-up); plumb it opportunistically so a future field is honored.
+    # Forward SGD momentum whenever the field is present. ``SkyRLOptimizerConfig.sgd_momentum`` is a
+    # first-class field (default 0.0), so a real OptimizerConfig always provides it and it is forwarded
+    # rather than falling back to Megatron-core's internal default (0.9). It is only consumed by
+    # Megatron-core's SGD path; for Adam-family optimizers it is inert. A bare DictConfig without the
+    # field defers to Megatron-core's own default (the ``getattr`` returns None and we skip forwarding).
     sgd_momentum = getattr(optim_config, "sgd_momentum", None)
     if sgd_momentum is not None:
         optim_args["sgd_momentum"] = float(sgd_momentum)

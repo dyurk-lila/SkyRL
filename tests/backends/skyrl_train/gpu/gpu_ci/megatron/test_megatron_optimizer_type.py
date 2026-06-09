@@ -33,41 +33,45 @@ def test_adam_is_default_and_routes_betas():
 
 
 @pytest.mark.megatron
-def test_sgd_dispatches_and_keeps_default_momentum():
+def test_sgd_dispatches_and_forwards_momentum():
     optim_config = OptimizerConfig(optimizer="sgd")
     mcore_config = init_megatron_optim_config(optim_config, optimizer_config_kwargs={})
     assert mcore_config.optimizer == "sgd"
-    # SkyRLOptimizerConfig does not expose a momentum field yet, so SGD falls back to
-    # Megatron-core's default momentum (0.9). This guards against a future regression
-    # where the adapter zeros it out.
-    assert mcore_config.sgd_momentum == pytest.approx(0.9)
+    # sgd_momentum is now a first-class field (default 0.0) and is forwarded unconditionally,
+    # so Megatron SGD now also defaults to 0.0 (vanilla SGD), matching the FSDP backend, instead
+    # of falling back to Megatron-core's internal 0.9.
+    assert mcore_config.sgd_momentum == pytest.approx(0.0)
+    # An explicit momentum must reach mcore.
+    mcore_explicit = init_megatron_optim_config(
+        OptimizerConfig(optimizer="sgd", sgd_momentum=0.9), optimizer_config_kwargs={}
+    )
+    assert mcore_explicit.sgd_momentum == pytest.approx(0.9)
 
 
 @pytest.mark.megatron
-def test_lion_type_forwarded():
-    # The adapter must forward the requested type verbatim; whether Lion can actually be
+@pytest.mark.parametrize("optimizer", ["lion", "muon", "adaptive_muon", "soap"])
+def test_emerging_optimizer_type_forwarded(optimizer):
+    # The adapter must forward the requested type verbatim; whether it can actually be
     # constructed is decided later by Megatron-core based on emerging-optimizers availability.
-    mcore_config = init_megatron_optim_config(OptimizerConfig(optimizer="lion"), optimizer_config_kwargs={})
-    assert mcore_config.optimizer == "lion"
+    mcore_config = init_megatron_optim_config(OptimizerConfig(optimizer=optimizer), optimizer_config_kwargs={})
+    assert mcore_config.optimizer == optimizer
 
 
 @pytest.mark.megatron
-def test_default_optim_args_are_byte_identical_to_pre_change():
-    """The default ``OptimizerConfig`` must produce a Megatron-core ``OptimizerConfig``
-    that is unchanged by this feature.
+def test_default_optim_args_unperturbed_on_adam_path():
+    """The default ``OptimizerConfig`` must produce a Megatron-core ``OptimizerConfig`` whose
+    Adam path is unchanged by this feature.
 
-    Two ways the new ``optimizer`` field could have silently shifted mcore config:
-    (1) injecting a ``sgd_momentum`` override (the adapter only forwards it when the
-        SkyRL field is present, which it is not yet) — verify mcore keeps its 0.9 default;
-    (2) the ``optimizer`` value itself — verify it is still ``"adam"`` (AdamW).
+    ``sgd_momentum`` is only consumed by Megatron-core's SGD branch, so forwarding ``0.0`` is
+    inert for the default ``adam`` optimizer. We verify (1) the optimizer is still ``"adam"``
+    (AdamW), and (2) the full mcore config matches an explicit, identical adam build — i.e.
+    adding the ``optimizer`` / ``sgd_momentum`` fields did not perturb any other adam arg.
     """
     mcore_default = init_megatron_optim_config(OptimizerConfig(), optimizer_config_kwargs={})
 
     assert mcore_default.optimizer == "adam"
-    # sgd_momentum is NOT forwarded (no SkyRL field), so mcore keeps its own default of 0.9.
-    assert mcore_default.sgd_momentum == pytest.approx(0.9)
-    # The full mcore OptimizerConfig must match what an explicit, optimizer-free build
-    # produces — i.e. adding the ``optimizer`` field did not perturb any other arg.
+    # sgd_momentum is forwarded as the field default (0.0); inert on the adam path.
+    assert mcore_default.sgd_momentum == pytest.approx(0.0)
     reference = init_megatron_optim_config(
         OptimizerConfig(optimizer="adam"),
         optimizer_config_kwargs={},
