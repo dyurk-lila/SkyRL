@@ -1,14 +1,15 @@
 """
 CPU-collectable tests for ``Worker.get_peak_cuda_memory``.
 
-The signature/shape assertions run on any host. The behavioral assertions
-(values, types, and reset semantics) require a real CUDA device and are
-skipped otherwise, since SkyRL's CPU CI lane has no GPU.
+The signature/shape and no-sync assertions run on any host. The behavioral
+assertions (values, types, and reset semantics) require a real CUDA device and
+are skipped otherwise, since SkyRL's CPU CI lane has no GPU.
 
 uv run --isolated --extra dev pytest tests/backends/skyrl_train/workers/test_get_peak_cuda_memory.py
 """
 
 import inspect
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -25,6 +26,27 @@ def test_get_peak_cuda_memory_exists_and_signature():
     # (self, reset)
     assert list(sig.parameters) == ["self", "reset"]
     assert sig.parameters["reset"].default is True
+
+
+def test_get_peak_cuda_memory_does_not_synchronize():
+    """The peak counters are host-tracked, so the method must NOT block on a
+    device sync — this is what makes it safe to call every train step.
+
+    Runs on any host (CPU CI included): we stub the CUDA reads so no real GPU
+    is needed and assert ``torch.cuda.synchronize`` is never invoked.
+    """
+    worker = object.__new__(Worker)
+    with (
+        patch("torch.cuda.synchronize") as mock_sync,
+        patch("torch.cuda.max_memory_allocated", return_value=1),
+        patch("torch.cuda.max_memory_reserved", return_value=2),
+        patch("torch.cuda.mem_get_info", return_value=(0, 3)),
+        patch("torch.cuda.reset_peak_memory_stats"),
+    ):
+        result = Worker.get_peak_cuda_memory(worker, reset=True)
+
+    mock_sync.assert_not_called()
+    assert set(result) == EXPECTED_KEYS
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA device")

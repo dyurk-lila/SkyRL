@@ -753,6 +753,45 @@ class SFTTrainer:
         cp = self.sft_cfg.megatron_config.context_parallel_size
         return total_gpus // (tp * pp * cp)
 
+    def _peak_memory_log(self) -> dict[str, float]:
+        """Per-step peak GPU memory (max over ranks), as a ready-to-merge log dict.
+
+        Fans :meth:`Worker.get_peak_cuda_memory` out across the policy workers,
+        max-reduces the per-rank high-water marks, and converts bytes to GB.
+        Relies on the worker method's default ``reset=True`` so each call
+        measures a fresh window (the next step) rather than a cumulative
+        high-water mark. Peak GPU memory is a per-rank quantity; the
+        cluster-meaningful number is the max over ranks.
+
+        Cost: the worker method itself does no device sync, but this consumer
+        issues one **blocking** ``ray.get`` fan-out to every policy rank (RPC
+        dispatch + round-trip + per-rank dict materialization). It is therefore
+        a host-side serialization point on the train step's critical path and is
+        gated behind ``log_peak_memory`` (default off) at the call sites.
+
+        Returns ``{}`` when there are no per-rank results (defensive; should not
+        happen in normal operation).
+        """
+        per_rank = ray.get(
+            self.dispatch.policy_actor_group.async_run_ray_method("pass_through", "get_peak_cuda_memory")
+        )
+        if not per_rank:
+            return {}
+        bytes_per_gb = 1024**3
+        peak_allocated = max(r["max_allocated"] for r in per_rank)
+        peak_reserved = max(r["max_reserved"] for r in per_rank)
+        # ``total`` is the (constant) device capacity already fetched by the
+        # worker; surfacing the reserved fraction gives a directly readable
+        # OOM-proximity signal without an externally-known card size. Use the
+        # capacity of the rank that owns the peak reserved bytes.
+        peak_rank = max(per_rank, key=lambda r: r["max_reserved"])
+        peak_total = peak_rank["total"]
+        return {
+            "memory/peak_allocated_gb": peak_allocated / bytes_per_gb,
+            "memory/peak_reserved_gb": peak_reserved / bytes_per_gb,
+            "memory/peak_reserved_frac": peak_reserved / peak_total,
+        }
+
     def _validate_packing_cfg(self):
         """Validate the config when ``use_sequence_packing=True``."""
         if self.sft_cfg.strategy != "megatron":
@@ -1409,6 +1448,8 @@ class SFTTrainer:
             log_dict.update({f"timing/{k}": v for k, v in all_timings.items()})
             if self._ray_gpu_monitor is not None:
                 log_dict.update(self._ray_gpu_monitor.flush())
+            if self.sft_cfg.log_peak_memory:
+                log_dict.update(self._peak_memory_log())
 
             self.tracker.log(log_dict, step=step, commit=True)
             logger.info(
@@ -1561,6 +1602,8 @@ class SFTTrainer:
             log_dict.update({f"timing/{k}": v for k, v in all_timings.items()})
             if self._ray_gpu_monitor is not None:
                 log_dict.update(self._ray_gpu_monitor.flush())
+            if self.sft_cfg.log_peak_memory:
+                log_dict.update(self._peak_memory_log())
 
             self._fire("on_step_end", batch=batch, metrics=step_result)
 

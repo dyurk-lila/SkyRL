@@ -303,6 +303,13 @@ class Worker(DistributedTorchRayActor):
         allocator pool bytes). These discriminate configs in a way that the
         instantaneous values from :meth:`get_cuda_memory` cannot.
 
+        Unlike :meth:`get_cuda_memory`, this method does **not** call
+        ``torch.cuda.synchronize()``: the peak counters are maintained by the
+        caching allocator on the host at allocation/free time, and
+        ``mem_get_info()[1]`` returns the (constant) device capacity — none of
+        these values require the device to be idle to be correct. Skipping the
+        sync makes the method safe (non-blocking) to call on every train step.
+
         Args:
             reset: When True (default), reset the peak-memory stats after reading
                 so the next call measures the next window (e.g. one train step).
@@ -312,10 +319,8 @@ class Worker(DistributedTorchRayActor):
             ``max_reserved`` (peak allocator pool bytes), and ``total`` (device
             capacity), plus the integer ``rank`` of this worker (0 when the
             distributed process group is not initialized). The ``rank`` value is
-            per-rank and intended for max-reduction by a future trainer-side
-            consumer.
+            per-rank and intended for max-reduction by a trainer-side consumer.
         """
-        torch.cuda.synchronize()
         result = {
             "max_allocated": torch.cuda.max_memory_allocated(),
             "max_reserved": torch.cuda.max_memory_reserved(),
