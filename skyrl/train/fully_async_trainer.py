@@ -35,7 +35,11 @@ from skyrl.train.generators.utils import (
 )
 from skyrl.train.trainer import RayPPOTrainer
 from skyrl.train.utils import Timer
-from skyrl.train.utils.trainer_utils import ResumeMode, build_dataloader
+from skyrl.train.utils.trainer_utils import (
+    ResumeMode,
+    build_dataloader,
+    peak_memory_metrics,
+)
 
 
 @dataclass
@@ -432,6 +436,23 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 # 5. Set logs for this training step.
                 logger.info(status)
                 self.all_metrics.update({"trainer/epoch": epoch, "trainer/global_step": self.global_step})
+                if self.cfg.trainer.log_peak_memory:
+                    # Per-group + cluster-headline peak GPU memory across the
+                    # ACTIVE worker groups. Mirrors the synchronous
+                    # RayPPOTrainer.train() log site so the two RL log paths
+                    # cannot diverge (this override never calls into the base
+                    # train()). colocate_all is asserted False for fully async
+                    # training (see __init__), so the groups live on disjoint
+                    # GPUs here; the shared helper is still correct either way.
+                    self.all_metrics.update(
+                        peak_memory_metrics(
+                            {
+                                "policy": self.policy_model,
+                                "critic": self.critic_model,
+                                "ref": self.ref_model,
+                            }
+                        )
+                    )
                 self.tracker.log(self.all_metrics, step=self.global_step)
                 self.all_metrics = {}
                 pbar.update(1)

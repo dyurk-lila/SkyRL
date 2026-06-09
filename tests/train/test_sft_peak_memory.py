@@ -58,14 +58,21 @@ def _per_rank(*specs: tuple[int, int]) -> list[dict]:
 
 
 def test_peak_memory_log_max_reduces_across_ranks():
-    """The consumer takes the max over ranks for each counter and reports GB."""
+    """The consumer takes the max over ranks for each counter and reports GB.
+
+    SFT has a single ``policy`` group, so the shared helper emits both the
+    per-group ``memory/policy/*`` keys and the cluster-wide headline
+    ``memory/peak_*`` keys (the original SFT metric, byte-for-byte) with the
+    same values.
+    """
     trainer = _make_trainer()
     # rank 0 has the larger allocated; rank 1 has the larger reserved.
     fake = _per_rank((3 * _GB, 5 * _GB), (4 * _GB, 4 * _GB))
 
     sentinel = object()
     trainer.dispatch.policy_actor_group.async_run_ray_method.return_value = sentinel
-    with patch("skyrl.train.sft_trainer.ray.get", return_value=fake) as mock_get:
+    # ray.get now runs inside the shared helper in trainer_utils.
+    with patch("skyrl.train.utils.trainer_utils.ray.get", return_value=fake) as mock_get:
         out = trainer._peak_memory_log()
 
     # Fans out the right pass_through method on the policy group, then ray.gets it.
@@ -75,6 +82,12 @@ def test_peak_memory_log_max_reduces_across_ranks():
     mock_get.assert_called_once_with(sentinel)
 
     assert out == {
+        # per-group keys
+        "memory/policy/peak_allocated_gb": 4.0,  # max(3, 4)
+        "memory/policy/peak_reserved_gb": 5.0,  # max(5, 4)
+        "memory/policy/peak_reserved_frac": 5.0 / 80.0,
+        # cluster-wide headline (single group -> identical values; matches the
+        # original SFT metric keys exactly).
         "memory/peak_allocated_gb": 4.0,  # max(3, 4)
         "memory/peak_reserved_gb": 5.0,  # max(5, 4)
         # reserved fraction uses the capacity of the peak-reserved rank (rank 0,
@@ -93,7 +106,7 @@ def test_peak_memory_log_does_not_pass_reset_false():
     """
     trainer = _make_trainer()
     fake = _per_rank((1 * _GB, 1 * _GB))
-    with patch("skyrl.train.sft_trainer.ray.get", return_value=fake):
+    with patch("skyrl.train.utils.trainer_utils.ray.get", return_value=fake):
         trainer._peak_memory_log()
 
     _, call_args, call_kwargs = trainer.dispatch.policy_actor_group.async_run_ray_method.mock_calls[0]
@@ -105,9 +118,12 @@ def test_peak_memory_log_single_rank():
     """A single-rank result is reported as-is (in GB)."""
     trainer = _make_trainer()
     fake = _per_rank((7 * _GB, 9 * _GB))
-    with patch("skyrl.train.sft_trainer.ray.get", return_value=fake):
+    with patch("skyrl.train.utils.trainer_utils.ray.get", return_value=fake):
         out = trainer._peak_memory_log()
     assert out == {
+        "memory/policy/peak_allocated_gb": 7.0,
+        "memory/policy/peak_reserved_gb": 9.0,
+        "memory/policy/peak_reserved_frac": 9.0 / 80.0,
         "memory/peak_allocated_gb": 7.0,
         "memory/peak_reserved_gb": 9.0,
         "memory/peak_reserved_frac": 9.0 / 80.0,
@@ -117,7 +133,7 @@ def test_peak_memory_log_single_rank():
 def test_peak_memory_log_empty_results_returns_empty_dict():
     """No per-rank results -> empty dict (defensive; never blocks the log dict)."""
     trainer = _make_trainer()
-    with patch("skyrl.train.sft_trainer.ray.get", return_value=[]):
+    with patch("skyrl.train.utils.trainer_utils.ray.get", return_value=[]):
         assert trainer._peak_memory_log() == {}
 
 
@@ -127,6 +143,17 @@ def test_peak_memory_log_empty_results_returns_empty_dict():
 # ---------------------------------------------------------------------------
 
 _DUMMY_PEAK = _per_rank((6 * _GB, 8 * _GB))
+
+# The full set of memory/* keys SFT emits: the per-group (single ``policy``
+# group) keys plus the cluster-wide headline keys from the shared helper.
+_EXPECTED_MEMORY_KEYS = {
+    "memory/policy/peak_allocated_gb",
+    "memory/policy/peak_reserved_gb",
+    "memory/policy/peak_reserved_frac",
+    "memory/peak_allocated_gb",
+    "memory/peak_reserved_gb",
+    "memory/peak_reserved_frac",
+}
 
 
 def _logged_memory_keys(tracker: MagicMock) -> set[str]:
@@ -219,17 +246,13 @@ def test_train_loop_gates_peak_memory_at_real_log_site(monkeypatch, log_peak_mem
     monkeypatch.setattr(trainer, "_load_and_tokenize", lambda *_a, **_k: _dummy_tokenized())
     monkeypatch.setattr(trainer, "load_checkpoint", lambda: 0)
 
-    with patch("skyrl.train.sft_trainer.ray.get", return_value=_DUMMY_PEAK) as mock_get:
+    with patch("skyrl.train.utils.trainer_utils.ray.get", return_value=_DUMMY_PEAK) as mock_get:
         trainer.train()
 
     logged = _logged_memory_keys(trainer.tracker)
     fan_out = trainer.dispatch.policy_actor_group.async_run_ray_method
     if log_peak_memory:
-        assert logged == {
-            "memory/peak_allocated_gb",
-            "memory/peak_reserved_gb",
-            "memory/peak_reserved_frac",
-        }
+        assert logged == _EXPECTED_MEMORY_KEYS
         assert fan_out.call_args_list, "fan-out RPC should be issued when enabled"
         for call in fan_out.call_args_list:
             assert call.args == ("pass_through", "get_peak_cuda_memory")
@@ -249,17 +272,13 @@ def test_dummy_loop_gates_peak_memory_at_real_log_site(log_peak_memory):
     """
     trainer = _build_integration_trainer(log_peak_memory)
 
-    with patch("skyrl.train.sft_trainer.ray.get", return_value=_DUMMY_PEAK) as mock_get:
+    with patch("skyrl.train.utils.trainer_utils.ray.get", return_value=_DUMMY_PEAK) as mock_get:
         trainer._train_dummy()
 
     logged = _logged_memory_keys(trainer.tracker)
     fan_out = trainer.dispatch.policy_actor_group.async_run_ray_method
     if log_peak_memory:
-        assert logged == {
-            "memory/peak_allocated_gb",
-            "memory/peak_reserved_gb",
-            "memory/peak_reserved_frac",
-        }
+        assert logged == _EXPECTED_MEMORY_KEYS
         assert mock_get.call_count >= 1
     else:
         assert logged == set(), "no memory/* keys must reach tracker.log when disabled"

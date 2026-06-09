@@ -67,6 +67,7 @@ from skyrl.train.utils.trainer_utils import (
     GLOBAL_STEP_PREFIX,
     cleanup_old_checkpoints,
     extract_step_from_path,
+    peak_memory_metrics,
     validate_consistency_for_latest_checkpoint,
 )
 from skyrl.train.utils.utils import ResolvedPlacementGroup, Timer
@@ -756,12 +757,13 @@ class SFTTrainer:
     def _peak_memory_log(self) -> dict[str, float]:
         """Per-step peak GPU memory (max over ranks), as a ready-to-merge log dict.
 
-        Fans :meth:`Worker.get_peak_cuda_memory` out across the policy workers,
-        max-reduces the per-rank high-water marks, and converts bytes to GB.
-        Relies on the worker method's default ``reset=True`` so each call
-        measures a fresh window (the next step) rather than a cumulative
-        high-water mark. Peak GPU memory is a per-rank quantity; the
-        cluster-meaningful number is the max over ranks.
+        Thin wrapper over the shared :func:`peak_memory_metrics` reduce (so SFT
+        and RL cannot drift): fans :meth:`Worker.get_peak_cuda_memory` out across
+        the policy workers, max-reduces the per-rank high-water marks, and
+        converts bytes to GB. SFT has a single ``policy`` group, so the helper's
+        per-group keys (``memory/policy/*``) and its cluster-wide headline keys
+        (``memory/peak_*``) carry the same numbers; the headline keys match the
+        original SFT metric exactly.
 
         Cost: the worker method itself does no device sync, but this consumer
         issues one **blocking** ``ray.get`` fan-out to every policy rank (RPC
@@ -772,25 +774,7 @@ class SFTTrainer:
         Returns ``{}`` when there are no per-rank results (defensive; should not
         happen in normal operation).
         """
-        per_rank = ray.get(
-            self.dispatch.policy_actor_group.async_run_ray_method("pass_through", "get_peak_cuda_memory")
-        )
-        if not per_rank:
-            return {}
-        bytes_per_gb = 1024**3
-        peak_allocated = max(r["max_allocated"] for r in per_rank)
-        peak_reserved = max(r["max_reserved"] for r in per_rank)
-        # ``total`` is the (constant) device capacity already fetched by the
-        # worker; surfacing the reserved fraction gives a directly readable
-        # OOM-proximity signal without an externally-known card size. Use the
-        # capacity of the rank that owns the peak reserved bytes.
-        peak_rank = max(per_rank, key=lambda r: r["max_reserved"])
-        peak_total = peak_rank["total"]
-        return {
-            "memory/peak_allocated_gb": peak_allocated / bytes_per_gb,
-            "memory/peak_reserved_gb": peak_reserved / bytes_per_gb,
-            "memory/peak_reserved_frac": peak_reserved / peak_total,
-        }
+        return peak_memory_metrics({"policy": self.dispatch.policy_actor_group})
 
     def _validate_packing_cfg(self):
         """Validate the config when ``use_sequence_packing=True``."""

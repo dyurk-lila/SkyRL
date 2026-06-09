@@ -183,9 +183,12 @@ class SFTConfig(BaseConfig):
     enable_ray_gpu_monitor: bool = True
     """Enable background Ray GPU/RAM metrics collection and logging to wandb."""
     log_peak_memory: bool = False
-    """Log per-step peak GPU memory (max over ranks) to ``memory/peak_allocated_gb``,
-    ``memory/peak_reserved_gb``, and ``memory/peak_reserved_frac``. The worker read
-    is device-sync-free, but enabling this adds one BLOCKING Ray round-trip to the
+    """Log per-step peak GPU memory (max over ranks) for the policy group, both
+    per-group (``memory/policy/peak_*``) and as a cluster-wide headline max
+    (``memory/peak_allocated_gb``, ``memory/peak_reserved_gb``,
+    ``memory/peak_reserved_frac``). SFT has a single ``policy`` group, so the
+    per-group and headline keys carry identical values. The worker read is
+    device-sync-free, but enabling this adds one BLOCKING Ray round-trip to the
     policy group per logged step (a host-side serialization point on the step's
     critical path), so it is opt-in. When False, no extra Ray calls are made."""
     max_ckpts_to_keep: int = -1

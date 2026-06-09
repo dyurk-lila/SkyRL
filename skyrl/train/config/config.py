@@ -675,6 +675,14 @@ class TrainerConfig(BaseConfig):
     logger: str = "wandb"
     enable_ray_gpu_monitor: bool = True
     """Enable background Ray GPU/RAM metrics collection and logging to wandb."""
+    log_peak_memory: bool = False
+    """Log per-step peak GPU memory (max over ranks) across the active worker
+    groups, both per-group (``memory/{policy,critic,ref}/peak_*``) and as a
+    cluster-wide headline max (``memory/peak_allocated_gb``,
+    ``memory/peak_reserved_gb``, ``memory/peak_reserved_frac``). The worker read
+    is device-sync-free, but enabling this adds one BLOCKING Ray round-trip per
+    active group per logged step (a host-side serialization point on the step's
+    critical path), so it is opt-in. When False, no extra Ray calls are made."""
     dump_data_batch: bool = False
     dump_eval_results: bool = True
     rope_scaling: Optional[Dict[str, Any]] = None

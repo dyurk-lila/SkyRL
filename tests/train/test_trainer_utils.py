@@ -23,6 +23,7 @@ from skyrl.train.utils.trainer_utils import (
     handle_dynamic_sampling,
     handle_filter_sampling,
     handle_replace_sampling,
+    peak_memory_metrics,
     run_on_each_node,
     sanitize_data_source,
     validate_consistency_for_latest_checkpoint,
@@ -1063,3 +1064,150 @@ def test_validate_stepwise_multiple_is_last_step_true_per_trajectory():
     output["is_last_step"] = [True, True, True]
     with pytest.raises(AssertionError, match="is_last_step.*True.*trajectory continues"):
         validate_generator_output(num_prompts=1, generator_output=output, step_wise=True)
+
+
+# ---------------------------------------------------------------------------
+# peak_memory_metrics: the shared reduce used by BOTH SFT and RL trainers.
+# Fully CPU-mockable — mock each group's async_run_ray_method handle and patch
+# the module-level ray.get to return fabricated per-rank dicts.
+# ---------------------------------------------------------------------------
+
+_GB = 1024**3
+
+
+def _mock_group():
+    """An actor group whose fan-out returns a per-group sentinel handle."""
+    group = Mock()
+    group.async_run_ray_method.return_value = object()
+    return group
+
+
+def _per_rank(*specs):
+    """Build per-rank dicts from (max_allocated, max_reserved) byte pairs."""
+    return [
+        {"max_allocated": alloc, "max_reserved": reserved, "total": 80 * _GB, "rank": i}
+        for i, (alloc, reserved) in enumerate(specs)
+    ]
+
+
+def test_peak_memory_metrics_single_group_max_reduces_and_headlines():
+    """One group -> per-group keys plus identical cluster-headline keys, in GB."""
+    group = _mock_group()
+    # rank 0 owns the larger allocated; rank 1 owns the larger reserved.
+    per_rank = _per_rank((3 * _GB, 5 * _GB), (4 * _GB, 4 * _GB))
+
+    with patch("skyrl.train.utils.trainer_utils.ray.get", return_value=per_rank) as mock_get:
+        out = peak_memory_metrics({"policy": group})
+
+    group.async_run_ray_method.assert_called_once_with("pass_through", "get_peak_cuda_memory")
+    mock_get.assert_called_once_with(group.async_run_ray_method.return_value)
+    assert out == {
+        "memory/policy/peak_allocated_gb": 4.0,  # max(3, 4)
+        "memory/policy/peak_reserved_gb": 5.0,  # max(5, 4)
+        "memory/policy/peak_reserved_frac": 5.0 / 80.0,
+        # headline == policy (single group)
+        "memory/peak_allocated_gb": 4.0,
+        "memory/peak_reserved_gb": 5.0,
+        "memory/peak_reserved_frac": 5.0 / 80.0,
+    }
+
+
+def test_peak_memory_metrics_multi_group_keys_and_headline_is_max_not_sum():
+    """Multiple groups -> per-group keys each + a cluster MAX headline (never a sum).
+
+    Correct under colocate_all=True (shared GPUs): summing would double-count the
+    shared devices, so the headline is a cross-group max.
+    """
+    policy = _mock_group()
+    critic = _mock_group()
+
+    # policy peaks allocated; critic peaks reserved (on a smaller card).
+    policy_ranks = _per_rank((10 * _GB, 12 * _GB))
+    critic_ranks = [{"max_allocated": 6 * _GB, "max_reserved": 20 * _GB, "total": 40 * _GB, "rank": 0}]
+
+    def fake_get(handle):
+        return policy_ranks if handle is policy.async_run_ray_method.return_value else critic_ranks
+
+    with patch("skyrl.train.utils.trainer_utils.ray.get", side_effect=fake_get):
+        out = peak_memory_metrics({"policy": policy, "critic": critic})
+
+    # Per-group keys are independent honest per-rank maxes within each group.
+    assert out["memory/policy/peak_allocated_gb"] == 10.0
+    assert out["memory/policy/peak_reserved_gb"] == 12.0
+    assert out["memory/policy/peak_reserved_frac"] == 12.0 / 80.0
+    assert out["memory/critic/peak_allocated_gb"] == 6.0
+    assert out["memory/critic/peak_reserved_gb"] == 20.0
+    assert out["memory/critic/peak_reserved_frac"] == 20.0 / 40.0
+    # Headline is the cross-group MAX (not 10+6 or 12+20).
+    assert out["memory/peak_allocated_gb"] == 10.0  # max(10, 6)
+    assert out["memory/peak_reserved_gb"] == 20.0  # max(12, 20)
+    # The headline fraction uses the card that owns the headline reserved peak
+    # (critic's 40 GB card), NOT the policy card.
+    assert out["memory/peak_reserved_frac"] == 20.0 / 40.0
+
+
+def test_peak_memory_metrics_skips_none_groups():
+    """``None`` groups (e.g. an absent critic/ref) are skipped, never fanned out."""
+    policy = _mock_group()
+    per_rank = _per_rank((7 * _GB, 9 * _GB))
+
+    with patch("skyrl.train.utils.trainer_utils.ray.get", return_value=per_rank):
+        out = peak_memory_metrics({"policy": policy, "critic": None, "ref": None})
+
+    # Only the active group is fanned out and keyed.
+    policy.async_run_ray_method.assert_called_once_with("pass_through", "get_peak_cuda_memory")
+    assert "memory/critic/peak_allocated_gb" not in out
+    assert "memory/ref/peak_allocated_gb" not in out
+    assert out["memory/policy/peak_allocated_gb"] == 7.0
+    assert out["memory/peak_allocated_gb"] == 7.0
+
+
+def test_peak_memory_metrics_no_groups_returns_empty():
+    """All-None mapping -> {} and no Ray calls at all (defensive)."""
+    with patch("skyrl.train.utils.trainer_utils.ray.get") as mock_get:
+        out = peak_memory_metrics({"policy": None, "critic": None, "ref": None})
+    assert out == {}
+    mock_get.assert_not_called()
+
+
+def test_peak_memory_metrics_empty_per_rank_returns_empty():
+    """A group yielding no per-rank results contributes nothing -> {}."""
+    group = _mock_group()
+    with patch("skyrl.train.utils.trainer_utils.ray.get", return_value=[]):
+        out = peak_memory_metrics({"policy": group})
+    assert out == {}
+
+
+def test_peak_memory_metrics_custom_prefix():
+    """The ``prefix`` arg namespaces every emitted key."""
+    group = _mock_group()
+    per_rank = _per_rank((2 * _GB, 2 * _GB))
+    with patch("skyrl.train.utils.trainer_utils.ray.get", return_value=per_rank):
+        out = peak_memory_metrics({"policy": group}, prefix="gpu_mem")
+    assert "gpu_mem/policy/peak_allocated_gb" in out
+    assert "gpu_mem/peak_allocated_gb" in out
+    assert not any(k.startswith("memory/") for k in out)
+
+
+def test_peak_memory_metrics_all_zero_reserved_headline_frac_is_zero():
+    """All groups report max_reserved == 0 -> headline frac is 0.0, not a crash.
+
+    The headline ``cluster_reserved_total`` is only seeded inside the strict
+    ``peak_reserved > cluster_reserved`` branch, so an all-zero-reserved report
+    leaves it ``None``. The defensive division guard must return 0.0 rather than
+    raising ``0 / None`` TypeError. Effectively unreachable on a live CUDA worker
+    (the context always reserves bytes) but guarded for robustness.
+    """
+    group = _mock_group()
+    # Non-zero allocated so per-group keys are still emitted (metrics non-empty),
+    # but zero reserved on every rank so the reserved branch never fires.
+    per_rank = _per_rank((4 * _GB, 0), (3 * _GB, 0))
+
+    with patch("skyrl.train.utils.trainer_utils.ray.get", return_value=per_rank):
+        out = peak_memory_metrics({"policy": group})
+
+    assert out["memory/policy/peak_reserved_frac"] == 0.0
+    assert out["memory/peak_reserved_frac"] == 0.0
+    assert out["memory/peak_reserved_gb"] == 0.0
+    # Allocated headline is still the cross-rank max.
+    assert out["memory/peak_allocated_gb"] == 4.0

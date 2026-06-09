@@ -84,6 +84,7 @@ from skyrl.train.utils.trainer_utils import (
     build_dataloader,
     cleanup_old_checkpoints,
     extract_step_from_path,
+    peak_memory_metrics,
     run_on_each_node,
     validate_consistency_for_latest_checkpoint,
     validate_generator_output,
@@ -441,6 +442,21 @@ class RayPPOTrainer:
 
                 if self._ray_gpu_monitor is not None:
                     log_payload.update(self._ray_gpu_monitor.flush())
+
+                if self.cfg.trainer.log_peak_memory:
+                    # Per-group + cluster-headline peak GPU memory across the
+                    # ACTIVE worker groups. The shared helper skips None groups
+                    # and never sums across them (correct under colocate_all,
+                    # where policy/critic/ref time-slice the same GPUs).
+                    log_payload.update(
+                        peak_memory_metrics(
+                            {
+                                "policy": self.policy_model,
+                                "critic": self.critic_model,
+                                "ref": self.ref_model,
+                            }
+                        )
+                    )
 
                 self._fire("on_log", logs=log_payload)
 
