@@ -64,6 +64,111 @@ def get_node_ids(
     return unique_node_ids
 
 
+def peak_memory_metrics(
+    named_groups: Dict[str, Optional[PPORayActorGroup]],
+    prefix: str = "memory",
+) -> Dict[str, float]:
+    """Per-step peak GPU memory across worker groups, as a ready-to-merge log dict.
+
+    Shared reduce used by BOTH the SFT and RL trainers so they cannot drift. For
+    each ``(name, group)`` with ``group is not None``, fans
+    :meth:`Worker.get_peak_cuda_memory` out across that group's ranks (one
+    blocking ``ray.get`` per group), max-reduces the per-rank high-water marks,
+    and converts bytes to GB. Relies on the worker method's default
+    ``reset=True`` so each call measures a fresh window (the next step) rather
+    than a cumulative high-water mark.
+
+    Key scheme (decided for correctness under colocation; see below):
+
+    * Per-group: ``{prefix}/{name}/peak_allocated_gb``,
+      ``{prefix}/{name}/peak_reserved_gb``, ``{prefix}/{name}/peak_reserved_frac``
+      — one set per active group, so each group's headroom is independently
+      visible.
+    * Headline: ``{prefix}/peak_allocated_gb``, ``{prefix}/peak_reserved_gb``,
+      ``{prefix}/peak_reserved_frac`` — the cluster-wide max across all active
+      groups (NOT a sum). This is the single OOM-proximity signal.
+
+    Colocation correctness: RL defaults to ``colocate_all=True``, where the
+    policy/critic/ref groups run as SEPARATE Ray actor processes time-slicing
+    the SAME physical GPUs. Each process's ``torch.cuda.max_*`` counter tracks
+    only its OWN allocations, so we (a) never SUM peaks across groups (the
+    co-resident processes' reserved bytes physically sum on the card, but
+    summing the per-group *peaks-over-time* would badly over-count, since the
+    peaks need not be simultaneous) and (b) take a cross-group max for the
+    headline. That headline is therefore a non-double-counted, conservative
+    cluster signal — a lower bound on the true instantaneous device high-water
+    mark when multiple groups are co-resident, not necessarily the exact
+    physical peak. Under ``colocate_all=False`` the groups live on disjoint GPUs
+    and the max is simply the busiest group. The per-group keys are honest
+    per-rank maxes within each group in both regimes. The ``peak_reserved_frac``
+    uses the full physical capacity of the rank that owns the peak reserved
+    bytes (Ray's fractional ``num_gpus_per_actor`` does not cap device memory),
+    giving a directly readable OOM-proximity fraction in both regimes.
+
+    Cost: the worker method itself does no device sync, but this consumer issues
+    one **blocking** ``ray.get`` fan-out per active group (RPC dispatch +
+    round-trip + per-rank dict materialization), i.e. a host-side serialization
+    point on the train step's critical path. Callers gate it behind a config
+    flag (default off).
+
+    Args:
+        named_groups: Mapping of stable group name (e.g. ``"policy"``,
+            ``"critic"``, ``"ref"``) to its actor group or ``None``. ``None``
+            groups (and groups with no per-rank results) are skipped.
+        prefix: Metric-key namespace. Defaults to ``"memory"``.
+
+    Returns:
+        Ready-to-merge log dict (see key scheme). Empty ``{}`` when no group
+        yields any per-rank result (defensive; should not happen in normal
+        operation).
+    """
+    bytes_per_gb = 1024**3
+    metrics: Dict[str, float] = {}
+    # Cluster-wide (cross-group) high-water marks for the headline keys. The
+    # capacity is carried alongside the peak-reserved bytes so the headline
+    # fraction is computed on the card that actually owns that peak.
+    cluster_allocated = 0
+    cluster_reserved = 0
+    cluster_reserved_total: Optional[int] = None
+
+    for name, group in named_groups.items():
+        if group is None:
+            continue
+        per_rank = ray.get(group.async_run_ray_method("pass_through", "get_peak_cuda_memory"))
+        if not per_rank:
+            continue
+        peak_allocated = max(r["max_allocated"] for r in per_rank)
+        peak_reserved_rank = max(per_rank, key=lambda r: r["max_reserved"])
+        peak_reserved = peak_reserved_rank["max_reserved"]
+        peak_total = peak_reserved_rank["total"]
+        metrics[f"{prefix}/{name}/peak_allocated_gb"] = peak_allocated / bytes_per_gb
+        metrics[f"{prefix}/{name}/peak_reserved_gb"] = peak_reserved / bytes_per_gb
+        metrics[f"{prefix}/{name}/peak_reserved_frac"] = peak_reserved / peak_total
+
+        if peak_allocated > cluster_allocated:
+            cluster_allocated = peak_allocated
+        if peak_reserved > cluster_reserved:
+            cluster_reserved = peak_reserved
+            cluster_reserved_total = peak_total
+
+    if not metrics:
+        return {}
+
+    metrics[f"{prefix}/peak_allocated_gb"] = cluster_allocated / bytes_per_gb
+    metrics[f"{prefix}/peak_reserved_gb"] = cluster_reserved / bytes_per_gb
+    # ``cluster_reserved_total`` is only seeded inside the strict ``>`` branch
+    # above, so it stays ``None`` if every active group reports
+    # max_reserved == 0 on all ranks (a worker that has not yet allocated). Guard
+    # the division so the headline fraction is a safe 0.0 rather than a
+    # 0 / None TypeError. Effectively unreachable on a live CUDA worker (the
+    # context plus any allocation always reserves bytes), but kept robust to
+    # match the helper's other defensive guards.
+    metrics[f"{prefix}/peak_reserved_frac"] = (
+        cluster_reserved / cluster_reserved_total if cluster_reserved_total else 0.0
+    )
+    return metrics
+
+
 def run_on_each_node(node_ids: List[str], fn: Callable, *args, **kwargs):
     """Simple helper to run a function on each node.
 

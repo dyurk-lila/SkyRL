@@ -67,6 +67,7 @@ from skyrl.train.utils.trainer_utils import (
     GLOBAL_STEP_PREFIX,
     cleanup_old_checkpoints,
     extract_step_from_path,
+    peak_memory_metrics,
     validate_consistency_for_latest_checkpoint,
 )
 from skyrl.train.utils.utils import ResolvedPlacementGroup, Timer
@@ -753,6 +754,28 @@ class SFTTrainer:
         cp = self.sft_cfg.megatron_config.context_parallel_size
         return total_gpus // (tp * pp * cp)
 
+    def _peak_memory_log(self) -> dict[str, float]:
+        """Per-step peak GPU memory (max over ranks), as a ready-to-merge log dict.
+
+        Thin wrapper over the shared :func:`peak_memory_metrics` reduce (so SFT
+        and RL cannot drift): fans :meth:`Worker.get_peak_cuda_memory` out across
+        the policy workers, max-reduces the per-rank high-water marks, and
+        converts bytes to GB. SFT has a single ``policy`` group, so the helper's
+        per-group keys (``memory/policy/*``) and its cluster-wide headline keys
+        (``memory/peak_*``) carry the same numbers; the headline keys match the
+        original SFT metric exactly.
+
+        Cost: the worker method itself does no device sync, but this consumer
+        issues one **blocking** ``ray.get`` fan-out to every policy rank (RPC
+        dispatch + round-trip + per-rank dict materialization). It is therefore
+        a host-side serialization point on the train step's critical path and is
+        gated behind ``log_peak_memory`` (default off) at the call sites.
+
+        Returns ``{}`` when there are no per-rank results (defensive; should not
+        happen in normal operation).
+        """
+        return peak_memory_metrics({"policy": self.dispatch.policy_actor_group})
+
     def _validate_packing_cfg(self):
         """Validate the config when ``use_sequence_packing=True``."""
         if self.sft_cfg.strategy != "megatron":
@@ -1409,6 +1432,8 @@ class SFTTrainer:
             log_dict.update({f"timing/{k}": v for k, v in all_timings.items()})
             if self._ray_gpu_monitor is not None:
                 log_dict.update(self._ray_gpu_monitor.flush())
+            if self.sft_cfg.log_peak_memory:
+                log_dict.update(self._peak_memory_log())
 
             self.tracker.log(log_dict, step=step, commit=True)
             logger.info(
@@ -1561,6 +1586,8 @@ class SFTTrainer:
             log_dict.update({f"timing/{k}": v for k, v in all_timings.items()})
             if self._ray_gpu_monitor is not None:
                 log_dict.update(self._ray_gpu_monitor.flush())
+            if self.sft_cfg.log_peak_memory:
+                log_dict.update(self._peak_memory_log())
 
             self._fire("on_step_end", batch=batch, metrics=step_result)
 

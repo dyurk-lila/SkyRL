@@ -73,6 +73,16 @@ class WorkerDispatch:
         self._actor_groups[model] = actor_group
         self._gpu_state[model] = GPUState()
 
+    @property
+    def policy_actor_group(self) -> PPORayActorGroup:
+        """The policy :class:`PPORayActorGroup`.
+
+        Public accessor so callers (e.g. trainer-side observability) can fan a
+        ``pass_through`` method out across the policy workers without reaching
+        into the private ``_actor_groups`` dict.
+        """
+        return self._actor_groups["policy"]
+
     # ------------------------------------------------------------------
     # Multi-LoRA: per-model adapter swap orchestration.
     # ------------------------------------------------------------------
