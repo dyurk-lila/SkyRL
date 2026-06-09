@@ -68,7 +68,7 @@ def _fused_linear_logprob_apply(
                 inference_only,
                 return_entropy,
             )
-        except ImportError as e:
+        except Exception as e:
             warnings.warn(
                 f"fused_linear_logprob_backend='triton' unavailable ({e}); falling back to the "
                 "pure-PyTorch backend. Install triton (and run on GPU) to use the fused Triton kernel.",
