@@ -39,12 +39,21 @@ def init_megatron_optim_config(
         "min_lr": getattr(optim_config, "min_lr", 0.0),
         "clip_grad": getattr(optim_config, "max_grad_norm", 1.0),
         "weight_decay": getattr(optim_config, "weight_decay", 1e-2),
+        # adam_beta1/2 are only consumed by Adam-family optimizers in Megatron-core.
         "adam_beta1": float(adam_betas[0]),
         "adam_beta2": float(adam_betas[1]),
         "bf16": True,
         "params_dtype": torch.bfloat16,
         "use_distributed_optimizer": True,
     }
+    # Forward SGD momentum whenever the field is present. ``SkyRLOptimizerConfig.sgd_momentum`` is a
+    # first-class field (default 0.0), so a real OptimizerConfig always provides it and it is forwarded
+    # rather than falling back to Megatron-core's internal default (0.9). It is only consumed by
+    # Megatron-core's SGD path; for Adam-family optimizers it is inert. A bare DictConfig without the
+    # field defers to Megatron-core's own default (the ``getattr`` returns None and we skip forwarding).
+    sgd_momentum = getattr(optim_config, "sgd_momentum", None)
+    if sgd_momentum is not None:
+        optim_args["sgd_momentum"] = float(sgd_momentum)
     optim_args.update(optimizer_config_kwargs)
 
     config = OptimizerConfig(**optim_args)

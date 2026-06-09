@@ -52,6 +52,51 @@ else:
     CPUOffloadPolicy, FSDPModule, MixedPrecisionPolicy = None, None, None
 
 
+def build_fsdp_optimizer(optim_config: OptimizerConfig, params) -> optim.Optimizer:
+    """Build the torch optimizer for the FSDP backend from ``optim_config``.
+
+    ``params`` is any iterable accepted by a ``torch.optim`` constructor (e.g.
+    ``module.parameters()``). Only the cross-backend core ``"adam"`` (AdamW) and ``"sgd"`` are
+    buildable on FSDP. Any other name (the Megatron-only "emerging" optimizers, e.g.
+    ``"lion"``/``"muon"``/``"adaptive_muon"``/``"soap"``) raises ``NotImplementedError`` — FSDP
+    cannot construct them and they are only reachable via Megatron-core + the optional
+    ``emerging-optimizers`` package.
+
+    .. warning::
+        Only the default ``"adam"`` path is exercised by existing tests/runs. The ``"sgd"`` path
+        is wired but UNVALIDATED on real GPU training; see ``OptimizerConfig.optimizer``.
+
+    Note: ``"sgd"`` momentum comes from ``optim_config.sgd_momentum`` (default ``0.0`` = vanilla
+    SGD, byte-identical to the historical FSDP behavior). The Megatron backend now also forwards
+    the same field, so the two backends agree (both default to ``0.0``).
+    """
+    optimizer_type = getattr(optim_config, "optimizer", "adam")
+    if optimizer_type == "adam":
+        return optim.AdamW(
+            params,
+            lr=optim_config.lr,
+            betas=optim_config.adam_betas,
+            weight_decay=optim_config.weight_decay,
+        )
+    elif optimizer_type == "sgd":
+        # momentum defaults to 0.0 (sgd_momentum default == torch default), so behavior is
+        # unchanged from before sgd_momentum became a field.
+        return optim.SGD(
+            params,
+            lr=optim_config.lr,
+            momentum=getattr(optim_config, "sgd_momentum", 0.0),
+            weight_decay=optim_config.weight_decay,
+        )
+    else:
+        known_emerging = ", ".join(repr(o) for o in OptimizerConfig._KNOWN_EMERGING_OPTIMIZERS)
+        raise NotImplementedError(
+            f"The FSDP backend only supports the cross-backend core optimizers 'adam' or 'sgd', "
+            f"got {optimizer_type!r}. Emerging optimizers (e.g. {known_emerging}; non-exhaustive) "
+            "are only available on the Megatron backend via the optional emerging-optimizers package; "
+            "the exact set is owned by Megatron-core."
+        )
+
+
 class FSDPStrategy(DistributedStrategy):
     """
     The strategy for training with FSDP.
@@ -256,12 +301,7 @@ class FSDPStrategy(DistributedStrategy):
 
         optim_config = self.optimizer_config
         if optim_config is not None:
-            new_optimizer = optim.AdamW(
-                fsdp_module.parameters(),
-                lr=optim_config.lr,
-                betas=optim_config.adam_betas,
-                weight_decay=optim_config.weight_decay,
-            )
+            new_optimizer = build_fsdp_optimizer(optim_config, fsdp_module.parameters())
 
             lr_scheduler = get_scheduler(
                 optim_config.scheduler,

@@ -137,6 +137,18 @@ megatron = [
     "nvidia-modelopt; sys_platform == 'linux'",
 ]
 
+# Opt-in extra that unlocks the Megatron-only "emerging" optimizers
+# (lion/muon/adaptive_muon and any others the package exposes via its registry).
+# Standalone and lower-risk: compose with the megatron extra, e.g.
+#   uv sync --extra megatron --extra emerging-optimizers
+# It is intentionally NOT folded into the `megatron` extra so the default Megatron
+# install is unchanged (adam/sgd only) and this heavier git dep stays opt-in.
+# The PyPI `emerging-optimizers` name is an NVIDIA placeholder (only 999.9.9), so the
+# real package is git-installed via [tool.uv.sources] below (import name:
+# `emerging_optimizers`). Megatron-core requires >=0.2 to enable these optimizers.
+emerging-optimizers = [
+    "emerging-optimizers; sys_platform == 'linux' and python_version >= '3.12'",
+]
 flashrl = [
     "skyrl[skyrl-train]",
     # NOTE: Custom vLLM wheel must be installed separately.
@@ -299,6 +311,17 @@ harbor = { git = "https://github.com/laude-institute/harbor", rev = "a85628c803d
 megatron-bridge = {git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge", rev = "8382dc343b07b068a827ca20bae860633df3baa0", marker = "sys_platform == 'linux'"}
 # megatron-core dev branch: https://github.com/NVIDIA/Megatron-LM/tree/dev latest as of 6/5/26
 megatron-core = {git = "https://github.com/NVIDIA/Megatron-LM", rev = "cefc2520158c7ceba3f9adbe4b547a6f7a118da1", marker = "sys_platform == 'linux'"}
+# emerging-optimizers (Megatron-only lion/muon/adaptive_muon/...): opt-in via the
+# `emerging-optimizers` extra. The PyPI name is an NVIDIA placeholder (999.9.9), so install
+# from git like the other NVIDIA deps above. Megatron-core requires version >=0.2 to enable
+# these optimizers.
+# TODO: pin a specific rev (SHA) to match the repo's reproducible SHA-pinning convention for the
+# other NVIDIA git deps (megatron-core / megatron-bridge / harbor above). A branch ref is
+# non-reproducible (the resolved commit drifts on each fresh resolve) and MUST become a SHA exposing
+# a >=0.2 version before merge. This branch ref is tolerable only for now because the whole capability
+# is gated behind the DO-NOT-UPSTREAM / DO-NOT-RELY notice (see OptimizerConfig.optimizer) — no
+# default install or validated path depends on it.
+emerging-optimizers = {git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers", branch = "main", marker = "sys_platform == 'linux'"}
 # NOTE (sumanthrh): This custom wheel of vllm-router includes a fix for /chat/completions endpoint: https://github.com/vllm-project/router/pull/162  on top of 0.1.14
 # TODO (sumanthrh): Remove this after 0.1.15 vllm-router release
 vllm-router = { url = "https://github.com/SumanthRH/router/releases/download/0.1.14.post1/vllm_router-0.1.14-cp38-abi3-manylinux_2_35_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }

@@ -100,7 +100,11 @@ def _patched_load_parameter_state_from_dp_reshardable(self, state_dict):
 # gpu_optimizer_cls) in its ``defaults`` dict, which bleed into param_groups
 # and get pickled into the "common" checkpoint file.  PyTorch 2.6+ defaults
 # torch.load to weights_only=True, which rejects these class globals.
-_safe_globals = [torch.optim.Adam, torch.optim.AdamW]
+# torch.optim.SGD covers both the plain-SGD path and HybridDeviceOptimizer's
+# CPUSGD (megatron-core aliases ``from torch.optim import SGD as CPUSGD``) and its
+# torch-fallback gpu_optimizer_cls, so ``optimizer: sgd`` + optimizer_cpu_offload can
+# round-trip through the weights_only=True "common" checkpoint load.
+_safe_globals = [torch.optim.Adam, torch.optim.AdamW, torch.optim.SGD]
 try:
     from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import (
         HybridDeviceOptimizer,
@@ -113,6 +117,15 @@ try:
         from transformer_engine.pytorch.optimizers.fused_adam import FusedAdam
 
         _safe_globals.append(FusedAdam)
+    except ImportError:
+        pass
+
+    # When Transformer Engine is installed, megatron-core uses TE's FusedSGD as the
+    # GPU SGD class (gpu_optimizer_cls), so register it alongside FusedAdam.
+    try:
+        from transformer_engine.pytorch.optimizers import FusedSGD
+
+        _safe_globals.append(FusedSGD)
     except ImportError:
         pass
 except ImportError:
