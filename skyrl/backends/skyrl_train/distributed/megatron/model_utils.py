@@ -51,8 +51,8 @@ def _fused_linear_logprob_apply(
     if backend == "triton":
         try:
             from skyrl.backends.skyrl_train.distributed.megatron.fused_linear_logprob_triton import (
-                FusedLinearLogprobTriton,
                 TRITON_AVAILABLE,
+                FusedLinearLogprobTriton,
             )
 
             if not TRITON_AVAILABLE:
@@ -155,19 +155,52 @@ def _distributed_log_softmax_and_entropy(
     torch.distributed.all_reduce(logits_max, op=torch.distributed.ReduceOp.MAX, group=group)
 
     shifted = vocab_parallel_logits - logits_max
-    sum_exp_logits = shifted.exp().sum(-1, keepdim=True).float()
+    # Compute exp(shifted) once and reuse it for both the sum-exp denominator and the softmax.
+    exp_shifted = shifted.exp()
+    sum_exp_logits = exp_shifted.sum(-1, keepdim=True).float()
     torch.distributed.all_reduce(sum_exp_logits, op=torch.distributed.ReduceOp.SUM, group=group)
 
     log_sum_exp = sum_exp_logits.log()
     log_softmax = shifted - log_sum_exp.to(shifted.dtype)
 
     # softmax = exp(shifted) / sum_exp ; sum(softmax * logits) reduced over the shard.
-    softmax = shifted.exp().div_(sum_exp_logits)
+    softmax = exp_shifted.div_(sum_exp_logits)
     sum_px = (softmax * vocab_parallel_logits).sum(-1, keepdim=True)
     torch.distributed.all_reduce(sum_px, op=torch.distributed.ReduceOp.SUM, group=group)
 
     entropy = (logits_max + log_sum_exp - sum_px).squeeze(-1)
     return log_softmax, entropy
+
+
+def _add_chosen_token_grad(
+    grad_logits: torch.Tensor,
+    chunk_target_mask: torch.Tensor,
+    chunk_masked_target: torch.Tensor,
+    chunk_grad_output: torch.Tensor,
+    partition_vocab_size: int,
+) -> None:
+    """Add ``grad_output`` at the chosen-token (label) positions of ``grad_logits``, in place.
+
+    Shared by :class:`ChunkedDistributedLogprob` and :class:`FusedLinearLogprob` backward so the
+    out-of-shard / index convention stays in lockstep. ``grad_logits`` enters as
+    ``-softmax * grad_output`` with shape ``[B, chunk_len, V // TP]``; this adds ``grad_output`` at
+    each in-shard target column, completing ``(onehot(target) - softmax) * grad_output``. Targets
+    not owned by this shard (``chunk_target_mask`` set) contribute no one-hot term, matching the
+    stock path. A flat ``scatter_add_`` is used instead of materializing a
+    ``[B, chunk_len, V // TP]`` one-hot (which would be ~8x the softmax allocation and OOM at large
+    vocab).
+    """
+    batch_size, chunk_len = grad_logits.shape[0], grad_logits.shape[1]
+    device = grad_logits.device
+    row = torch.arange(batch_size, device=device).view(-1, 1).expand(-1, chunk_len).reshape(-1)
+    col = torch.arange(chunk_len, device=device).expand(batch_size, -1).reshape(-1)
+    # Flat offset to the start of each [b, s, :] row in the chunk's flattened tensor.
+    flat_idx = (row * chunk_len + col) * partition_vocab_size
+
+    valid_mask = ~chunk_target_mask
+    flat_chosen = flat_idx.masked_select(valid_mask.reshape(-1)) + chunk_masked_target.masked_select(valid_mask)
+    grad_output_selected = chunk_grad_output.masked_select(valid_mask)
+    grad_logits.view(-1).scatter_add_(0, flat_chosen, grad_output_selected)
 
 
 class DistributedLogprob(torch.autograd.Function):
@@ -325,12 +358,9 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
 
         all_grad_input = []
 
-        batch_size = int(vocab_parallel_logits.shape[0])
-
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * chunk_size
             chunk_end = min(seq_size, (chunk_idx + 1) * chunk_size)
-            chunk_len = chunk_end - chunk_start
 
             logits = vocab_parallel_logits[:, chunk_start:chunk_end, :]
             logits = logits.to(dtype=torch.float32)
@@ -341,30 +371,19 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
             )
             softmax_output = softmax_output.exp()
 
-            # Memory-efficient scatter-add fast path (ported from DistributedLogprob.backward).
-            # Materializing one_hot(masked_target, num_classes=partition_vocab_size) would
-            # allocate a [B, chunk_len, partition_vocab_size] int64 tensor (~8x the size of
-            # softmax_output in float32), which causes OOM for large vocabularies. Instead,
-            # compute -softmax * grad_output in place and add grad_output at the chosen-token
-            # positions via scatter_add_.
+            # Build (onehot(target) - softmax) * grad_output without materializing a
+            # [B, chunk_len, partition_vocab_size] one-hot (~8x softmax_output in float32 -> OOM at
+            # large vocab). `neg` is zero-copy; the subsequent mul_ writes in place, then
+            # _add_chosen_token_grad adds grad_output at the chosen-token positions via scatter_add_.
             chunk_target_mask = target_mask[:, chunk_start:chunk_end]
             chunk_masked_target = masked_target[:, chunk_start:chunk_end]
             chunk_grad_output = grad_output[:, chunk_start:chunk_end]
 
-            row = torch.arange(batch_size, device=softmax_output.device).view(-1, 1).expand(-1, chunk_len).reshape(-1)
-            col = torch.arange(chunk_len, device=softmax_output.device).expand(batch_size, -1).reshape(-1)
-            # Flat offset to the start of each [b, s, :] row in the chunk's flattened tensor.
-            flat_idx = (row * chunk_len + col) * partition_vocab_size
-
-            valid_mask = ~chunk_target_mask
-            flat_chosen = flat_idx.masked_select(valid_mask.reshape(-1)) + chunk_masked_target.masked_select(valid_mask)
-
-            # `neg` is zero-copy; the subsequent mul_ writes in place.
             grad_input = softmax_output.neg_()
             grad_input.mul_(chunk_grad_output.unsqueeze(-1))
-
-            grad_output_selected = chunk_grad_output.masked_select(valid_mask)
-            grad_input.view(-1).scatter_add_(0, flat_chosen, grad_output_selected)
+            _add_chosen_token_grad(
+                grad_input, chunk_target_mask, chunk_masked_target, chunk_grad_output, partition_vocab_size
+            )
 
             all_grad_input.append(grad_input)
 
@@ -392,7 +411,7 @@ class FusedLinearLogprob(torch.autograd.Function):
     SkyRL's existing ``_compute_distributed_log_softmax`` exactly.
 
     Numerics (each are verified against the stock logits path in
-    ``tests/cpu/distributed/test_fused_linear_logprob.py``):
+    ``tests/backends/skyrl_train/cpu/megatron/test_fused_linear_logprob.py``):
       * forward: per seq-chunk, ``logits = (hidden_c @ weightᵀ).float()``; a vocab-parallel
         stable log-softmax via ``all_reduce(MAX)`` then ``all_reduce(SUM of exp)``; gather the
         target column (zeroed where the target is out-of-shard) and ``all_reduce(SUM)`` so
@@ -452,7 +471,6 @@ class FusedLinearLogprob(torch.autograd.Function):
         masked_target = (target - vocab_start_index).clamp_(min=0)
         masked_target[target_mask] = 0
 
-        partition_vocab_size = int(weight.shape[0])
         seq_size = int(hidden.shape[1])
         num_chunks = max(1, (seq_size + chunk_size - 1) // chunk_size)
 
@@ -478,9 +496,7 @@ class FusedLinearLogprob(torch.autograd.Function):
                 log_probs, -1, masked_target[:, chunk_start:chunk_end].unsqueeze(-1)
             ).squeeze(-1)
             chunk_log_probs[target_mask[:, chunk_start:chunk_end]] = 0.0
-            torch.distributed.all_reduce(
-                chunk_log_probs, op=torch.distributed.ReduceOp.SUM, group=tp_group
-            )
+            torch.distributed.all_reduce(chunk_log_probs, op=torch.distributed.ReduceOp.SUM, group=tp_group)
             all_log_probs.append(chunk_log_probs)
 
         log_probs = torch.cat(all_log_probs, dim=1)
@@ -539,33 +555,14 @@ class FusedLinearLogprob(torch.autograd.Function):
                 softmax = _compute_distributed_log_softmax(logits, group=tp_group).exp_()
 
             # d(log p(target))/dlogits = onehot(target) - softmax, scaled by grad_output.
-            # Build the gradient as (-softmax) then add grad_output at the chosen positions —
-            # the same memory-efficient scatter-add as ChunkedDistributedLogprob.backward (no
-            # [B, chunk, V] one-hot materialized).
+            # Build the gradient as (-softmax) then add grad_output at the chosen positions via the
+            # shared memory-efficient scatter-add (no [B, chunk, V] one-hot materialized).
             chunk_target_mask = target_mask[:, chunk_start:chunk_end]
             chunk_masked_target = masked_target[:, chunk_start:chunk_end]
             if logprob_grad_is_none:
-                chunk_grad_output = torch.zeros(
-                    softmax.shape[:2], dtype=softmax.dtype, device=softmax.device
-                )
+                chunk_grad_output = torch.zeros(softmax.shape[:2], dtype=softmax.dtype, device=softmax.device)
             else:
                 chunk_grad_output = grad_output[:, chunk_start:chunk_end]
-
-            batch_size = softmax.shape[0]
-            chunk_len = chunk_end - chunk_start
-            row = (
-                torch.arange(batch_size, device=softmax.device)
-                .view(-1, 1)
-                .expand(-1, chunk_len)
-                .reshape(-1)
-            )
-            col = torch.arange(chunk_len, device=softmax.device).expand(batch_size, -1).reshape(-1)
-            flat_idx = (row * chunk_len + col) * partition_vocab_size
-
-            valid_mask = ~chunk_target_mask
-            flat_chosen = flat_idx.masked_select(valid_mask.reshape(-1)) + chunk_masked_target.masked_select(
-                valid_mask
-            )
 
             if grad_entropy is not None:
                 # softmax is recomputed (not in-place negated) so it survives for the entropy
@@ -574,8 +571,9 @@ class FusedLinearLogprob(torch.autograd.Function):
             else:
                 dlogits = softmax.neg_()
                 dlogits.mul_(chunk_grad_output.unsqueeze(-1))
-            grad_output_selected = chunk_grad_output.masked_select(valid_mask)
-            dlogits.view(-1).scatter_add_(0, flat_chosen, grad_output_selected)
+            _add_chosen_token_grad(
+                dlogits, chunk_target_mask, chunk_masked_target, chunk_grad_output, partition_vocab_size
+            )
 
             if grad_entropy is not None:
                 # Entropy gradient, mirroring stock _VocabParallelEntropy.backward EXACTLY:
@@ -780,6 +778,19 @@ def from_parallel_logits_to_logprobs_packed_sequences(
         sub_seq_lengths (list[list[int]], optional): Per-row sub-sequence lengths for controller-side sequence packing.
             When provided, ``cu_seqlens_padded`` is interpreted as one entry per sub-sequence, and output values are
             scattered back to the row offsets used by ``PackedDataCollator``.
+        lm_head_weight (torch.Tensor, optional): When provided, enables the fused LM-head path:
+            ``vocab_parallel_logits`` is interpreted as the packed pre-projection hidden state
+            [1, T // CP, hidden_size] and ``lm_head_weight`` is this rank's LM-head weight shard
+            [vocab_size // TP, hidden_size]. The head GEMM is fused into the chunked log-prob so the full
+            [1, T // CP, vocab // TP] logits are never materialized. See :func:`from_parallel_logits_to_logprobs`
+            and :class:`FusedLinearLogprob`.
+        fused_backend (str, optional): Implementation for the fused path when ``lm_head_weight`` is set:
+            ``"torch"`` (default, pure-PyTorch, runs anywhere) or ``"triton"`` (vendored flash-style kernel,
+            GPU only, falls back to torch if unavailable). Ignored when ``lm_head_weight`` is None.
+        return_entropy (bool, optional): Only valid on the fused path (``lm_head_weight`` is set). When True,
+            ALSO return the per-token entropy of the full-vocab distribution, computed in the SAME chunked TP
+            loop as the log-prob (verl's established dual-output pattern). Entropy is per-position and
+            target-independent, so it is NOT rolled/scattered like the log-probs (see Returns). Defaults to False.
 
     Returns:
         torch.Tensor: Unpacked log probabilities tensor with shape [batch_size, unpacked_seqlen-1].

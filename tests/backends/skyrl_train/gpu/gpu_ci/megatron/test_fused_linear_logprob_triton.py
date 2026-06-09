@@ -36,68 +36,24 @@ from skyrl.backends.skyrl_train.distributed.megatron.fused_linear_logprob_triton
     TRITON_AVAILABLE,
     FusedLinearLogprobTriton,
 )
-from skyrl.backends.skyrl_train.distributed.megatron.model_utils import (
-    from_parallel_logits_to_logprobs,
-)
 
-# Module-level skip: the whole file needs a GPU and triton.
-pytestmark = pytest.mark.skipif(
-    not (torch.cuda.is_available() and TRITON_AVAILABLE),
-    reason="Triton fused LM-head log-prob requires a CUDA device and triton",
-)
-
-
-def _stock_logprobs(hidden, weight_shard, target, vstart, vend, chunk_size):
-    """Reference: materialize this rank's logit shard (hidden @ W_shard.T) then run the stock
-    (unfused) logprob path over the same TP group. fused(hidden, W_shard) must equal
-    stock(materialized logit shard). Returns (logprob, grad_hidden, grad_weight, grad_seed)."""
-    leaf_h = hidden.detach().clone().requires_grad_(True)
-    leaf_w = weight_shard.detach().clone().requires_grad_(True)
-    logits = leaf_h @ leaf_w.t()  # [B, S, V // TP]
-    lp = from_parallel_logits_to_logprobs(
-        logits,
-        target,
-        vocab_start_index=vstart,
-        vocab_end_index=vend,
-        tp_group=dist.group.WORLD,
-        inference_only=False,
-        cp_group=None,
-        chunk_size=chunk_size,
-    )
-    grad_seed = torch.linspace(0.5, 1.5, steps=lp.numel(), device=lp.device, dtype=lp.dtype).reshape(lp.shape)
-    lp.backward(grad_seed)
-    return lp.detach(), leaf_h.grad.detach(), leaf_w.grad.detach(), grad_seed
-
-
-def _fused_logprobs(hidden, weight_shard, target, vstart, vend, chunk_size, grad_seed):
-    """Triton fused path on this rank's weight shard, via the public lm_head_weight entry point."""
-    leaf_h = hidden.detach().clone().requires_grad_(True)
-    leaf_w = weight_shard.detach().clone().requires_grad_(True)
-    lp = from_parallel_logits_to_logprobs(
-        leaf_h,  # hidden state, NOT logits
-        target,
-        vocab_start_index=vstart,
-        vocab_end_index=vend,
-        tp_group=dist.group.WORLD,
-        inference_only=False,
-        cp_group=None,
-        chunk_size=chunk_size,
-        lm_head_weight=leaf_w,
-        # NOTE: requires model_utils.from_parallel_logits_to_logprobs to dispatch to
-        # FusedLinearLogprobTriton on the fused branch (see the backend-dispatch NOTE in the
-        # accompanying review message). When that wiring is absent this test will run against
-        # the pure-torch FusedLinearLogprob, which is still a valid (weaker) check.
-    )
-    lp.backward(grad_seed.clone())
-    return lp.detach(), leaf_h.grad.detach(), leaf_w.grad.detach()
+# Module-level markers: this is a megatron-backend GPU test (selected by the megatron GPU CI job
+# via ``-m megatron``), and the whole file additionally needs a GPU and triton.
+pytestmark = [
+    pytest.mark.megatron,
+    pytest.mark.skipif(
+        not (torch.cuda.is_available() and TRITON_AVAILABLE),
+        reason="Triton fused LM-head log-prob requires a CUDA device and triton",
+    ),
+]
 
 
 def _direct_fused_logprobs(hidden, weight_shard, target_shifted, vstart, vend, chunk_size, grad_seed):
-    """Drive FusedLinearLogprobTriton.apply directly (bypasses model_utils dispatch).
+    """Drive FusedLinearLogprobTriton.apply directly (bypasses the model_utils dispatcher).
 
     The public entry point shifts targets internally; here we pass an ALREADY-shifted target and
-    compare against a directly-driven stock reference, so this path is independent of whether
-    model_utils has been wired to select the Triton backend yet.
+    compare against a directly-driven stock reference, so the Triton kernel is exercised in
+    isolation from the ``_fused_linear_logprob_apply`` backend selection.
     """
     leaf_h = hidden.detach().clone().requires_grad_(True)
     leaf_w = weight_shard.detach().clone().requires_grad_(True)
@@ -279,7 +235,9 @@ def _direct_fused_entropy(hidden, weight_shard, target_shifted, vstart, vend, ch
 
 def _stock_entropy(hidden, weight_shard, chunk_size, grad_ent):
     """Stock per-token entropy over the materialized logit shard via vocab_parallel_entropy."""
-    from skyrl.backends.skyrl_train.distributed.megatron.model_utils import vocab_parallel_entropy
+    from skyrl.backends.skyrl_train.distributed.megatron.model_utils import (
+        vocab_parallel_entropy,
+    )
 
     leaf_h = hidden.detach().clone().requires_grad_(True)
     leaf_w = weight_shard.detach().clone().requires_grad_(True)
@@ -323,9 +281,9 @@ def _entropy_worker(rank, world_size, port, chunk_size, with_oov, dtype_str, ret
         weight_shard = weight_full[vstart:vend].contiguous()
         target_shifted = target.roll(shifts=-1, dims=-1)
 
-        grad_ent = torch.linspace(
-            0.3, 1.1, steps=batch_size * seq_len, device=device, dtype=torch.float32
-        ).reshape(batch_size, seq_len)
+        grad_ent = torch.linspace(0.3, 1.1, steps=batch_size * seq_len, device=device, dtype=torch.float32).reshape(
+            batch_size, seq_len
+        )
 
         ent_ref, gh_ref, gw_ref = _stock_entropy(hidden, weight_shard, chunk_size, grad_ent)
         ent_fused, gh_fused, gw_fused = _direct_fused_entropy(
