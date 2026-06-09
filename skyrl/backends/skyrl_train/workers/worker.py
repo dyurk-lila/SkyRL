@@ -295,6 +295,37 @@ class Worker(DistributedTorchRayActor):
             "total": total,
         }
 
+    def get_peak_cuda_memory(self, reset: bool = True) -> Dict[str, Any]:
+        """Get peak CUDA memory usage on worker's CUDA device since the last reset.
+
+        Reports the per-rank high-water marks tracked by the caching allocator:
+        ``max_allocated`` (peak live tensor bytes) and ``max_reserved`` (peak
+        allocator pool bytes). These discriminate configs in a way that the
+        instantaneous values from :meth:`get_cuda_memory` cannot.
+
+        Args:
+            reset: When True (default), reset the peak-memory stats after reading
+                so the next call measures the next window (e.g. one train step).
+
+        Returns:
+            dict with byte-valued ``max_allocated`` (peak live tensor bytes),
+            ``max_reserved`` (peak allocator pool bytes), and ``total`` (device
+            capacity), plus the integer ``rank`` of this worker (0 when the
+            distributed process group is not initialized). The ``rank`` value is
+            per-rank and intended for max-reduction by a future trainer-side
+            consumer.
+        """
+        torch.cuda.synchronize()
+        result = {
+            "max_allocated": torch.cuda.max_memory_allocated(),
+            "max_reserved": torch.cuda.max_memory_reserved(),
+            "total": torch.cuda.mem_get_info()[1],
+            "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
+        }
+        if reset:
+            torch.cuda.reset_peak_memory_stats()
+        return result
+
     def save_memory_snapshot(self, tag: str = ""):
         """Save a snapshot of memory usage on the Worker's CUDA device.
 
