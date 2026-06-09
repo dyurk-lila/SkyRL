@@ -86,6 +86,16 @@ class ModelConfig(BaseConfig):
 
 @dataclass
 class OptimizerConfig(BaseConfig):
+    optimizer: str = "adam"
+    """Optimizer type. ``"adam"`` (AdamW; the default) and ``"sgd"`` are honored by both the
+    FSDP and Megatron backends. ``"adam"`` already maps to AdamW (decoupled weight decay) on
+    both backends, so there is no separate ``"adamw"`` token. Additional types reachable on the
+    Megatron backend (``"lion"``, ``"muon"``, ``"soap"``) require the optional
+    ``emerging-optimizers>=0.2`` package and are not supported on FSDP. ``adam_betas`` is only
+    consumed by Adam-family optimizers. ``sgd`` momentum differs by backend: the Megatron backend
+    uses Megatron-core's default momentum (0.9), whereas the FSDP backend currently builds
+    ``torch.optim.SGD`` with its default ``momentum=0`` (vanilla SGD) since ``OptimizerConfig``
+    does not yet expose a momentum field."""
     lr: float = 1e-6
     adam_betas: List[float] = field(default_factory=lambda: [0.9, 0.999])
     weight_decay: float = 1e-2
@@ -95,6 +105,25 @@ class OptimizerConfig(BaseConfig):
     num_warmup_steps: int = 0
     """Number of mini-batch steps to warmup the optimizer."""
     scheduler: str = "constant_with_warmup"
+
+    # Optimizer types every backend can build natively without optional packages.
+    _CORE_OPTIMIZERS = ("adam", "sgd")
+    # Optimizer types reachable on the Megatron backend only via the optional
+    # ``emerging-optimizers`` package (availability is install-dependent and validated
+    # by Megatron-core at construction time, so we accept them here rather than reject).
+    _EMERGING_OPTIMIZERS = ("lion", "muon", "soap")
+
+    def __post_init__(self):
+        valid = self._CORE_OPTIMIZERS + self._EMERGING_OPTIMIZERS
+        if self.optimizer not in valid:
+            raise ValueError(
+                f"Invalid optimizer {self.optimizer!r}. Valid options are {valid}. "
+                f"{self._CORE_OPTIMIZERS} are supported by both backends; "
+                f"{self._EMERGING_OPTIMIZERS} are Megatron-only and require the optional "
+                "emerging-optimizers>=0.2 package. "
+                "Note: 'adam' already means AdamW (decoupled weight decay), so use 'adam' "
+                "rather than 'adamw'."
+            )
 
 
 @dataclass

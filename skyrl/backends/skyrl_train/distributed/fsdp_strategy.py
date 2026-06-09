@@ -52,6 +52,41 @@ else:
     CPUOffloadPolicy, FSDPModule, MixedPrecisionPolicy = None, None, None
 
 
+def build_fsdp_optimizer(optim_config: OptimizerConfig, params) -> optim.Optimizer:
+    """Build the torch optimizer for the FSDP backend from ``optim_config``.
+
+    ``params`` is any iterable accepted by a ``torch.optim`` constructor (e.g.
+    ``module.parameters()``). Only ``"adam"`` (AdamW) and ``"sgd"`` are buildable on FSDP;
+    the Megatron-only types (``"lion"``/``"muon"``/``"soap"``) raise ``NotImplementedError``.
+
+    Note: ``"sgd"`` builds ``torch.optim.SGD`` with its default ``momentum=0`` (vanilla SGD).
+    This diverges from the Megatron backend, which uses Megatron-core's default momentum of
+    0.9. ``OptimizerConfig`` does not yet expose a momentum field; until it does, an FSDP SGD
+    run is momentum-free. See the ``OptimizerConfig.optimizer`` docstring.
+    """
+    optimizer_type = getattr(optim_config, "optimizer", "adam")
+    if optimizer_type == "adam":
+        return optim.AdamW(
+            params,
+            lr=optim_config.lr,
+            betas=optim_config.adam_betas,
+            weight_decay=optim_config.weight_decay,
+        )
+    elif optimizer_type == "sgd":
+        # momentum defaults to 0 here (torch default); see the divergence note above.
+        return optim.SGD(
+            params,
+            lr=optim_config.lr,
+            weight_decay=optim_config.weight_decay,
+        )
+    else:
+        raise NotImplementedError(
+            f"The FSDP backend only supports optimizer 'adam' or 'sgd', got {optimizer_type!r}. "
+            "Optimizers such as 'lion'/'muon'/'soap' are only available on the Megatron backend "
+            "via the optional emerging-optimizers package."
+        )
+
+
 class FSDPStrategy(DistributedStrategy):
     """
     The strategy for training with FSDP.
@@ -256,12 +291,7 @@ class FSDPStrategy(DistributedStrategy):
 
         optim_config = self.optimizer_config
         if optim_config is not None:
-            new_optimizer = optim.AdamW(
-                fsdp_module.parameters(),
-                lr=optim_config.lr,
-                betas=optim_config.adam_betas,
-                weight_decay=optim_config.weight_decay,
-            )
+            new_optimizer = build_fsdp_optimizer(optim_config, fsdp_module.parameters())
 
             lr_scheduler = get_scheduler(
                 optim_config.scheduler,

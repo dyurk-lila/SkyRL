@@ -217,6 +217,7 @@ For both the critic and policy model, we provide a common optimizer configuratio
 
 ```yaml
 optimizer_config:
+   optimizer: "adam"
    lr: 1.0e-6
    adam_betas: [0.9, 0.999]
    weight_decay: 1e-2
@@ -227,8 +228,9 @@ optimizer_config:
 
 ```
 
+- `optimizer_config.optimizer`: Optimizer type. Defaults to `"adam"` (AdamW with decoupled weight decay; there is no separate `"adamw"` token). `"adam"` and `"sgd"` are supported on both the FSDP and Megatron backends. `"lion"`, `"muon"`, and `"soap"` are reachable only on the Megatron backend and require the optional `emerging-optimizers>=0.2` package; the FSDP backend raises `NotImplementedError` for them. Note that `"sgd"` momentum differs by backend: Megatron uses Megatron-core's default momentum (0.9), while FSDP currently builds `torch.optim.SGD` with its default `momentum=0` (vanilla SGD).
 - `optimizer_config.lr`: Learning rate for the optimizer
-- `optimizer_config.adam_betas`: Betas for AdamW optimizer.
+- `optimizer_config.adam_betas`: Betas for AdamW optimizer. Only consumed by Adam-family optimizers.
 - `optimizer_config.weight_decay`: L2 regularization strength for AdamW.
 - `optimizer_config.max_grad_norm`: Gradient clipping parameter. The total L2 norm of the model gradients will be scaled to this value during training.
 - `optimizer_config.offload_after_step`: Whether to offload optimizer state to CPU after step if colocated. When generation and training workers are colocated, we recommend using the default setting of `true`. In some cases with non-colocation, it can be desirable to leave optimizer state on GPU memory to avoid offloading costs as well as additional CPU memory usage.
@@ -255,6 +257,7 @@ policy:
       # For Megatron, this is used for `lora_A_init_method`, and "xavier", "normal", "kaiming", and "zero" are supported.
       init_method: "kaiming" # Initialization method for LoRA layers
   optimizer_config:
+    optimizer: "adam"  # Optimizer type (adam=AdamW; sgd; lion/muon/soap are Megatron-only)
     lr: 1.0e-6  # Learning rate
     adam_betas: [0.9, 0.999]  # Betas for Adam optimizer
     weight_decay: 1e-2  # L2 regularization strength
@@ -307,6 +310,7 @@ critic:
       exclude_modules: null  # Modules to exclude from LoRA
       init_method: "kaiming" # Initialization method for LoRA layers
   optimizer_config:
+    optimizer: "adam"  # Optimizer type (adam=AdamW; sgd; lion/muon/soap are Megatron-only)
     lr: 5.0e-6
     adam_betas: [0.9, 0.999]
     weight_decay: 1e-2

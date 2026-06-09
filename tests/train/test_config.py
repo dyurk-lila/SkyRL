@@ -12,6 +12,7 @@ from omegaconf import OmegaConf
 
 from skyrl.train.config.config import (
     BaseConfig,
+    OptimizerConfig,
     SkyRLTrainConfig,
     _resolve_class_type,
     build_nested_dataclass,
@@ -185,6 +186,72 @@ class TestTrainerUseSamplePackingAlias:
             SkyRLTrainConfig.from_cli_overrides(
                 ["trainer.use_sample_packing=true", "trainer.remove_microbatch_padding=false"]
             )
+
+
+class TestOptimizerConfig:
+    """Tests for the ``OptimizerConfig.optimizer`` field, its default, and validation.
+
+    Shared by SFT and RL; the default must remain ``"adam"`` so existing runs are
+    bit-identical."""
+
+    def test_optimizer_defaults_to_adam(self):
+        assert OptimizerConfig().optimizer == "adam"
+
+    def test_optimizer_default_flows_through_full_config(self):
+        cfg = SkyRLTrainConfig.from_cli_overrides([])
+        assert cfg.trainer.policy.optimizer_config.optimizer == "adam"
+        assert cfg.trainer.critic.optimizer_config.optimizer == "adam"
+
+    @pytest.mark.parametrize("optimizer", ["adam", "sgd", "lion", "muon", "soap"])
+    def test_supported_optimizer_values_accepted(self, optimizer):
+        assert OptimizerConfig(optimizer=optimizer).optimizer == optimizer
+
+    @pytest.mark.parametrize("optimizer", ["adamw", "Adam", "rmsprop", "", "lamb"])
+    def test_invalid_optimizer_rejected(self, optimizer):
+        with pytest.raises(ValueError, match="Invalid optimizer"):
+            OptimizerConfig(optimizer=optimizer)
+
+    def test_optimizer_flows_through_build_nested_dataclass(self):
+        cfg = build_nested_dataclass(OptimizerConfig, {"optimizer": "sgd"})
+        assert cfg.optimizer == "sgd"
+
+    def test_optimizer_settable_via_cli_override(self):
+        cfg = SkyRLTrainConfig.from_cli_overrides(["trainer.policy.optimizer_config.optimizer=sgd"])
+        assert cfg.trainer.policy.optimizer_config.optimizer == "sgd"
+
+    def test_invalid_optimizer_rejected_via_cli_override(self):
+        with pytest.raises(ValueError, match="Invalid optimizer"):
+            SkyRLTrainConfig.from_cli_overrides(["trainer.policy.optimizer_config.optimizer=rmsprop"])
+
+    def test_invalid_optimizer_rejected_via_from_dict_config(self):
+        # Lock in the Hydra/OmegaConf entry (from_dict_config -> build_nested_dataclass
+        # -> __post_init__) rejecting an invalid value, not just the CLI-override path.
+        cfg = OmegaConf.create({"optimizer": "rmsprop"})
+        with pytest.raises(ValueError, match="Invalid optimizer"):
+            OptimizerConfig.from_dict_config(cfg)
+
+    def test_valid_optimizer_accepted_via_from_dict_config(self):
+        cfg = OmegaConf.create({"optimizer": "sgd"})
+        assert OptimizerConfig.from_dict_config(cfg).optimizer == "sgd"
+
+    def test_optimizer_class_attrs_excluded_from_dataclass_fields(self):
+        # The allow-list tuples are plain (non-annotated) class attributes, so they must
+        # NOT be dataclass fields. This is what keeps them out of ``asdict()`` and the
+        # strict key validator, and is the basis for the byte-identical default claim:
+        # the only new serialized field is ``optimizer`` (default "adam").
+        import dataclasses
+
+        field_names = {f.name for f in dataclasses.fields(OptimizerConfig)}
+        assert "_CORE_OPTIMIZERS" not in field_names
+        assert "_EMERGING_OPTIMIZERS" not in field_names
+        assert "optimizer" in field_names
+
+        d = dataclasses.asdict(OptimizerConfig())
+        assert d["optimizer"] == "adam"
+        assert "_CORE_OPTIMIZERS" not in d
+        assert "_EMERGING_OPTIMIZERS" not in d
+        # No momentum field is exposed yet (FSDP/Megatron SGD divergence is documented).
+        assert "sgd_momentum" not in d
 
 
 class TestMaxSeqLenValidation:
