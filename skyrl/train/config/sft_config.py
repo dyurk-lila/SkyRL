@@ -202,6 +202,15 @@ class SFTConfig(BaseConfig):
     # ---- Data loading ----
     num_workers: int = 8
     """Number of worker processes for parallel tokenization during dataset loading. Set to 0 for single-threaded."""
+    prefetch_data: bool = True
+    """Async double-buffer the per-step collate. When True, the CPU-side packing
+    collate for step N+1 runs on a single background thread while step N's
+    forward/backward runs on the GPU, hiding the collate latency. The collate is
+    deterministic within an epoch, so the prefetched batch is byte-identical to
+    the synchronous path; at an epoch boundary (data reshuffle) the prefetch is
+    skipped and the next batch is computed synchronously on the post-shuffle
+    order. Set to False to A/B against the serial data-loading path. May also be
+    forced off via the ``SKYRL_SFT_PREFETCH_DATA=0`` environment variable."""
 
     # ---- Tokenized dataset caching ----
     cache_dir: str = os.path.join(
