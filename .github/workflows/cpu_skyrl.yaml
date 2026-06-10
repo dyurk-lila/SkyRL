@@ -47,11 +47,15 @@ jobs:
     - name: Run pytest
       run: |
         uv run --extra tinker --extra jax --extra dev --with transformers==5.2.0 pytest --forked -s tests/tx/models/test_qwen3_5.py
-        # tests/tinker/test_api.py and tests/tinker/test_sample_session_routing.py spin up a real
-        # model-backed Tinker API server per test (subprocess.Popen + healthz polling); on CPU they
-        # take ~35+ min and dominate this job (the session-routing file alone ran ~32 min upstream).
-        # They are covered by the GPU/integration tinker CI (gpu_e2e_ci_tinker*), so exclude them here.
-        uv run --extra tinker --extra jax --extra dev pytest --forked -s tests --ignore=tests/tx/gpu --ignore=tests/train --ignore=tests/backends/skyrl_train --ignore=tests/tx/models/test_qwen3_5.py --ignore=tests/tinker/test_api.py --ignore=tests/tinker/test_sample_session_routing.py
+        # CPU-CI runtime trims (job was ~47 min; these dominate it). All retain coverage in the
+        # GPU/integration CI. Each test runs under --forked (fresh interpreter), so heavy
+        # model/LoRA tests are especially expensive on CPU:
+        #   - tinker server tests (test_api.py, test_sample_session_routing.py): spin up a real
+        #     model-backed Tinker API server per test (subprocess.Popen + healthz poll), ~6 min;
+        #     covered by gpu_e2e_ci_tinker*.
+        #   - tx *_lora_training.py parity tests (deepseekv3/llama3/qwen3/qwen3_5): full fp32
+        #     forward/backward LoRA parity, ~20 min combined; exercised in GPU CI.
+        uv run --extra tinker --extra jax --extra dev pytest --forked -s tests --ignore=tests/tx/gpu --ignore=tests/train --ignore=tests/backends/skyrl_train --ignore=tests/tx/models/test_qwen3_5.py --ignore=tests/tinker/test_api.py --ignore=tests/tinker/test_sample_session_routing.py --ignore=tests/tx/models/test_deepseekv3_lora_training.py --ignore=tests/tx/models/test_llama3_lora_training.py --ignore=tests/tx/models/test_qwen3_lora_training.py --ignore=tests/tx/models/test_qwen3_5_lora_training.py
     - name: Run engine benchmarks
       run: |
         uv run --extra tinker --extra dev python skyrl/benchmarks/benchmark_engine.py --base-model trl-internal-testing/tiny-Qwen3ForCausalLM --backend-config '{"max_lora_adapters": 3, "max_lora_rank": 1}' --num-warmup-steps 1 --num-steps 1 --num-requests 1 --seq-len 8 --sample-max-tokens 16
