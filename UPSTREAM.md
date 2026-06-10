@@ -57,20 +57,22 @@ Upstream remote: `https://github.com/NovaSky-AI/SkyRL.git` · sync target: **`up
 -->
 
 <!-- BEGIN AUTO:develop-delta -->
-_Last generated for `origin/main` (f508739f) ↔ `HEAD` (281b7298); merge-base `f508739f`. **Auto-generated — do not edit by hand.**_
+_Last generated for `origin/main` (f508739f) ↔ `HEAD` (ea2ea70b); merge-base `f508739f`. **Auto-generated — do not edit by hand.**_
 
-`develop` is **2 commit(s)** ahead of `main`.
+`develop` is **4 commit(s)** ahead of `main`.
 
 ### Commits on `develop` not on `main`
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `186fd6cc` | feat(upstream-sync): auto-regenerate develop↔main delta on m | dyurk-lila | 2026-06-10 |
 | `237a022f` | chore(upstream-sync): install sync tooling on develop (ledge | dyurk-lila | 2026-06-10 |
 
-<details><summary>merge commits (1)</summary>
+<details><summary>merge commits (2)</summary>
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `ea2ea70b` | Merge pull request #19 from fl97inc/chore/auto-develop-delta | dyurk-lila | 2026-06-10 |
 | `281b7298` | Merge pull request #18 from fl97inc/chore/install-upstream.. | dyurk-lila | 2026-06-10 |
 
 </details>
@@ -79,9 +81,12 @@ _Last generated for `origin/main` (f508739f) ↔ `HEAD` (281b7298); merge-base `
 
 ```
  .github/CODEOWNERS                   |  26 +++++++
+ .github/workflows/develop-delta.yaml |  91 ++++++++++++++++++++++
  .github/workflows/sync-upstream.yaml | 143 +++++++++++++++++++++++++++++++++++
- UPSTREAM.md                          |  75 ++++++++++++++++++
- 3 files changed, 244 insertions(+)
+ UPSTREAM.md                          | 127 +++++++++++++++++++++++++++++++
+ upstream-sync/bedrock-ci-setup.md    |  70 +++++++++++++++++
+ upstream-sync/gen_develop_delta.sh   | 104 +++++++++++++++++++++++++
+ 6 files changed, 561 insertions(+)
 ```
 <!-- END AUTO:develop-delta -->
 
