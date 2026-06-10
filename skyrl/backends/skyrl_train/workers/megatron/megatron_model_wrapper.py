@@ -93,9 +93,7 @@ def _install_fused_lm_head_capture(actor_module: List[nn.Module], holder: dict) 
                     # Gather the sequence-parallel-scattered hidden across TP. Its backward is a
                     # reduce-scatter (tensor_parallel_output_grad=True), which reduces the fused
                     # function's per-shard grad_hidden exactly as ColumnParallelLinear would.
-                    hidden = gather_from_sequence_parallel_region(
-                        hidden, tensor_parallel_output_grad=True, group=tpg
-                    )
+                    hidden = gather_from_sequence_parallel_region(hidden, tensor_parallel_output_grad=True, group=tpg)
                 holder["weight"] = w
                 # Return hidden in the logits position (+ no bias). The model's _scale_logits is
                 # identity here (MuP excluded above) and its transpose yields [b, s, h].

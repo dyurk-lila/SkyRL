@@ -149,15 +149,11 @@ def _capture_batches(trainer: SFTTrainer, monkeypatch) -> list[dict]:
 
 
 def _assert_batch_sequences_equal(serial: list[dict], prefetch: list[dict]):
-    assert len(serial) == len(prefetch), (
-        f"step count differs: serial={len(serial)} prefetch={len(prefetch)}"
-    )
+    assert len(serial) == len(prefetch), f"step count differs: serial={len(serial)} prefetch={len(prefetch)}"
     for s, p in zip(serial, prefetch):
         assert s["step"] == p["step"], f"step mismatch: {s['step']} vs {p['step']}"
         s_snap, p_snap = s["snap"], p["snap"]
-        assert s_snap.keys() == p_snap.keys(), (
-            f"step {s['step']} key mismatch: {s_snap.keys()} vs {p_snap.keys()}"
-        )
+        assert s_snap.keys() == p_snap.keys(), f"step {s['step']} key mismatch: {s_snap.keys()} vs {p_snap.keys()}"
         for key in s_snap:
             sv, pv = s_snap[key], p_snap[key]
             if key == "sub_seq_lengths":
@@ -165,9 +161,7 @@ def _assert_batch_sequences_equal(serial: list[dict], prefetch: list[dict]):
                 for a, b in zip(sv, pv):
                     assert torch.equal(a, b), f"step {s['step']} sub_seq_lengths differ"
             else:
-                assert sv.shape == pv.shape, (
-                    f"step {s['step']} {key} shape differs: {sv.shape} vs {pv.shape}"
-                )
+                assert sv.shape == pv.shape, f"step {s['step']} {key} shape differs: {sv.shape} vs {pv.shape}"
                 assert torch.equal(sv, pv), f"step {s['step']} {key} not byte-identical"
 
 

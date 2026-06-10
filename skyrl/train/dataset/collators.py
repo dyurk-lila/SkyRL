@@ -168,9 +168,9 @@ class PackedDataCollator:
             full_mask = np.empty(s, dtype=np.float32)
             full_mask[:n_pad] = 0.0
             full_mask[n_pad:] = np.asarray(ex["loss_mask"], dtype=np.float32)
-            assert full_mask.shape[0] == s, (
-                f"Reconstructed full loss_mask length {full_mask.shape[0]} != seq length {s}"
-            )
+            assert (
+                full_mask.shape[0] == s
+            ), f"Reconstructed full loss_mask length {full_mask.shape[0]} != seq length {s}"
             full_loss_masks.append(full_mask)
             full_input_ids.append(np.asarray(ex["input_ids"], dtype=np.int64))
 
