@@ -26,7 +26,18 @@ from megatron.core.optimizer import (
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from omegaconf import DictConfig
 
+from skyrl.backends.skyrl_train.distributed.megatron.optimizer_dtype import (
+    coerce_optimizer_dtype_kwargs,
+)
 from skyrl.train.config import OptimizerConfig as SkyRLOptimizerConfig
+
+__all__ = [
+    "coerce_optimizer_dtype_kwargs",
+    "init_megatron_optim_config",
+    "get_megatron_optimizer",
+    "get_megatron_optimizer_param_scheduler",
+    "get_megatron_last_lr",
+]
 
 
 def init_megatron_optim_config(
@@ -45,7 +56,9 @@ def init_megatron_optim_config(
         "params_dtype": torch.bfloat16,
         "use_distributed_optimizer": True,
     }
-    optim_args.update(optimizer_config_kwargs)
+    # Coerce any ``*_dtype`` string (e.g. "bf16" from YAML) into a real torch.dtype
+    # before it reaches Megatron's OptimizerConfig / FusedAdam, which require dtypes.
+    optim_args.update(coerce_optimizer_dtype_kwargs(optimizer_config_kwargs))
 
     config = OptimizerConfig(**optim_args)
     return config
