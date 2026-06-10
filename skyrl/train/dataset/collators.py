@@ -95,6 +95,7 @@ class PackedDataCollator:
         dp_size: int,
         batch_size: int,
         micro_train_batch_size_per_gpu: int,
+        vpp_size: int = 1,  # VPP-BINCOUNT (lila)
     ):
         if max_tokens_per_microbatch is None:
             raise ValueError("PackedDataCollator requires max_tokens_per_microbatch to be set explicitly.")
@@ -104,6 +105,9 @@ class PackedDataCollator:
         self.cp_size = cp_size
         self.dp_size = dp_size
         self.batch_size = batch_size
+        # VPP-BINCOUNT (lila): Virtual Pipeline Parallelism degree (interleaved
+        # 1F1B). Default 1 => no VPP => non-VPP bin-count behavior unchanged.
+        self.vpp_size = vpp_size
         self._default_collator = DefaultCollator(tokenizer, micro_train_batch_size_per_gpu)
         self._tokenizer = tokenizer
 
@@ -183,7 +187,17 @@ class PackedDataCollator:
         # same number of micro-batches. Forcing the global bin count to a
         # multiple of ``dp_size`` makes the per-DP-rank bin count (and thus
         # ``num_microbatches``) identical across ranks.
-        bin_count_multiple = dp_size
+        # VPP-BINCOUNT (lila): when Virtual Pipeline Parallelism is enabled
+        # (vpp_size > 1) on top of PP > 1, Megatron's interleaved 1F1B schedule
+        # additionally asserts that the per-DP-rank micro-batch count be a
+        # multiple of pp_size * vpp_size. per-DP-rank micro-batches =
+        # total_bins / dp_size, so force the GLOBAL bin count to a multiple of
+        # dp_size * pp_size * vpp_size. With VPP off this reduces to dp_size.
+        vpp_size = getattr(self, "vpp_size", 1)
+        if vpp_size and vpp_size > 1:
+            bin_count_multiple = dp_size * pp_size * vpp_size
+        else:
+            bin_count_multiple = dp_size
         packer = make_seq_packer(
             "first_fit_decreasing",
             bin_capacity=bin_capacity,

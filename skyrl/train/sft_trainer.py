@@ -834,6 +834,15 @@ class SFTTrainer:
 
         if self.sft_cfg.use_sequence_packing:
             self._validate_packing_cfg()
+            # VPP-BINCOUNT (lila): Virtual Pipeline Parallelism degree arrives in
+            # megatron_config.transformer_config_kwargs["virtual_pipeline_model_parallel_size"]
+            # (same source megatron_strategy.setup_distributed reads). Read it
+            # defensively (default 1 == VPP off) so the packer can round the bin
+            # count up to a multiple of dp_size * pp_size * vpp_size.
+            _tck = getattr(self.sft_cfg.megatron_config, "transformer_config_kwargs", None)
+            vpp_size = 1
+            if isinstance(_tck, dict):
+                vpp_size = _tck.get("virtual_pipeline_model_parallel_size", None) or 1
             return PackedDataCollator(
                 tokenizer=tokenizer,
                 max_tokens_per_microbatch=self.sft_cfg.resolved_bin_capacity(),
@@ -843,6 +852,7 @@ class SFTTrainer:
                 dp_size=self._dp_size(),
                 batch_size=self.sft_cfg.batch_size,
                 micro_train_batch_size_per_gpu=self.sft_cfg.micro_train_batch_size_per_gpu,
+                vpp_size=vpp_size,  # VPP-BINCOUNT (lila)
             )
         return DefaultCollator(
             tokenizer=tokenizer,
