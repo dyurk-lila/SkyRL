@@ -718,6 +718,24 @@ class TrainerConfig(BaseConfig):
     This lowers peak GPU memory at the cost of ~2x wall-clock time.
     ``None`` disables chunking (Megatron backend only; FSDP requires a positive int).
     See https://github.com/NovaSky-AI/SkyRL/pull/1610 for more details."""
+    fused_linear_logprob: bool = False
+    """Megatron only. Fuse the LM-head projection into the chunked log-prob computation so the
+    full ``[*, seq, vocab // TP]`` logits tensor is never materialized (the dominant activation
+    transient on the log-prob path at large vocab / long context). The model returns its
+    pre-projection hidden state and the head GEMM is applied per sequence-chunk inside the fused
+    log-prob (recomputed in backward). Numerically equivalent to the stock logits path (verified
+    in ``tests/backends/skyrl_train/cpu/megatron/test_fused_linear_logprob.py``); ``False`` keeps
+    the byte-identical stock behaviour. Uses ``logprobs_chunk_size`` for the chunk width.
+    NOTE: not applied when the model uses MuP output scaling (``use_mup``) or any post-projection
+    logit transform — those fall back to the stock path automatically (see
+    ``_install_fused_lm_head_capture`` in the Megatron model wrapper)."""
+    fused_linear_logprob_backend: str = "torch"
+    """Implementation for ``fused_linear_logprob`` (ignored when that is ``False``):
+    ``"torch"`` — pure-PyTorch chunked kernel; runs anywhere (CPU/GPU), no extra deps; bounds but
+    still materializes the per-chunk logits. The verified default.
+    ``"triton"`` — vendored flash-style Triton kernel (ported from verl); tiles over vocab so the
+    per-chunk logits never materialize (lower memory + faster), GPU + ``triton`` required. Falls
+    back to ``"torch"`` with a warning if Triton is unavailable."""
 
     def __post_init__(self):
         # ref model defaults to the policy model
@@ -734,6 +752,16 @@ class TrainerConfig(BaseConfig):
             raise ValueError(
                 "logprobs_chunk_size=None (no chunking) is only supported with the Megatron backend. "
                 f"Set a positive integer for strategy={self.strategy!r}."
+            )
+        if self.fused_linear_logprob and self.strategy != "megatron":
+            raise ValueError(
+                "fused_linear_logprob=True is only supported with the Megatron backend, "
+                f"got strategy={self.strategy!r}."
+            )
+        if self.fused_linear_logprob_backend not in ("torch", "triton"):
+            raise ValueError(
+                "fused_linear_logprob_backend must be 'torch' or 'triton', "
+                f"got {self.fused_linear_logprob_backend!r}."
             )
 
 
