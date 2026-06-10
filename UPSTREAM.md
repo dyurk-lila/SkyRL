@@ -47,6 +47,58 @@ Upstream remote: `https://github.com/NovaSky-AI/SkyRL.git` · sync target: **`up
 > #1695 in intent but uses a different chunk-worker implementation (~93/377 added lines absent
 > from `main`). Authors decide: rebase onto `develop`, upstream, or drop.
 
+## 2.5. Live `develop` ↔ `main` delta (AUTO-GENERATED)
+
+<!--
+  Everything between the BEGIN/END AUTO markers below is regenerated on every merge to `develop`
+  by .github/workflows/develop-delta.yaml (script: upstream-sync/gen_develop_delta.sh).
+  DO NOT edit inside the markers by hand — your changes will be overwritten on the next merge.
+  §2 above (curated categories / public PR#s) is hand-maintained and is NEVER touched by the bot.
+-->
+
+<!-- BEGIN AUTO:develop-delta -->
+_Last generated for `origin/main` (f508739f) ↔ `HEAD` (281b7298); merge-base `f508739f`. **Auto-generated — do not edit by hand.**_
+
+`develop` is **2 commit(s)** ahead of `main`.
+
+### Commits on `develop` not on `main`
+
+| commit | subject | author | date |
+|---|---|---|---|
+| `237a022f` | chore(upstream-sync): install sync tooling on develop (ledge | dyurk-lila | 2026-06-10 |
+
+<details><summary>merge commits (1)</summary>
+
+| commit | subject | author | date |
+|---|---|---|---|
+| `281b7298` | Merge pull request #18 from fl97inc/chore/install-upstream.. | dyurk-lila | 2026-06-10 |
+
+</details>
+
+### Files changed (`origin/main...HEAD`)
+
+```
+ .github/CODEOWNERS                   |  26 +++++++
+ .github/workflows/sync-upstream.yaml | 143 +++++++++++++++++++++++++++++++++++
+ UPSTREAM.md                          |  75 ++++++++++++++++++
+ 3 files changed, 244 insertions(+)
+```
+<!-- END AUTO:develop-delta -->
+
+### Notes (LLM-enriched — optional)
+
+<!--
+  The block below is written by the OPTIONAL Claude enrichment step in
+  .github/workflows/develop-delta.yaml (dormant until `vars.ENABLE_CLAUDE_DELTA == 'true'` and
+  Lila Bedrock CI access is provisioned — see upstream-sync/bedrock-ci-setup.md). It paraphrases
+  what each carried change does and suggests a category. The deterministic script NEVER touches
+  this block, and Claude NEVER touches the tables block above — they own disjoint byte ranges.
+-->
+
+<!-- BEGIN AUTO:develop-delta-notes -->
+_No LLM enrichment yet. Activates once `ENABLE_CLAUDE_DELTA` + Bedrock CI access are set up._
+<!-- END AUTO:develop-delta-notes -->
+
 ## 3. Drop-list (carried work superseded by a merged upstream PR)
 
 When an upstream equivalent merges, the carried copy is dropped at the next sync. Deterministic

@@ -1,0 +1,91 @@
+# Regenerates the "live develop ↔ main delta" block in UPSTREAM.md on every merge to `develop`.
+#
+# Two stages (hybrid engine — see upstream-sync/02-recurring-workflow.md):
+#   1. DETERMINISTIC (always runs, no creds): upstream-sync/gen_develop_delta.sh renders the exact
+#      `git log main..develop` + `git diff --stat` into the <!-- BEGIN/END AUTO:develop-delta -->
+#      block. Correct on its own; works the moment this lands.
+#   2. CLAUDE ENRICHMENT (optional, DORMANT): if `vars.ENABLE_CLAUDE_DELTA == 'true'`, Claude Code
+#      (via the blessed Lila action `fl97inc/lila-actions/claude-code`, on a self-hosted Bedrock
+#      runner) writes prose summaries + suggested categories into the SEPARATE
+#      <!-- BEGIN/END AUTO:develop-delta-notes --> block. Never edits the deterministic block.
+#      Stays off until Lila Bedrock CI access is provisioned — see upstream-sync/bedrock-ci-setup.md.
+#
+# Loop prevention: the commit-back step skips when the only change is the bot's own, and the push
+# trigger ignores commits authored by the bot (see `if:` on the job + the paths/author guards).
+
+name: develop-delta
+
+on:
+  push:
+    branches: [develop]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: develop-delta
+  cancel-in-progress: false
+
+jobs:
+  regen:
+    runs-on: ubuntu-latest
+    # Don't re-trigger on the bot's own "update delta" commit.
+    if: github.event_name == 'workflow_dispatch' || github.actor != 'lila-sync-bot'
+    steps:
+      - name: Checkout develop (full history)
+        uses: actions/checkout@v4
+        with:
+          ref: develop
+          fetch-depth: 0
+
+      - name: Fetch main (delta base)
+        run: git fetch origin main:refs/remotes/origin/main
+
+      - name: Regenerate deterministic delta block
+        id: gen
+        run: |
+          BASE=origin/main HEAD_REF=HEAD bash upstream-sync/gen_develop_delta.sh
+          if git diff --quiet -- UPSTREAM.md; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # --- OPTIONAL Claude enrichment (dormant until enabled + Bedrock access provisioned) ---
+      # Uncomment the lila-actions step once:
+      #   1. an admin sets repo variable ENABLE_CLAUDE_DELTA=true,
+      #   2. fl97inc/SkyRL has access to the fl97inc/lila-actions private action
+      #      (email devsecops@lila.ai), and
+      #   3. infra (#sw-team-infra, @rlincoln) confirms this repo's Actions may assume
+      #      arn:aws:iam::535002886782:role/solo-github-arc-gha-claude-code-bedrock.
+      # See upstream-sync/bedrock-ci-setup.md for the full runbook. Note: the Lila action runs on a
+      # self-hosted Bedrock-capable runner, so this job's `runs-on` would change accordingly.
+      #
+      # - name: Claude enrichment (notes block only)
+      #   if: vars.ENABLE_CLAUDE_DELTA == 'true'
+      #   uses: fl97inc/lila-actions/claude-code@v2
+      #   with:
+      #     prompt: |
+      #       Read UPSTREAM.md. Using `git log origin/main..HEAD` and the diff, write a concise
+      #       prose summary of each carried change and a suggested category
+      #       (keep-fork-only / pending-upstream / evaluate). Write ONLY between the markers
+      #       <!-- BEGIN AUTO:develop-delta-notes --> and <!-- END AUTO:develop-delta-notes -->.
+      #       Do not edit any other part of the file. Do not touch the develop-delta tables block.
+      #     claude_args: >-
+      #       --model us.anthropic.claude-sonnet-4-6
+      #       --max-turns 6
+      #       --allowedTools "Read,Edit,Bash(git log:*),Bash(git diff:*)"
+      #   env:
+      #     AWS_REGION: us-east-1
+
+      - name: Commit & push regenerated delta
+        if: steps.gen.outputs.changed == 'true'
+        run: |
+          git config user.name  "lila-sync-bot"
+          git config user.email "lila-sync-bot@users.noreply.github.com"
+          git add UPSTREAM.md
+          git commit -m "docs(upstream-sync): regenerate develop↔main delta [skip ci]"
+          # Re-fetch + rebase in case develop moved during the run; then push.
+          git pull --rebase origin develop
+          git push origin HEAD:develop
