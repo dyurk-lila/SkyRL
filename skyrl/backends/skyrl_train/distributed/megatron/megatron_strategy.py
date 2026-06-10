@@ -164,6 +164,22 @@ class MegatronStrategy(DistributedStrategy):
         if local_rank != -1:
             torch.cuda.set_device(local_rank)
 
+        # VPP-INIT-PARALLEL (lila): register Virtual Pipeline Parallelism (VPP) with
+        # parallel_state so get_forward_backward_func picks the INTERLEAVED schedule.
+        # Without registering vp_size here, mcore's initialize_model_parallel leaves
+        # vp_size=None; the model is then built as VPP chunks but the non-interleaved
+        # schedule asserts "...does not support model chunking". The VPP size arrives
+        # from the lila launch via
+        # megatron_config.transformer_config_kwargs.virtual_pipeline_model_parallel_size
+        # (a plain dict on the MegatronConfig dataclass). Read it defensively, and also
+        # honor a top-level field if a future config grows one. Default None preserves
+        # the prior non-interleaved behavior.
+        _vpp = None
+        _tck = getattr(self.megatron_config, "transformer_config_kwargs", None)
+        if isinstance(_tck, dict):
+            _vpp = _tck.get("virtual_pipeline_model_parallel_size", None)
+        _vpp = getattr(self.megatron_config, "virtual_pipeline_model_parallel_size", _vpp)
+
         mpu.initialize_model_parallel(
             tensor_model_parallel_size=self.megatron_config.tensor_model_parallel_size,
             pipeline_model_parallel_size=self.megatron_config.pipeline_model_parallel_size,
@@ -171,6 +187,7 @@ class MegatronStrategy(DistributedStrategy):
             expert_tensor_parallel_size=self.megatron_config.expert_tensor_parallel_size,
             use_sharp=False,
             context_parallel_size=self.megatron_config.context_parallel_size,
+            virtual_pipeline_model_parallel_size=_vpp,  # VPP-INIT-PARALLEL (lila)
             nccl_communicator_config_path=None,
         )
         self.set_seed(self.seed)

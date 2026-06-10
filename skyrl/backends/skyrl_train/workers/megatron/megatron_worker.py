@@ -397,14 +397,199 @@ class MegatronWorker:
         # Apply any additional transformer config kwargs (can override the above).
         for k, v in transformer_config_kwargs.items():
             setattr(provider, k, v)
+
+        # VPP-PATTERN-AUTOPIPE (lila): auto-inject pipe ('|') pipeline-segment
+        # boundaries into the hybrid Mamba layer pattern so Virtual Pipeline
+        # Parallelism works without the caller hand-authoring the (fragile,
+        # VP-major) piped string. mcore's select_pipeline_segment needs one
+        # '|'-delimited segment per (pp_size * vp_size) chunk, in VP-major
+        # order; with no pipes and vp_stage set it raises ValueError. The
+        # Nemotron-H pattern arrives pipe-free from the HF config
+        # (hybrid_override_pattern -> provider.hybrid_layer_pattern via
+        # NemotronHBridge.CONFIG_MAPPING). We rewrite it here, AFTER the
+        # transformer_config_kwargs setattr loop (so VPP size / any caller
+        # pattern override are already on the provider) and BEFORE finalize().
+        # Adding pipes does NOT change the derived num_layers (the count
+        # strips pipes). Honors an explicit already-piped pattern (no-op when
+        # '|' is already present). Only the auto-piped path is wired.
+        _vpp_size = getattr(provider, "virtual_pipeline_model_parallel_size", None)
+        _pp_size = megatron_config.pipeline_model_parallel_size
+        # The bridge sets hybrid_layer_pattern; a caller may instead set the
+        # deprecated hybrid_override_pattern. Prefer whichever is populated.
+        _hpat = getattr(provider, "hybrid_override_pattern", None) or getattr(
+            provider, "hybrid_layer_pattern", None
+        )
+        if (
+            _vpp_size is not None
+            and _vpp_size > 1
+            and _pp_size > 1
+            and isinstance(_hpat, str)
+            and "|" not in _hpat
+        ):
+            # Strip any MTP separator block before piping the main decoder
+            # pattern (MTP is disabled for these perf runs, but be safe).
+            _main = _hpat.split("/")[0]
+            _n_seg = _pp_size * _vpp_size
+            if len(_main) % _n_seg != 0:
+                raise ValueError(
+                    f"VPP-PATTERN-AUTOPIPE: hybrid pattern length ({len(_main)}) "
+                    f"is not divisible by pp_size*vp_size ({_pp_size}*{_vpp_size}"
+                    f"={_n_seg}); cannot evenly pipe. pattern={_main!r}"
+                )
+            _per = len(_main) // _n_seg
+            _piped = "|".join(_main[i * _per : (i + 1) * _per] for i in range(_n_seg))
+            # Write the piped pattern onto hybrid_layer_pattern (the canonical
+            # field) and clear hybrid_override_pattern so finalize() does not
+            # hit its 'both specified' conflict assert.
+            provider.hybrid_layer_pattern = _piped
+            if getattr(provider, "hybrid_override_pattern", None) is not None:
+                provider.hybrid_override_pattern = None
+            logger.info(
+                f"VPP-PATTERN-AUTOPIPE: piped hybrid_layer_pattern into {_n_seg} "
+                f"segments of {_per} (pp={_pp_size}, vp={_vpp_size}): {_piped}"
+            )
+
         provider.finalize()
 
         self.provider = provider
         self.bridge = bridge
 
+        # TP-COMM-UB-INIT (lila): when tensor-parallel comm/GEMM overlap
+        # (TransformerEngine Userbuffers) is requested via
+        # transformer_config_kwargs.tp_comm_overlap=true, TE's per-layer GEMM
+        # modules call get_ub(...) which asserts "UB manager is not initialized"
+        # unless te_module.base.initialize_ub(...) has run first. Megatron's
+        # training path does this in _initialize_tp_communicators BEFORE building
+        # the model; SkyRL never calls it, so the run fails at the first TP layer.
+        #
+        # We mirror Megatron-Core's _initialize_tp_communicators here, at the
+        # correct point: parallel_state is already initialized (setup_distributed
+        # ran in init_worker_process_group, before init_model -> init_configs)
+        # and the transformer config is finalized (so hidden_size / tp_size /
+        # cp_size / sequence_parallel are known), but the transformer layers are
+        # not built yet (make_megatron_module runs afterwards). NO-OP unless
+        # tp_comm_overlap is truthy on the (finalized) provider config.
+        self._maybe_initialize_tp_comm_ub(provider)
+
         self.strategy.hf_config = hf_config
         self.tokenizer = tokenizer
         self.enable_router_replay = megatron_config.moe_enable_routing_replay
+
+    def _maybe_initialize_tp_comm_ub(self, provider) -> None:
+        """TP-COMM-UB-INIT (lila): initialize TransformerEngine Userbuffers for
+        tensor-parallel communication/GEMM overlap, mirroring Megatron-Core's
+        ``_initialize_tp_communicators`` (megatron/training/initialize.py).
+
+        Guarded: returns immediately (true NO-OP) unless ``provider.tp_comm_overlap``
+        is truthy, so the byte-identical default path is unchanged when the knob
+        is off.
+
+        SHAPE MATH (must match Megatron exactly, else UB deadlocks/corrupts):
+        Megatron uses ``shape = [(seq_length * micro_batch_size) // cp_size,
+        hidden_size]`` and does NOT divide by tp_size -- sequence-parallel seq
+        sharding (seq // tp) happens INSIDE TE; the UB communication buffer is
+        sized to the full (pre-SP-shard) token count. The buffer is a
+        FIXED-capacity allocation: at runtime the TE GEMM modules view a
+        sub-region sized to the actual per-rank token count, so the buffer must
+        be an UPPER BOUND on tokens-per-cp-rank for the largest micro-batch.
+
+        With SkyRL sequence packing (micro_batch_size=1, THD layout) the model
+        receives a flat packed tensor whose seq dim is
+        ``total_padded_tokens // cp_size`` where total_padded_tokens is bounded by
+        the FFD bin capacity ``max_tokens_per_microbatch`` (see
+        ``preprocess_packed_seqs`` in megatron_utils.py, shape[0] = sum_padded //
+        cp_size). Without packing the seq dim is ``max_length`` (== provider
+        seq_length for these runs).
+
+        The packed bin capacity / max_length lives ONLY on the upstream SFTConfig;
+        it is NOT carried onto the worker-visible SkyRLTrainConfig
+        (build_skyrl_config_for_sft drops it). So we source the (pre-cp-divide)
+        sequence length from the explicit env var ``SKYRL_TP_COMM_UB_SEQLEN``
+        (exported + threaded into the Ray actor env by the launch). We FAIL LOUD
+        if tp_comm_overlap is on but the seq length cannot be resolved -- never
+        guess a buffer shape (a wrong shape would deadlock/corrupt a 64-GPU run).
+        """
+        if not getattr(provider, "tp_comm_overlap", False):
+            return  # NO-OP: overlap disabled, default path unchanged.
+
+        import torch  # local import keeps the guarded path self-contained
+
+        tp_size = int(getattr(provider, "tensor_model_parallel_size", 1) or 1)
+        cp_size = int(getattr(provider, "context_parallel_size", 1) or 1)
+        hidden_size = int(getattr(provider, "hidden_size", 0) or 0)
+
+        # Resolve the (pre-cp-divide) sequence length = max tokens per micro-batch.
+        # Precedence: explicit override env var, then the transformer-config
+        # seq_length (valid only when not packing, i.e. seq_length == max_length).
+        seq_len_total = os.environ.get("SKYRL_TP_COMM_UB_SEQLEN", "").strip()
+        if seq_len_total:
+            try:
+                seq_len_total = int(seq_len_total)
+            except ValueError as e:
+                raise ValueError(
+                    f"TP-COMM-UB-INIT: SKYRL_TP_COMM_UB_SEQLEN={seq_len_total!r} is "
+                    f"not an integer; set it to the packed bin capacity "
+                    f"(max_tokens_per_microbatch) or max_length."
+                ) from e
+        else:
+            seq_len_total = int(getattr(provider, "seq_length", 0) or 0)
+
+        if seq_len_total <= 0 or hidden_size <= 0 or tp_size <= 1:
+            raise ValueError(
+                "TP-COMM-UB-INIT: tp_comm_overlap=True but could not resolve a valid "
+                f"UB shape (seq_len_total={seq_len_total}, hidden_size={hidden_size}, "
+                f"tp_size={tp_size}). With sequence packing the worker config does "
+                f"NOT carry the bin capacity, so you MUST export "
+                f"SKYRL_TP_COMM_UB_SEQLEN=<max_tokens_per_microbatch> (else "
+                f"<max_length>); tp_size must be >1 for TP comm overlap to apply."
+            )
+
+        # Megatron formula: (seq_length * micro_batch_size) // cp_size, hidden.
+        # micro_batch_size is folded into seq_len_total here (packing => mbs=1,
+        # the bin capacity already counts all tokens in the micro-batch).
+        if seq_len_total % cp_size != 0:
+            raise ValueError(
+                f"TP-COMM-UB-INIT: seq_len_total ({seq_len_total}) is not divisible "
+                f"by context_parallel_size ({cp_size}); cannot size the UB buffer."
+            )
+        ub_seq = seq_len_total // cp_size
+        shape = [ub_seq, hidden_size]
+
+        # Match Megatron's verbatim call shape for TE >= 1.9: shape, tp_size,
+        # use_fp8, ub_cfgs, bootstrap_backend. TE 2.10's initialize_ub also
+        # accepts dtype and quantization_modes; we pass use_fp8=False (TE falls
+        # back to a single NONE-quantization buffer, emitting a DeprecationWarning
+        # only). We do NOT enable fp8 here (Nemotron-H hybrid has no fp8 SSM path
+        # and these runs train bf16). bootstrap_backend="nccl": this cluster has
+        # no MPI in-process; TE builds its own TP-domain process groups from the
+        # global rank ordering and tp_size (it does NOT need the TP group object).
+        if torch.distributed.is_initialized():
+            _rank = torch.distributed.get_rank()
+        else:
+            _rank = -1
+        logger.info(
+            f"TP-COMM-UB-INIT (lila): initializing TransformerEngine Userbuffers "
+            f"rank={_rank} shape={shape} (seq_len_total={seq_len_total} // cp={cp_size}) "
+            f"tp_size={tp_size} hidden={hidden_size} use_fp8=False bootstrap=nccl"
+        )
+        try:
+            from transformer_engine.pytorch import module as te_module
+
+            te_module.base.initialize_ub(
+                shape=shape,
+                tp_size=tp_size,
+                use_fp8=False,
+                dtype=torch.bfloat16,
+                ub_cfgs=None,
+                bootstrap_backend="nccl",
+            )
+        except Exception as e:  # noqa: BLE001 -- UB init failure must be LOUD.
+            logger.error(
+                f"TP-COMM-UB-INIT (lila): initialize_ub FAILED rank={_rank} "
+                f"shape={shape} tp_size={tp_size}: {e!r}"
+            )
+            raise
+        logger.info(f"TP-COMM-UB-INIT (lila): Userbuffers initialized rank={_rank} shape={shape}")
 
     def configure_lora(self, lora_config, lora_type: Optional[str] = "lora"):
         if lora_type == "lora":
