@@ -52,7 +52,9 @@ jobs:
   
   skyrl_train_tests:
     needs: check_code_quality
-    runs-on: ubuntu-latest
+    # Loads models in tests/train + tests/backends/skyrl_train; use the org's 32 GB larger runner
+    # to avoid OOM on ubuntu-latest (7 GB).
+    runs-on: ubuntu-latest-8-core
     defaults:
       run:
         shell: bash
