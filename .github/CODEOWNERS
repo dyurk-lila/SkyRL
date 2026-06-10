@@ -1,0 +1,26 @@
+# CODEOWNERS — gates the upstream-sync conflict hotspots.
+#
+# Any PR (especially the bi-weekly `sync/upstream-*` PR) that touches these paths requires review
+# from a code owner before merge. Enforced only once branch protection on `develop` (and `main`)
+# has "Require review from Code Owners" enabled — see upstream-sync/02-recurring-workflow.md.
+#
+# NOTE: handles below are a PROPOSED baseline (the effort owner). The per-domain owner split is an
+# OPEN DECISION (Notion §8: "who owns the recurring sync?"). Refine in review — replace with the
+# real domain owners / an org team (e.g. @fl97inc/ml-ssi) once decided. Every handle here must be
+# a repo collaborator or a team with write access, or the rule is silently ignored by GitHub.
+
+# --- HIGH-severity sync hotspots (fork edits collide with upstream churn here) ---
+/skyrl/train/config/config.py            @dyurk-lila
+/skyrl/train/config/sft_config.py        @dyurk-lila
+/skyrl/train/trainer.py                  @dyurk-lila
+/skyrl/train/sft_trainer.py              @dyurk-lila
+/skyrl/train/fully_async_trainer.py      @dyurk-lila
+
+# --- Dependency pins (drift with upstream; git-sourced megatron deps) ---
+/pyproject.toml                          @dyurk-lila
+
+# --- The sync machinery itself ---
+/UPSTREAM.md                             @dyurk-lila
+/.github/CODEOWNERS                      @dyurk-lila
+/.github/workflows/sync-upstream.yaml    @dyurk-lila
+/upstream-sync/                          @dyurk-lila

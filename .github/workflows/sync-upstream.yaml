@@ -1,0 +1,143 @@
+# Opens a PR that brings the fork up to the latest `upstream/main`. It NEVER auto-merges:
+# the conflict hotspots (config/trainer renames like #1738) demand human + CODEOWNERS review.
+#
+# Two-branch model (see upstream-sync/02-recurring-workflow.md):
+#   * `main`    — zero-commit mirror of `upstream/main`; advances ONLY by `git merge --ff-only`.
+#                 If `main` ever carries a non-upstream commit the fast-forward fails — by design.
+#   * `develop` — long-lived integration branch carrying the bespoke delta. The reviewed sync PR
+#                 merges the freshly-advanced `main` INTO `develop`.
+#
+# Flow each run:
+#   1. Fast-forward `main` to `upstream/main` (push). Abort loudly if `main` has diverged.
+#   2. Merge the new `main` into a `sync/develop-<date>` branch cut from `develop`.
+#        - clean    -> open a normal PR into `develop`, request review
+#        - conflicts -> abort the merge (NO markers committed), push the un-merged base, open a
+#                       DRAFT PR with a hotspot checklist so reviewers resolve in their own branch
+#
+# ACTIVATION: scheduled + workflow_dispatch triggers only register from the repo's DEFAULT branch.
+# This lives on `develop`; it stays dormant until an admin sets `develop` as the default branch.
+# Before relying on it: confirm branch protection + CODEOWNERS on `develop`, and that the token
+# (or a PAT) is allowed to push to `main` under its protection rule.
+
+name: sync-upstream
+
+on:
+  schedule:
+    - cron: "0 15 * * 1"   # Mondays 15:00 UTC. For strictly bi-weekly, gate on ISO week parity in the job.
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream ref to sync to (default: main)"
+        required: false
+        default: "main"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/NovaSky-AI/SkyRL.git
+  UPSTREAM_REF: ${{ github.event.inputs.upstream_ref || 'main' }}
+
+jobs:
+  open-sync-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: develop
+
+      - name: Configure git + rerere
+        run: |
+          git config user.name  "lila-sync-bot"
+          git config user.email "lila-sync-bot@users.noreply.github.com"
+          git config rerere.enabled true
+          git config merge.conflictStyle zdiff3
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null || git remote set-url upstream "$UPSTREAM_URL"
+          git fetch upstream --tags
+          git fetch origin main
+          echo "TARGET_SHA=$(git rev-parse "upstream/${UPSTREAM_REF}")" >> "$GITHUB_ENV"
+          echo "SHORT_SHA=$(git rev-parse --short "upstream/${UPSTREAM_REF}")" >> "$GITHUB_ENV"
+          echo "STAMP=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Skip if develop already contains the target
+        run: |
+          if git merge-base --is-ancestor "$TARGET_SHA" origin/develop; then
+            echo "develop already contains $TARGET_SHA — nothing to sync."
+            echo "UP_TO_DATE=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: Fast-forward main to upstream (refuse if main diverged)
+        if: env.UP_TO_DATE != '1'
+        run: |
+          # main MUST be a zero-commit mirror. If it carries any non-upstream commit, the
+          # fast-forward is impossible and that is a hard error to surface, not paper over.
+          if ! git merge-base --is-ancestor origin/main "$TARGET_SHA"; then
+            echo "::error::main ($(git rev-parse --short origin/main)) is NOT an ancestor of upstream/${UPSTREAM_REF} ($SHORT_SHA)."
+            echo "::error::main has diverged from upstream — it must be a zero-commit mirror for --ff-only to work."
+            echo "::error::Move the offending commit(s) onto a topic branch off develop, reset main to upstream, and re-run."
+            exit 1
+          fi
+          git push origin "${TARGET_SHA}:refs/heads/main"
+          echo "Fast-forwarded main -> $SHORT_SHA"
+
+      - name: Create sync branch off develop and merge the new main
+        if: env.UP_TO_DATE != '1'
+        id: merge
+        run: |
+          BRANCH="sync/develop-${STAMP}"
+          echo "BRANCH=$BRANCH" >> "$GITHUB_ENV"
+          git switch -c "$BRANCH" origin/develop
+          if git merge --no-edit "$TARGET_SHA"; then
+            echo "result=clean" >> "$GITHUB_OUTPUT"
+          else
+            # Do NOT commit conflict markers. Record conflicts, abort, push the clean pre-merge
+            # base branch so reviewers resolve in their own working tree.
+            git diff --name-only --diff-filter=U > /tmp/conflicts.txt || true
+            git merge --abort
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+          fi
+          git push -u origin "$BRANCH" --force-with-lease
+
+      - name: Open PR (clean)
+        if: env.UP_TO_DATE != '1' && steps.merge.outputs.result == 'clean'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr create --base develop --head "$BRANCH" \
+            --title "chore(sync): upstream ${SHORT_SHA}" \
+            --body "Automated upstream sync. \`main\` fast-forwarded to \`${TARGET_SHA}\`; this PR merges it into \`develop\`.
+
+          - [ ] CODEOWNERS review on hotspot files
+          - [ ] CI green (incl. \`check_sft_trend.py\` gate)
+          - [ ] \`uv sync\` for \`skyrl[megatron]\` verified
+          - [ ] \`UPSTREAM.md\` updated (last-sync row + drop-list)
+          - [ ] tag \`lila-sync-${SHORT_SHA}\` after merge
+
+          Do NOT auto-merge — see upstream-sync/02-recurring-workflow.md." \
+            --label "upstream-sync"
+
+      - name: Open DRAFT PR with conflict checklist
+        if: env.UP_TO_DATE != '1' && steps.merge.outputs.result == 'conflict'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          CHECKLIST=$(sed 's/^/- [ ] /' /tmp/conflicts.txt 2>/dev/null || echo "- [ ] (see CI log)")
+          gh pr create --draft --base develop --head "$BRANCH" \
+            --title "chore(sync): upstream ${SHORT_SHA} (CONFLICTS — manual resolve)" \
+            --body "Automated upstream sync to \`${TARGET_SHA}\` hit conflicts merging the new \`main\` into \`develop\`; the merge was **aborted** (no markers committed). \`main\` was still fast-forwarded. This branch is at the pre-merge \`develop\` base — resolve in your own branch off it.
+
+          Conflicting files:
+          ${CHECKLIST}
+
+          Resolution rules: see 'Mandatory hotspot resolution rules' in upstream-sync/01-catch-up-plan.md. Never auto-merge." \
+            --label "upstream-sync"
