@@ -1,9 +1,38 @@
 import math
-from typing import Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 from skyrl.backends.skyrl_train.distributed.strategy import DistributedStrategy
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
 from skyrl.train.dataset.replay_buffer import Experience
+
+
+def pop_return_per_token_outputs(
+    loss_fn_config: Optional[Dict[str, Any]],
+) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """Extract the per-request ``return_per_token_outputs`` flag from ``loss_fn_config``.
+
+    Default ``True`` keeps the existing contract (Tinker / RL consume the per-token
+    ``loss_fn_outputs``); SkyRL's own SFTTrainer sets it ``False`` since it only reads
+    ``metrics``. The flag is popped here because it is not an ``AlgorithmConfig`` field:
+    leaving it in would trip the ``AlgorithmConfig`` key validation in
+    ``build_nested_dataclass`` (reached via ``from_dict_config``).
+
+    The pop runs on a shallow copy so the caller's ``loss_fn_config`` dict is never
+    mutated (callers may reuse it across micro-batches). Returns the (possibly copied)
+    config alongside the resolved flag.
+
+    Args:
+        loss_fn_config: Optional per-call loss-function config overrides, or ``None``.
+
+    Returns:
+        ``(loss_fn_config, return_per_token_outputs)`` where ``loss_fn_config`` is a
+        fresh copy with ``return_per_token_outputs`` removed when the input was not
+        ``None``, otherwise the original ``None``.
+    """
+    if loss_fn_config is None:
+        return None, True
+    loss_fn_config = dict(loss_fn_config)
+    return loss_fn_config, loss_fn_config.pop("return_per_token_outputs", True)
 
 
 def reduce_metrics(metrics: Dict[str, List[float]], sum_loss_metrics: bool = False) -> Dict[str, float]:
