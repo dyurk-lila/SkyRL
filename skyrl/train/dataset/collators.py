@@ -319,9 +319,20 @@ class PackedDataCollator:
             max_subseqs_per_bin = self.max_subseqs_per_bin
             for row_idx, packed_len in enumerate(bin_packed_lengths):
                 slack = graph_seqlen - packed_len
-                # (a) one pad sub-seq absorbing all the (align-multiple) slack.
-                if slack > 0:
-                    bin_subseq_lengths[row_idx].append(slack)
+                # (a) ALWAYS append exactly one slack sub-seq absorbing the
+                #     (align-multiple) slack, even when slack == 0. Appending it
+                #     unconditionally keeps the per-bin segment layout identical
+                #     across steps: [n_real real segments] + [1 slack segment] +
+                #     [zero-length K-pad]. Skipping it when slack==0 (the prior
+                #     behavior) made the position of the first zero-pad segment
+                #     depend on the data, which left ``cu_seqlens`` shape constant
+                #     (the zero-pad backfills) but its *values* data-dependent. A
+                #     fixed, exactly-once slack segment makes both the shape and
+                #     the segment boundaries deterministic for graph replay.
+                #     A zero-length slack segment is structurally identical to a
+                #     zero-length K-pad segment (a duplicated cumsum value), so
+                #     this never changes the real tokens' boundaries.
+                bin_subseq_lengths[row_idx].append(slack)
                 # (b) zero-length sub-seqs to reach the fixed K.
                 n_real_and_slack = len(bin_subseq_lengths[row_idx])
                 if n_real_and_slack > max_subseqs_per_bin:
@@ -331,6 +342,14 @@ class PackedDataCollator:
                         f"the per-bin sequence count."
                     )
                 bin_subseq_lengths[row_idx].extend([0] * (max_subseqs_per_bin - n_real_and_slack))
+                # Hard invariant for CUDA-graph replay: every bin row MUST hold
+                # EXACTLY max_subseqs_per_bin sub-seqs so the worker's cu_seqlens
+                # shape is the constant [max_subseqs_per_bin + 1] on every step.
+                assert len(bin_subseq_lengths[row_idx]) == max_subseqs_per_bin, (
+                    f"bin {row_idx} has {len(bin_subseq_lengths[row_idx])} sub-seqs after padding, "
+                    f"expected exactly max_subseqs_per_bin ({max_subseqs_per_bin}); cu_seqlens shape "
+                    f"would not be static across steps."
+                )
                 # Every bin now sums (with align round-up) to exactly graph_seqlen.
                 bin_packed_lengths[row_idx] = graph_seqlen
             # Dense row width is constant graph_seqlen too.

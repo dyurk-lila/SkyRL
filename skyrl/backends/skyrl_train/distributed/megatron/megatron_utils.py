@@ -429,15 +429,30 @@ def preprocess_packed_seqs(
             running = 0
             for length in lens:
                 length_int = int(length)
+                # CUDA-graph static-shape contract: EVERY entry is appended,
+                # INCLUDING zero-length sub-seqs. In fixed-pad mode the collator
+                # backfills each bin's sub_seq_lengths with zero-length entries to
+                # a constant count (max_subseqs_per_bin), so cu_seqlens shape is
+                # [max_subseqs_per_bin + 1] on every step. Do NOT add an
+                # ``if length_int > 0`` filter here: dropping zero-length entries
+                # would collapse num_subseqs back to the (data-dependent) real
+                # count and break graph replay. A zero-length entry is a
+                # zero-WIDTH cu_seqlens segment (a duplicated cumsum value), which
+                # mamba/flash-attn varlen tolerate and which the downstream
+                # gather/scatter loops treat as a no-op (they advance row_offset
+                # by the segment's padded width, which is 0).
                 flat_seqlens.append(length_int)
                 row_index_of_subseq.append(r)
                 intra_row_offset_of_subseq.append(running)
                 # Pad each sub-seq independently to align_size, matching the
-                # collator's row layout.
+                # collator's row layout. (For length_int == 0 the pad is 0, so a
+                # zero-length sub-seq advances ``running`` by 0.)
                 pad = (align_size - length_int % align_size) % align_size
                 running += length_int + pad
 
         seqlens_in_batch = torch.tensor(flat_seqlens, dtype=torch.int32, device=input_ids.device)
+        # num_subseqs counts the zero-length pad sub-seqs too, so cu_seqlens has a
+        # constant shape [num_subseqs + 1] across steps in fixed-pad mode.
         num_subseqs = len(flat_seqlens)
     else:
         seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
@@ -466,18 +481,40 @@ def preprocess_packed_seqs(
     # CUDA-graph static-shape padding (opt-in).
     # ----------------------------------------------------------------------------
     # mcore's CUDA-graph replay value-checks max_seqlen_q/kv (the int packed into
-    # PackedSeqParams). When the controller-side collator runs in fixed-pad mode
-    # (PackedDataCollator.graph_seqlen set), it already makes the rmpad token
-    # count and the cu_seqlens shape static, but the *largest sub-seq* in a bin
-    # still varies step to step, so max_seqlen would change and trip the
-    # graph-mismatch detector. Pin it to the configured constant.
+    # PackedSeqParams; see ``_CudaGraphRunner.get_mismatch_errors`` ->
+    # "Value mismatch ... max_seqlen_q"). When the controller-side collator runs
+    # in fixed-pad mode (PackedDataCollator.graph_seqlen set), it already makes the
+    # rmpad token count and the cu_seqlens shape static, but the *largest sub-seq*
+    # in a bin still varies step to step, so the dynamic ``max(seqlens_padded)``
+    # changes between the captured microbatch and replayed microbatches and trips
+    # the graph-mismatch detector. Pin it to the configured constant.
     #
-    # We read the value from the env var SKYRL_GRAPH_SEQLEN (set by the worker
-    # from sft_cfg.graph_seqlen) rather than threading it through this function's
-    # signature, which is on a hot path called from many sites. When unset or 0
-    # (the default), behavior is byte-identical to before.
+    # We read the value from the env var SKYRL_GRAPH_SEQLEN (set by every worker
+    # via the ``_set_graph_seqlen_env`` pass_through RPC from sft_cfg.graph_seqlen
+    # before the first training step) rather than threading it through this
+    # function's signature, which is on a hot path called from many sites. When
+    # unset or 0 (the default), behavior is byte-identical to before.
+    #
+    # graph_seqlen is the per-bin padded token width, which is also the maximum
+    # possible padded length of any single sub-seq in a bin (a bin holds at most
+    # graph_seqlen padded tokens), so pinning max_seqlen to it is a SAFE upper
+    # bound: flash/mamba varlen use max_seqlen only to size scratch, never to
+    # bound the cu_seqlens. We pin UNCONDITIONALLY (not max(dynamic, const)) so
+    # the value is byte-identical on capture and every replay regardless of the
+    # data in the microbatch.
     _graph_seqlen = int(os.environ.get("SKYRL_GRAPH_SEQLEN", "0"))
     if _graph_seqlen > 0:
+        # The collator validates graph_seqlen >= bin_capacity and packs each bin
+        # to <= bin_capacity real tokens, so no padded sub-seq can exceed
+        # graph_seqlen. If that invariant is ever violated the pin would be
+        # SMALLER than a real sub-seq and silently under-size attention scratch
+        # (and the captured reference would not match), so fail loudly instead.
+        if max_seqlen_in_batch > _graph_seqlen:
+            raise ValueError(
+                f"A padded sub-sequence length ({max_seqlen_in_batch}) exceeds the pinned "
+                f"graph_seqlen ({_graph_seqlen}); the CUDA-graph max_seqlen pin would be smaller "
+                f"than a real sub-seq. Raise graph_seqlen (>= the largest packed sub-seq)."
+            )
         max_seqlen_in_batch = _graph_seqlen
 
     shape = list(input_ids.shape[1:])
