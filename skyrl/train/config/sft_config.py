@@ -72,6 +72,38 @@ class SFTConfig(BaseConfig):
         cfg = SFTConfig.from_cli_overrides(sys.argv[1:])
     """
 
+    @staticmethod
+    def _normalize_override(arg: str) -> str:
+        """Normalize a single ``key=value`` CLI override onto the flat SFT namespace.
+
+        Strips a leading Hydra add-prefix (``+`` / ``++``) and an optional
+        ``trainer.`` namespace prefix from the key so Hydra-style invocations
+        (e.g. ``++trainer.graph_seqlen=16384``) populate the corresponding FLAT
+        ``SFTConfig`` field (``graph_seqlen``). Only the key (text before the
+        first ``=``) is rewritten; the value -- which may itself contain ``=`` or
+        a leading ``trainer.`` (e.g. a path) -- is preserved verbatim. A bare
+        ``key=value`` with neither prefix is returned unchanged, so the default
+        (non-Hydra) invocation is byte-identical.
+        """
+        if not isinstance(arg, str):
+            return arg
+        key, sep, value = arg.partition("=")
+        if not sep:
+            # Not a key=value override (e.g. a Hydra group selection); leave as-is
+            # so OmegaConf raises its own clear error rather than us mangling it.
+            return arg
+        # Strip the Hydra add-prefix (``+`` enables adding a field, ``++`` forces
+        # add/override). OmegaConf.from_cli does not understand these and would
+        # otherwise treat them as literal key characters.
+        stripped_key = key.lstrip("+")
+        # Operators borrow the RL entrypoint's ``trainer.`` namespace; SFTConfig is
+        # flat, so drop a single leading ``trainer.`` segment to land on the field.
+        if stripped_key.startswith("trainer."):
+            stripped_key = stripped_key[len("trainer.") :]
+        if stripped_key == key:
+            return arg
+        return f"{stripped_key}={value}"
+
     @classmethod
     def from_cli_overrides(cls, args: Union[List[str], dict]) -> "SFTConfig":
         """Construct an SFTConfig from CLI arguments or a dict of overrides.
@@ -90,9 +122,29 @@ class SFTConfig(BaseConfig):
 
         Raises:
             ValueError: If both ``num_epochs`` and ``num_steps`` are explicitly provided.
+
+        Notes:
+            ``SFTConfig`` is a FLAT dataclass (``graph_seqlen``, ``batch_size``,
+            ``model.path`` ...), but operators routinely reach for the Hydra-style
+            override syntax the RL entrypoint uses: a leading ``+``/``++`` add-prefix
+            and/or a ``trainer.`` namespace (e.g. ``++trainer.graph_seqlen=16384``).
+            ``OmegaConf.from_cli`` does NOT understand those Hydra directives -- it
+            treats ``++`` as literal key characters and has no ``trainer`` group --
+            so such an override would either be rejected by the strict key check in
+            ``build_nested_dataclass`` (``Invalid fields {'++trainer'}``) or, under a
+            wrapping launcher that pre-filters args, be silently dropped. Either way
+            the targeted flat field (``graph_seqlen`` / ``max_subseqs_per_bin``)
+            stays at its default ``None`` and the feature never engages at runtime
+            (this is exactly how the CUDA-graph static padding silently no-op'd: the
+            collator's ``graph_seqlen`` branch never ran and the ``SKYRL_GRAPH_SEQLEN``
+            worker-env RPC never fired). We normalize those prefixes here so the
+            natural invocation lands on the flat field. Bare ``key=value`` overrides
+            are unaffected (byte-identical).
         """
         if isinstance(args, dict):
             args = [f"{k}={v}" for k, v in args.items()]
+
+        args = [cls._normalize_override(arg) for arg in args]
 
         overrides = OmegaConf.from_cli(args)
         # Check for mutual exclusion before constructing the full config

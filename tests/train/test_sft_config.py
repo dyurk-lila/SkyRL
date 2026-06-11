@@ -259,3 +259,57 @@ class TestMaxTokensPerMicrobatch:
         cfg = self._packed_cfg(max_tokens_per_microbatch=256, micro_train_batch_size_per_gpu=4)
         skyrl_cfg = build_skyrl_config_for_sft(cfg)
         assert skyrl_cfg.trainer.micro_train_batch_size_per_gpu == 1
+
+
+class TestHydraStyleOverridePrefixes:
+    """Operators reach for Hydra ``+``/``++`` add-prefixes and the ``trainer.``
+    namespace (as on the RL entrypoint). ``SFTConfig`` is flat, so these are
+    normalized onto the flat field before parsing. Without this, the
+    CUDA-graph static-padding knobs (``graph_seqlen`` / ``max_subseqs_per_bin``)
+    silently stayed ``None`` at runtime and the feature never engaged.
+    """
+
+    _common = [
+        "use_sequence_packing=true",
+        "max_length=16384",
+        "max_tokens_per_microbatch=16384",
+    ]
+
+    def test_double_plus_trainer_namespace_populates_flat_field(self):
+        cfg = _sft_cfg_from_overrides(
+            ["++trainer.graph_seqlen=16384", "++trainer.max_subseqs_per_bin=64"] + self._common
+        )
+        assert cfg.graph_seqlen == 16384
+        assert cfg.max_subseqs_per_bin == 64
+
+    def test_single_plus_trainer_namespace(self):
+        cfg = _sft_cfg_from_overrides(["+trainer.graph_seqlen=16384"] + self._common)
+        assert cfg.graph_seqlen == 16384
+
+    def test_double_plus_flat_key(self):
+        cfg = _sft_cfg_from_overrides(["++graph_seqlen=16384"] + self._common)
+        assert cfg.graph_seqlen == 16384
+
+    def test_bare_flat_key_unchanged(self):
+        cfg = _sft_cfg_from_overrides(["graph_seqlen=16384"] + self._common)
+        assert cfg.graph_seqlen == 16384
+
+    def test_default_off_when_unset(self):
+        cfg = _sft_cfg_from_overrides(self._common + ["model.path=Qwen/Qwen3-0.6B"])
+        assert cfg.graph_seqlen is None
+        assert cfg.max_subseqs_per_bin is None
+
+    def test_trainer_namespace_on_nested_field_value_preserved(self):
+        # The ``trainer.`` strip must rewrite only the KEY; a value containing a
+        # dot (or even a leading ``trainer.``) must survive verbatim.
+        cfg = _sft_cfg_from_overrides(["++trainer.model.path=org/Model-v1", "batch_size=4"])
+        assert cfg.model.path == "org/Model-v1"
+        assert cfg.batch_size == 4
+
+    def test_value_with_equals_preserved(self):
+        assert SFTConfig._normalize_override("++trainer.run_name=a=b") == "run_name=a=b"
+
+    def test_unknown_key_still_rejected(self):
+        # Normalization must not loosen strict validation.
+        with pytest.raises(ValueError, match=r"Invalid fields \{'totally_bogus_key'\}"):
+            _sft_cfg_from_overrides(["++trainer.totally_bogus_key=1", "max_length=16"])
