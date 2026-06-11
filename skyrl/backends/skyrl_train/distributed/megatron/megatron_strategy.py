@@ -145,6 +145,54 @@ class MegatronStrategy(DistributedStrategy):
         # short-lived background workers, which does not work well with Ray.
         ckpt_base.async_calls = AsyncCallsQueue(persistent=True)
 
+    def _cuda_graph_rng_kwargs(self) -> dict:
+        """RNG-tracker kwargs for ``model_parallel_cuda_manual_seed``.
+
+        When CUDA graphs are enabled (``transformer_config_kwargs.cuda_graph_impl``
+        is set and not "none"), mcore's ``CudaGraphManager`` asserts that the
+        active ``CudaRNGStatesTracker`` is graph-capable: either the
+        TransformerEngine tracker (``use_te_rng_tracker=True``) or the mcore
+        tracker built with ``use_cudagraphable_rng=True``. The bare
+        ``model_parallel_cuda_manual_seed(seed)`` call initializes the default
+        (non-graph-capable) mcore tracker, so a hybrid Mamba model with
+        ``cuda_graph_impl=local`` crashes at ``MambaLayer`` init with
+        "RNG tracker does not support cudagraphs!".
+
+        We read ``use_te_rng_tracker`` / ``cuda_graph_impl`` from the megatron
+        config and propagate the requirement. Defaults are safe: when CUDA
+        graphs are off (or the keys are absent) this returns ``{}`` so the call
+        behaves exactly as before.
+        """
+        megatron_config = getattr(self, "megatron_config", None)
+        tck = getattr(megatron_config, "transformer_config_kwargs", None)
+        if tck is None:
+            return {}
+        # transformer_config_kwargs may be a plain dict or an OmegaConf node.
+        if not isinstance(tck, dict):
+            try:
+                from omegaconf import OmegaConf
+
+                tck = OmegaConf.to_container(tck, resolve=True)
+            except Exception:
+                try:
+                    tck = dict(tck)
+                except Exception:
+                    return {}
+
+        use_te_rng_tracker = tck.get("use_te_rng_tracker", False)
+        cuda_graph_impl = tck.get("cuda_graph_impl", None)
+        cuda_graphs_on = cuda_graph_impl not in (None, "none")
+
+        if not cuda_graphs_on:
+            # No CUDA graphs: keep the default tracker for backward compatibility.
+            return {}
+        if use_te_rng_tracker:
+            return {"te_rng_tracker": True}
+        # CUDA graphs requested without the TE tracker: use mcore's
+        # graph-capable RNG path (requires torch.cuda.{set,get}_rng_state with
+        # register_generator_state support, available in recent PyTorch).
+        return {"use_cudagraphable_rng": True}
+
     def set_seed(self, seed: int) -> None:
         # Vary seed by pipeline parallel rank so that different PP stages get
         # different dropout masks and stochastic noise (matches Megatron standard
@@ -157,7 +205,7 @@ class MegatronStrategy(DistributedStrategy):
         if torch.cuda.device_count() > 0:
             from megatron.core import tensor_parallel
 
-            tensor_parallel.model_parallel_cuda_manual_seed(seed)
+            tensor_parallel.model_parallel_cuda_manual_seed(seed, **self._cuda_graph_rng_kwargs())
 
     def setup_distributed(self) -> None:
         local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
