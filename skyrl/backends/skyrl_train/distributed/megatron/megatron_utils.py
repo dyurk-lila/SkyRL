@@ -21,6 +21,7 @@
 # limitations under the License.
 
 import gc
+import os
 from typing import Any, List, Optional, Union
 
 import torch
@@ -460,6 +461,24 @@ def preprocess_packed_seqs(
 
     # Pure Python int calculation to avoid further synchronization
     max_seqlen_in_batch = max(seqlens_in_batch_padded_cpu)
+
+    # ----------------------------------------------------------------------------
+    # CUDA-graph static-shape padding (opt-in).
+    # ----------------------------------------------------------------------------
+    # mcore's CUDA-graph replay value-checks max_seqlen_q/kv (the int packed into
+    # PackedSeqParams). When the controller-side collator runs in fixed-pad mode
+    # (PackedDataCollator.graph_seqlen set), it already makes the rmpad token
+    # count and the cu_seqlens shape static, but the *largest sub-seq* in a bin
+    # still varies step to step, so max_seqlen would change and trip the
+    # graph-mismatch detector. Pin it to the configured constant.
+    #
+    # We read the value from the env var SKYRL_GRAPH_SEQLEN (set by the worker
+    # from sft_cfg.graph_seqlen) rather than threading it through this function's
+    # signature, which is on a hot path called from many sites. When unset or 0
+    # (the default), behavior is byte-identical to before.
+    _graph_seqlen = int(os.environ.get("SKYRL_GRAPH_SEQLEN", "0"))
+    if _graph_seqlen > 0:
+        max_seqlen_in_batch = _graph_seqlen
 
     shape = list(input_ids.shape[1:])
     shape[0] = sum(seqlens_in_batch_padded_cpu) // cp_size

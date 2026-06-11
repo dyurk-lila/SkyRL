@@ -18,7 +18,7 @@ function for the un-packed layout.
 
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -95,6 +95,8 @@ class PackedDataCollator:
         dp_size: int,
         batch_size: int,
         micro_train_batch_size_per_gpu: int,
+        graph_seqlen: Optional[int] = None,
+        max_subseqs_per_bin: Optional[int] = None,
     ):
         if max_tokens_per_microbatch is None:
             raise ValueError("PackedDataCollator requires max_tokens_per_microbatch to be set explicitly.")
@@ -106,6 +108,52 @@ class PackedDataCollator:
         self.batch_size = batch_size
         self._default_collator = DefaultCollator(tokenizer, micro_train_batch_size_per_gpu)
         self._tokenizer = tokenizer
+
+        # ------------------------------------------------------------------
+        # CUDA-graph static-shape padding (opt-in).
+        # ------------------------------------------------------------------
+        # When ``graph_seqlen`` is set, every packed bin is padded with
+        # synthetic pad sub-sequences so that, ACROSS microbatches/steps:
+        #   (a) the rmpad token count == graph_seqlen (constant T),
+        #   (b) the number of sub-sequences per bin == max_subseqs_per_bin
+        #       (constant cu_seqlens shape [K+1]),
+        #   (c) max_seqlen is pinned to a constant (worker-side, via env).
+        # These are the three things mcore's CUDA-graph replay value-checks,
+        # and they let hybrid Mamba2/MoE SFT capture+replay graphs.
+        #
+        # ``graph_seqlen is None`` (default) => byte-identical to the legacy
+        # path: the synthetic-pad branch below is fully skipped.
+        self.graph_seqlen = graph_seqlen
+        if graph_seqlen is not None:
+            # align_size factors (tp/cp) are recomputed in __call__; here we
+            # only have access to tp/cp, so reproduce the same expression to
+            # validate the graph_seqlen divisibility up front.
+            align_size = tp_size * cp_size * 2 if cp_size > 1 else tp_size
+            if graph_seqlen % align_size != 0:
+                raise ValueError(
+                    f"graph_seqlen ({graph_seqlen}) must be divisible by align_size ({align_size}) "
+                    f"= tp_size*cp_size*2 if cp>1 else tp_size (tp={tp_size}, cp={cp_size}); "
+                    f"otherwise the synthetic pad sub-seq slack would not be an align multiple."
+                )
+            if graph_seqlen < max_tokens_per_microbatch:
+                raise ValueError(
+                    f"graph_seqlen ({graph_seqlen}) must be >= max_tokens_per_microbatch "
+                    f"(bin capacity = {max_tokens_per_microbatch}); a bin can pack up to "
+                    f"bin_capacity real tokens and must still fit inside graph_seqlen."
+                )
+            # ``max_subseqs_per_bin`` fixes the cu_seqlens shape [K+1]. The max
+            # sub-seq count actually observed in a batch is NOT static across
+            # steps, so we never derive it from the batch. If the caller does
+            # not pin it, fall back to the absolute, always-static upper bound:
+            # a bin of graph_seqlen tokens can hold at most graph_seqlen //
+            # align_size sub-seqs (each real sub-seq costs >= align_size padded
+            # tokens). This bound is conservative (large K => more zero-length
+            # cu_seqlens segments) but guarantees a fixed shape every step.
+            if max_subseqs_per_bin is None:
+                max_subseqs_per_bin = graph_seqlen // align_size
+            self.max_subseqs_per_bin = max_subseqs_per_bin
+        else:
+            self.max_subseqs_per_bin = max_subseqs_per_bin
 
     @property
     def tokenizer(self):
@@ -223,7 +271,71 @@ class PackedDataCollator:
             bin_packed_lengths.append(packed_len)
             bin_subseq_lengths.append(subseq_lens)
 
-        if pp_size > 1:
+        graph_seqlen = self.graph_seqlen
+        if graph_seqlen is not None:
+            # --------------------------------------------------------------
+            # CUDA-graph static-shape padding (opt-in; see __init__ docstring).
+            # --------------------------------------------------------------
+            # Make BOTH the rmpad token count (T) and the sub-seq count (K)
+            # constant across every bin and every step:
+            #
+            #   (a) Token slack: append ONE synthetic pad sub-seq of length
+            #       (graph_seqlen - packed_len) to each bin so the sum of
+            #       round_up(len, align_size) == graph_seqlen EXACTLY. Both
+            #       graph_seqlen and packed_len are align multiples, so the
+            #       slack is too => round_up(slack, align_size) == slack and
+            #       the bin's padded total lands precisely on graph_seqlen.
+            #       This single pad sub-seq carries ALL the slack so the dense
+            #       row width and the rmpad T are static. (We validated in
+            #       __init__ that graph_seqlen >= bin_capacity >= packed_len,
+            #       so the slack is always >= 0.)
+            #
+            #   (b) Sub-seq count: after the slack sub-seq, append ZERO-LENGTH
+            #       sub-seqs until the bin holds exactly max_subseqs_per_bin
+            #       entries, so cu_seqlens has a constant shape [K+1] every
+            #       step. Zero-length entries are structurally safe: cu_seqlens
+            #       is built from this SAME flattened list (preprocess_packed_
+            #       seqs), so a 0-length entry produces a zero-WIDTH cu_seqlens
+            #       segment (a duplicated cumsum value) and a matching no-op in
+            #       every downstream gather/scatter loop (_build_packed_targets,
+            #       _packed_subseq_row_indices_offsets_and_lens), which advance
+            #       row_offset by the (zero) padded segment width. The exact
+            #       seg-count invariants in those consumers therefore still hold.
+            #       Mamba/flash-attn varlen tolerate zero-length segments.
+            #
+            # The synthetic sub-seqs reference NO real tokens, so the row build
+            # loop in section 4 never writes them; their token positions stay at
+            # the pad fill (sequences=pad_token_id, attention_mask=0,
+            # loss_mask=0) from the np.full/np.zeros init. total_nonpad counts
+            # only real loss_mask==1 positions and is unaffected.
+            #
+            # CAVEAT (MoE expert-bias): these synthetic pad tokens carry no
+            # attention_mask, but the MoE router's expert-bias accumulator
+            # (moe_router_enable_expert_bias) currently has NO padding_mask, so
+            # the pad tokens leak into the per-expert token-count used to update
+            # the bias. A padding_mask must be plumbed through the router before
+            # this mode is used with moe_router_enable_expert_bias=true. That
+            # correctness fix is intentionally out of scope for this PR.
+            max_subseqs_per_bin = self.max_subseqs_per_bin
+            for row_idx, packed_len in enumerate(bin_packed_lengths):
+                slack = graph_seqlen - packed_len
+                # (a) one pad sub-seq absorbing all the (align-multiple) slack.
+                if slack > 0:
+                    bin_subseq_lengths[row_idx].append(slack)
+                # (b) zero-length sub-seqs to reach the fixed K.
+                n_real_and_slack = len(bin_subseq_lengths[row_idx])
+                if n_real_and_slack > max_subseqs_per_bin:
+                    raise ValueError(
+                        f"bin {row_idx} has {n_real_and_slack} sub-seqs (incl. slack pad) which exceeds "
+                        f"max_subseqs_per_bin ({max_subseqs_per_bin}); raise max_subseqs_per_bin or lower "
+                        f"the per-bin sequence count."
+                    )
+                bin_subseq_lengths[row_idx].extend([0] * (max_subseqs_per_bin - n_real_and_slack))
+                # Every bin now sums (with align round-up) to exactly graph_seqlen.
+                bin_packed_lengths[row_idx] = graph_seqlen
+            # Dense row width is constant graph_seqlen too.
+            max_packed_len = graph_seqlen
+        elif pp_size > 1:
             # Pad all packed rows to the global max so Megatron's
             # pipeline schedule sees uniform shapes.
             max_packed_len = max(bin_packed_lengths) if bin_packed_lengths else 0

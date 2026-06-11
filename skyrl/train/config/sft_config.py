@@ -243,6 +243,36 @@ class SFTConfig(BaseConfig):
     bin. ``None`` (default) resolves to ``max_length`` (each bin holds one
     sequence)."""
 
+    # ---- CUDA-graph static-shape padding (opt-in) ----
+    graph_seqlen: Optional[int] = None
+    """Opt-in fixed-length padding for CUDA-graph replay (hybrid Mamba2/MoE SFT).
+
+    Requires ``use_sequence_packing=True`` (Megatron). When set, ``PackedDataCollator``
+    pads every packed bin with synthetic pad sub-sequences so EVERY training
+    microbatch has identical tensor shapes -- a precondition for capturing and
+    replaying CUDA graphs:
+      * the rmpad token count is pinned to ``graph_seqlen`` (one slack pad sub-seq
+        absorbs ``graph_seqlen - packed_len`` per bin),
+      * the sub-seq count per bin is pinned to ``max_subseqs_per_bin`` (zero-length
+        pad sub-seqs make the ``cu_seqlens`` shape ``[K+1]`` constant), and
+      * ``max_seqlen`` is pinned worker-side via the ``SKYRL_GRAPH_SEQLEN`` env var.
+    Must be a multiple of the packing ``align_size`` (tp_size, or tp_size*cp_size*2
+    when cp>1) and ``>= max_tokens_per_microbatch``. ``None`` (default) disables
+    this mode and the packing path is byte-identical to the legacy behavior.
+
+    CAVEAT: when this is set AND ``moe_router_enable_expert_bias=true``, the synthetic
+    pad tokens leak into the MoE router's expert-bias accumulator (no padding_mask is
+    plumbed yet). Do not combine the two until that follow-up lands."""
+    max_subseqs_per_bin: Optional[int] = None
+    """Fixed sub-sequence count per bin for CUDA-graph padding (see ``graph_seqlen``).
+
+    Pins the ``cu_seqlens`` shape ``[K+1]`` to a constant across steps. ``None``
+    (default) derives the conservative, always-static upper bound
+    ``graph_seqlen // align_size`` (the most sub-seqs a bin could possibly hold).
+    Set it explicitly to a tighter bound if you know the per-bin sequence count to
+    avoid extra zero-length ``cu_seqlens`` segments. Ignored when ``graph_seqlen`` is
+    ``None``."""
+
     # ---- Dummy run / benchmarking ----
     dummy_run_full_ctx: bool = False  # Skip real data; fabricate full-context sequences
     dummy_run_max_steps: int = 5  # Number of steps to run in dummy mode
@@ -359,6 +389,13 @@ def validate_sft_cfg(cfg: SFTConfig) -> None:
         # Resolve and validate the FFD bin capacity (asserts it is >= max_length
         # so any single sequence fits in a bin).
         cfg.resolved_bin_capacity()
+        # CUDA-graph static-shape padding: the divisibility / >= bin_capacity
+        # checks live in PackedDataCollator.__init__ (where align_size is known);
+        # here we only enforce that the mode requires sequence packing.
+        if cfg.graph_seqlen is not None and cfg.graph_seqlen <= 0:
+            raise ValueError(f"graph_seqlen must be > 0 when set, got {cfg.graph_seqlen}.")
+    elif cfg.graph_seqlen is not None:
+        raise ValueError("graph_seqlen requires use_sequence_packing=True (Megatron sequence packing).")
 
 
 # NOTE (sumanthrh): Ideally this is not needed, but our internal abstractions for workers and worker groups depend

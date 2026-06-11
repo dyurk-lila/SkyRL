@@ -1083,6 +1083,18 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # this already gets set in the init_model method
         pass
 
+    def _set_graph_seqlen_env(self, graph_seqlen: int):
+        """Pin ``SKYRL_GRAPH_SEQLEN`` in this worker process.
+
+        ``preprocess_packed_seqs`` reads this env var to pin ``max_seqlen`` to a
+        constant for CUDA-graph replay (see megatron_utils.py). The collator
+        runs on the controller, so when SFT enables the static-pad mode
+        (``graph_seqlen`` set) the trainer dispatches this RPC to set the env var
+        inside each worker process. A value of 0 (the default) leaves the legacy
+        dynamic-``max_seqlen`` behavior unchanged.
+        """
+        os.environ["SKYRL_GRAPH_SEQLEN"] = str(int(graph_seqlen))
+
     # ------------------------------------------------------------------
     # Multi-LoRA / AdapterStore Ray-callable methods
     # ------------------------------------------------------------------

@@ -843,6 +843,9 @@ class SFTTrainer:
                 dp_size=self._dp_size(),
                 batch_size=self.sft_cfg.batch_size,
                 micro_train_batch_size_per_gpu=self.sft_cfg.micro_train_batch_size_per_gpu,
+                # CUDA-graph static-shape padding (opt-in; None => legacy behavior).
+                graph_seqlen=self.sft_cfg.graph_seqlen,
+                max_subseqs_per_bin=self.sft_cfg.max_subseqs_per_bin,
             )
         return DefaultCollator(
             tokenizer=tokenizer,
@@ -937,6 +940,17 @@ class SFTTrainer:
             )
         )
         ray.get(actor_group.async_run_ray_method("pass_through", "_set_pad_token_id", self.tokenizer.pad_token_id))
+
+        # CUDA-graph static-shape padding (opt-in): when the collator runs in
+        # fixed-pad mode (sft_cfg.graph_seqlen set), pin SKYRL_GRAPH_SEQLEN inside
+        # every worker so preprocess_packed_seqs reports a constant max_seqlen and
+        # mcore's CUDA-graph replay value-check does not trip. No-op when unset.
+        if self.sft_cfg.strategy == "megatron" and self.sft_cfg.graph_seqlen is not None:
+            ray.get(
+                actor_group.async_run_ray_method(
+                    "pass_through", "_set_graph_seqlen_env", self.sft_cfg.graph_seqlen
+                )
+            )
 
         self.dispatch = WorkerDispatch(self.cfg, policy_actor_group=actor_group)
 
