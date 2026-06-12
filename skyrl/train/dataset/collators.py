@@ -232,9 +232,36 @@ class PackedDataCollator:
         # multiple of ``dp_size`` makes the per-DP-rank bin count (and thus
         # ``num_microbatches``) identical across ranks.
         bin_count_multiple = dp_size
+
+        # CUDA-graph mode: the FFD packer counts RAW tokens, but the packed row
+        # lays each sub-seq out at its ALIGNED span ``_round_up(s, align_size)``.
+        # The aligned total of a bin therefore exceeds its raw token sum by up to
+        # ``align_size - 1`` per sub-seq. Packing only to ``graph_seqlen`` raw
+        # tokens lets that aligned total spill PAST ``graph_seqlen``, which made
+        # ``slack = graph_seqlen - packed_len`` go negative and the row writes
+        # overflow the buffer (the historical ``could not broadcast (1637,) into
+        # (1632,)``). Reserve the worst-case alignment headroom so the aligned
+        # ``packed_len`` of every bin is guaranteed <= ``graph_seqlen``: a bin
+        # holds at most ``max_subseqs_per_bin - 1`` REAL sub-seqs (one slot is
+        # reserved for the slack pad), each wasting at most ``align_size - 1``
+        # tokens to alignment, so the total waste is bounded by that product.
+        packing_bin_capacity = bin_capacity
+        if self.graph_seqlen is not None:
+            align_headroom = (self.max_subseqs_per_bin - 1) * (align_size - 1)
+            packing_bin_capacity = min(bin_capacity, self.graph_seqlen - align_headroom)
+            if packing_bin_capacity < max(seq_lengths, default=0):
+                raise ValueError(
+                    f"graph_seqlen ({self.graph_seqlen}) leaves an effective bin capacity of "
+                    f"{packing_bin_capacity} raw tokens after reserving alignment headroom "
+                    f"{align_headroom} = (max_subseqs_per_bin-1)*(align_size-1) "
+                    f"(max_subseqs_per_bin={self.max_subseqs_per_bin}, align_size={align_size}), "
+                    f"which is smaller than the longest sequence ({max(seq_lengths, default=0)}). "
+                    f"Raise graph_seqlen or lower max_subseqs_per_bin / max_tokens_per_microbatch."
+                )
+
         packer = make_seq_packer(
             "first_fit_decreasing",
-            bin_capacity=bin_capacity,
+            bin_capacity=packing_bin_capacity,
             min_bin_count=bin_count_multiple,
             bin_count_multiple=bin_count_multiple,
         )
@@ -319,6 +346,18 @@ class PackedDataCollator:
             max_subseqs_per_bin = self.max_subseqs_per_bin
             for row_idx, packed_len in enumerate(bin_packed_lengths):
                 slack = graph_seqlen - packed_len
+                # ``packed_len`` is the sum of ALIGNED sub-seq spans, which can
+                # exceed the raw bin-capacity token sum by up to ``align_size-1``
+                # per sub-seq. The FFD capacity above reserves exactly that
+                # worst-case headroom so ``packed_len <= graph_seqlen`` always
+                # holds and ``slack`` is non-negative; assert it here so any
+                # future drift surfaces as a clear error instead of a downstream
+                # numpy broadcast/overflow in the section-4 row writes.
+                assert slack >= 0, (
+                    f"bin {row_idx} aligned packed_len ({packed_len}) exceeds graph_seqlen "
+                    f"({graph_seqlen}); the FFD alignment headroom reservation failed. This bin's "
+                    f"real sub-seqs cannot fit the static graph buffer."
+                )
                 # (a) ALWAYS append exactly one slack sub-seq absorbing the
                 #     (align-multiple) slack, even when slack == 0. Appending it
                 #     unconditionally keeps the per-bin segment layout identical
@@ -349,6 +388,19 @@ class PackedDataCollator:
                     f"bin {row_idx} has {len(bin_subseq_lengths[row_idx])} sub-seqs after padding, "
                     f"expected exactly max_subseqs_per_bin ({max_subseqs_per_bin}); cu_seqlens shape "
                     f"would not be static across steps."
+                )
+                # Hard invariant for static CUDA-graph shapes AND for the
+                # section-4 row writes to fit: the aligned span of every sub-seq
+                # (real + slack + zero K-pads) must sum to EXACTLY graph_seqlen.
+                # The slack is an align multiple (graph_seqlen and each real span
+                # are), so _round_up(slack, align)==slack; this is what makes the
+                # row_offset advance land precisely on graph_seqlen=max_packed_len
+                # and every real write window [offset:offset+s] stay in bounds.
+                aligned_total = sum(_round_up(s, align_size) for s in bin_subseq_lengths[row_idx])
+                assert aligned_total == graph_seqlen, (
+                    f"bin {row_idx} aligned sub-seq spans sum to {aligned_total}, expected "
+                    f"graph_seqlen ({graph_seqlen}); the section-4 row writes would overflow the "
+                    f"max_packed_len buffer by {aligned_total - graph_seqlen}."
                 )
                 # Every bin now sums (with align round-up) to exactly graph_seqlen.
                 bin_packed_lengths[row_idx] = graph_seqlen
