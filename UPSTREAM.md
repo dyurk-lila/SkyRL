@@ -57,14 +57,16 @@ Upstream remote: `https://github.com/NovaSky-AI/SkyRL.git` · sync target: **`up
 -->
 
 <!-- BEGIN AUTO:develop-delta -->
-_Last generated for `origin/main` (f508739f) ↔ `HEAD` (58c6d609); merge-base `f508739f`. **Auto-generated — do not edit by hand.**_
+_Last generated for `origin/main` (f508739f) ↔ `HEAD` (55849207); merge-base `f508739f`. **Auto-generated — do not edit by hand.**_
 
-`develop` is **11 commit(s)** ahead of `main`.
+`develop` is **13 commit(s)** ahead of `main`.
 
 ### Commits on `develop` not on `main`
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `55849207` | Revert "ci(upstream-sync): grant workflows:write so main fas | dyurk-lila | 2026-06-15 |
+| `dc9bf5d3` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-06-15 |
 | `58c6d609` | ci(upstream-sync): grant workflows:write so main fast-forwar | dyurk-lila | 2026-06-15 |
 | `b577a50a` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-06-10 |
 | `684e4e66` | ci: also exclude heavy tx LoRA-training parity tests from CP | dyurk-lila | 2026-06-10 |
@@ -91,11 +93,11 @@ _Last generated for `origin/main` (f508739f) ↔ `HEAD` (58c6d609); merge-base `
  .github/workflows/cpu_skyrl.yaml       |  14 +++-
  .github/workflows/cpu_skyrl_train.yaml |   4 +-
  .github/workflows/develop-delta.yaml   |  91 +++++++++++++++++++++
- .github/workflows/sync-upstream.yaml   | 144 +++++++++++++++++++++++++++++++++
- UPSTREAM.md                            | 139 +++++++++++++++++++++++++++++++
+ .github/workflows/sync-upstream.yaml   | 143 +++++++++++++++++++++++++++++++++
+ UPSTREAM.md                            | 141 ++++++++++++++++++++++++++++++++
  upstream-sync/bedrock-ci-setup.md      |  70 ++++++++++++++++
  upstream-sync/gen_develop_delta.sh     | 104 ++++++++++++++++++++++++
- 8 files changed, 589 insertions(+), 3 deletions(-)
+ 8 files changed, 590 insertions(+), 3 deletions(-)
 ```
 <!-- END AUTO:develop-delta -->
 
