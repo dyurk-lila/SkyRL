@@ -57,14 +57,16 @@ Upstream remote: `https://github.com/NovaSky-AI/SkyRL.git` · sync target: **`up
 -->
 
 <!-- BEGIN AUTO:develop-delta -->
-_Last generated for `origin/main` (c4eaded7) ↔ `HEAD` (c42b3fa9); merge-base `c4eaded7`. **Auto-generated — do not edit by hand.**_
+_Last generated for `origin/main` (c4eaded7) ↔ `HEAD` (db513d40); merge-base `c4eaded7`. **Auto-generated — do not edit by hand.**_
 
-`develop` is **16 commit(s)** ahead of `main`.
+`develop` is **18 commit(s)** ahead of `main`.
 
 ### Commits on `develop` not on `main`
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `db513d40` | ci: disable auto-trigger of SkyRL-GPU job (missing fork ANYS | dyurk-lila | 2026-06-15 |
+| `414bb535` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-06-15 |
 | `a36839b9` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-06-15 |
 | `55849207` | Revert "ci(upstream-sync): grant workflows:write so main fas | dyurk-lila | 2026-06-15 |
 | `dc9bf5d3` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-06-15 |
@@ -95,12 +97,13 @@ _Last generated for `origin/main` (c4eaded7) ↔ `HEAD` (c42b3fa9); merge-base `
  .github/CODEOWNERS                     |  26 ++++++
  .github/workflows/cpu_skyrl.yaml       |  14 +++-
  .github/workflows/cpu_skyrl_train.yaml |   4 +-
- .github/workflows/develop-delta.yaml   |  91 +++++++++++++++++++++
- .github/workflows/sync-upstream.yaml   | 143 +++++++++++++++++++++++++++++++++
- UPSTREAM.md                            | 143 +++++++++++++++++++++++++++++++++
+ .github/workflows/develop-delta.yaml   |  91 ++++++++++++++++++++
+ .github/workflows/gpu_skyrl.yaml       |  23 ++----
+ .github/workflows/sync-upstream.yaml   | 143 ++++++++++++++++++++++++++++++++
+ UPSTREAM.md                            | 146 +++++++++++++++++++++++++++++++++
  upstream-sync/bedrock-ci-setup.md      |  70 ++++++++++++++++
- upstream-sync/gen_develop_delta.sh     | 104 ++++++++++++++++++++++++
- 8 files changed, 592 insertions(+), 3 deletions(-)
+ upstream-sync/gen_develop_delta.sh     | 104 +++++++++++++++++++++++
+ 9 files changed, 603 insertions(+), 18 deletions(-)
 ```
 <!-- END AUTO:develop-delta -->
 
