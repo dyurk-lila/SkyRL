@@ -1,21 +1,14 @@
 name: SkyRL-GPU
 
+# NOTE (fl97inc fork): the automatic `push` / `pull_request` triggers are
+# disabled because the `skyrl_gpu_tests` job submits an Anyscale job using
+# `secrets.ANYSCALE_CLI_TOKEN`, which is not configured on this fork. Without
+# it, every PR/push run fails in ~20s with "Your user credentials are invalid",
+# producing a permanently-red UNSTABLE check on every PR. The job is kept as
+# `workflow_dispatch` only so it can be run manually once an Anyscale CI token
+# is set on the fork; restore the `push`/`pull_request` triggers below at that
+# point. GPU coverage is otherwise exercised on-cluster (buzz) by reviewers.
 on:
-  push:
-    branches: [ main ]
-    paths:
-      - 'ci/**'
-      - 'skyrl/**'
-      - 'tests/**'
-      - 'pyproject.toml'
-      - '.github/workflows/gpu_skyrl.yaml'
-  pull_request:
-    paths:
-      - 'ci/**'
-      - 'skyrl/**'
-      - 'tests/**'
-      - 'pyproject.toml'
-      - '.github/workflows/gpu_skyrl.yaml'
   workflow_dispatch:
 
 permissions:
