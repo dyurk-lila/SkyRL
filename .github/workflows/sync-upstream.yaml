@@ -34,7 +34,6 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  workflows: write   # upstream commits touch .github/workflows/**; pushing main needs this scope
 
 concurrency:
   group: sync-upstream
