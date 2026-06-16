@@ -57,14 +57,17 @@ Upstream remote: `https://github.com/NovaSky-AI/SkyRL.git` · sync target: **`up
 -->
 
 <!-- BEGIN AUTO:develop-delta -->
-_Last generated for `origin/main` (c4eaded7) ↔ `HEAD` (db513d40); merge-base `c4eaded7`. **Auto-generated — do not edit by hand.**_
+_Last generated for `origin/main` (c4eaded7) ↔ `HEAD` (fdafc434); merge-base `c4eaded7`. **Auto-generated — do not edit by hand.**_
 
-`develop` is **18 commit(s)** ahead of `main`.
+`develop` is **22 commit(s)** ahead of `main`.
 
 ### Commits on `develop` not on `main`
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `a5158404` | test: move loguru deadlock regression test into skyrl-train  | Vu Dinh | 2026-06-16 |
+| `2fd5b66e` | fix: prevent loguru/stdlib logging deadlock in Ray workers | Vu Dinh | 2026-06-11 |
+| `f706ed79` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-06-15 |
 | `db513d40` | ci: disable auto-trigger of SkyRL-GPU job (missing fork ANYS | dyurk-lila | 2026-06-15 |
 | `414bb535` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-06-15 |
 | `a36839b9` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-06-15 |
@@ -79,10 +82,11 @@ _Last generated for `origin/main` (c4eaded7) ↔ `HEAD` (db513d40); merge-base `
 | `186fd6cc` | feat(upstream-sync): auto-regenerate develop↔main delta on m | dyurk-lila | 2026-06-10 |
 | `237a022f` | chore(upstream-sync): install sync tooling on develop (ledge | dyurk-lila | 2026-06-10 |
 
-<details><summary>merge commits (5)</summary>
+<details><summary>merge commits (6)</summary>
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `fdafc434` | Merge pull request #28 from fl97inc/vdinh/fix-loguru-loggi.. | dyurk-lila | 2026-06-16 |
 | `c42b3fa9` | Merge pull request #31 from fl97inc/sync/develop-2026-06-15  | dyurk-lila | 2026-06-15 |
 | `0c19095c` | Merge commit 'c4eaded781fd291b4e624be7d0c2d5843377815e' in.. | dyurk-lila | 2026-06-15 |
 | `751c765c` | Merge pull request #27 from fl97inc/ci/beefier-cpu-runner    | dyurk-lila | 2026-06-10 |
@@ -94,16 +98,18 @@ _Last generated for `origin/main` (c4eaded7) ↔ `HEAD` (db513d40); merge-base `
 ### Files changed (`origin/main...HEAD`)
 
 ```
- .github/CODEOWNERS                     |  26 ++++++
- .github/workflows/cpu_skyrl.yaml       |  14 +++-
- .github/workflows/cpu_skyrl_train.yaml |   4 +-
- .github/workflows/develop-delta.yaml   |  91 ++++++++++++++++++++
- .github/workflows/gpu_skyrl.yaml       |  23 ++----
- .github/workflows/sync-upstream.yaml   | 143 ++++++++++++++++++++++++++++++++
- UPSTREAM.md                            | 146 +++++++++++++++++++++++++++++++++
- upstream-sync/bedrock-ci-setup.md      |  70 ++++++++++++++++
- upstream-sync/gen_develop_delta.sh     | 104 +++++++++++++++++++++++
- 9 files changed, 603 insertions(+), 18 deletions(-)
+ .github/CODEOWNERS                       |  26 ++++++
+ .github/workflows/cpu_skyrl.yaml         |  14 ++-
+ .github/workflows/cpu_skyrl_train.yaml   |   4 +-
+ .github/workflows/develop-delta.yaml     |  91 +++++++++++++++++++
+ .github/workflows/gpu_skyrl.yaml         |  23 ++---
+ .github/workflows/sync-upstream.yaml     | 143 +++++++++++++++++++++++++++++
+ UPSTREAM.md                              | 149 +++++++++++++++++++++++++++++++
+ skyrl/train/utils/utils.py               |   8 +-
+ tests/train/utils/test_logging_config.py | 120 +++++++++++++++++++++++++
+ upstream-sync/bedrock-ci-setup.md        |  70 +++++++++++++++
+ upstream-sync/gen_develop_delta.sh       | 104 +++++++++++++++++++++
+ 11 files changed, 733 insertions(+), 19 deletions(-)
 ```
 <!-- END AUTO:develop-delta -->
 
