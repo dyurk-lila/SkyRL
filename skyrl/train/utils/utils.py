@@ -735,11 +735,17 @@ def configure_ray_worker_logging() -> None:
     # 1) Loguru formatting (force colors)
     logger.remove()
     logger.level("INFO", color="<bold><green>")
+    # NOTE: enqueue must stay False. With enqueue=True loguru drains records on a
+    # background writer thread; any stdlib log emitted from the sink's write path
+    # is forwarded by the _InterceptHandler below back into logger.log -> queue.put
+    # *on that writer thread*, which blocks on a full queue pipe and strands the
+    # stdlib logging lock, deadlocking every other thread that logs. Writing
+    # inline avoids the cross-thread re-entry entirely.
     logger.add(
         sys.stderr,
         colorize=True,  # keep ANSI even without a TTY
         level=level_name,  # ensure Loguru filters below this level
-        enqueue=True,
+        enqueue=False,
         backtrace=False,
         diagnose=False,
         format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
