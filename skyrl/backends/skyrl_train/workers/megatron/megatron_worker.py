@@ -473,7 +473,17 @@ class MegatronWorker:
 
         default_ddp_config = DistributedDataParallelConfig()
         if wrap_with_ddp:
-            default_ddp_config.use_distributed_optimizer = True
+            # The DDP-level distributed optimizer must be OFF for the layer-wise
+            # (Muon / emerging-optimizer) path: it needs whole 2D matrices on a
+            # single rank, not byte-sharded params, and the MoE expert-parallel
+            # ping-pong asserts when a non-Muon group sees the dist-opt. There is
+            # no MegatronDDPConfig field for this flag (the strict key validator
+            # rejects a ddp_config override), so honor an env var here. Default
+            # unchanged (unset / anything but "0" -> True), so Adam runs are
+            # untouched; Muon launches export SKYRL_USE_DISTRIBUTED_OPTIMIZER=0.
+            default_ddp_config.use_distributed_optimizer = (
+                os.environ.get("SKYRL_USE_DISTRIBUTED_OPTIMIZER", "1") != "0"
+            )
         if ddp_config is not None:
             for k, v in get_config_as_dict(ddp_config).items():
                 setattr(default_ddp_config, k, v)
