@@ -616,7 +616,15 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             optim_config = init_megatron_optim_config(
                 self.cfg.policy.optimizer_config, self.cfg.policy.megatron_config.optimizer_config_kwargs
             )
-            self.optimizer = get_megatron_optimizer(self.actor_module, optim_config)
+            # Pass raw optimizer_config_kwargs so get_megatron_optimizer can honor
+            # the SkyRL-only ``force_adam_param_globs`` key (e.g. routing the 2D MoE
+            # router/gate to Adam under Muon). init_megatron_optim_config already
+            # strips it before building OptimizerConfig.
+            self.optimizer = get_megatron_optimizer(
+                self.actor_module,
+                optim_config,
+                optimizer_config_kwargs=self.cfg.policy.megatron_config.optimizer_config_kwargs,
+            )
 
             # create scheduler
             self.scheduler = get_megatron_optimizer_param_scheduler(
