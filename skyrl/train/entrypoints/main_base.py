@@ -393,8 +393,19 @@ class BasePPOExp:
         # during `build_models` (which happens before _setup_trainer returns).
         self.trainer = trainer
 
-        # Build the models
-        trainer.build_models(PolicyWorker, CriticWorker, RefWorker)
+        # Build the models — skipped in simulated-trainer mode (no policy/critic/ref components).
+        # See FullyAsyncConfig.simulate_training / FullyAsyncTrainerSim: steps are simulated
+        # (sleep + pause/resume, no broadcast), typically against external served endpoints.
+        # TODO: we should make a top level TrainerConfig.simulate_training flag to provide a consistent way
+        # for simulating training steps
+        simulate_training = self.cfg.trainer.fully_async.simulate_training
+        if simulate_training:
+            logger.info(
+                "fully_async.simulate_training=True: skipping build_models() — no policy/critic/ref "
+                "models instantiated. Trainer steps will be simulated (sleep + pause/resume, no broadcast)."
+            )
+        else:
+            trainer.build_models(PolicyWorker, CriticWorker, RefWorker)
         return trainer
 
     def run(self):
@@ -409,6 +420,10 @@ class BasePPOExp:
             # worker logs; route them through the tracker so wandb users see
             # them as an `error/tracebacks` table row.
             if self.trainer is not None and self.trainer.tracker is not None:
+                # Flush metrics already recorded for the in-flight step (e.g.
+                # reward/timing metrics from a completed generation phase)
+                # before log_exception finishes the wandb run.
+                self.trainer.flush_pending_metrics()
                 self.trainer.tracker.log_exception(e, step=self.trainer.global_step)
             else:
                 logger.error(f"Setup failed before tracker was initialized:\n{e}")

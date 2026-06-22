@@ -12,6 +12,7 @@ from omegaconf import OmegaConf
 from skyrl.backends.skyrl_train.distributed.megatron.megatron_utils import (
     get_model_config,
     make_batch_generator,
+    model_packs_sequences_internally,
     preprocess_packed_seqs,
     recover_left_padding,
     remove_left_padding,
@@ -31,6 +32,9 @@ from skyrl.backends.skyrl_train.utils.replay_utils import (
     setup_per_microbatch_replay_forward,
 )
 from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
+from skyrl.backends.skyrl_train.workers.worker_utils import (
+    compute_minibatch_rollout_logprob_diff_metrics,
+)
 from skyrl.train.config import TrainerConfig
 
 
@@ -85,6 +89,18 @@ class MegatronModelWrapper:
         self.actor_optimizer = actor_optimizer
         self.policy_loss_fn = policy_loss_fn
         self.remove_microbatch_padding = self.cfg.remove_microbatch_padding
+        # Some models (e.g. Qwen3.5 via the VL bridge -> Qwen3VLModel) pack
+        # sequences inside their own forward; SkyRL sample packing would then
+        # double-pack and corrupt the GDN cu_seqlens, so refuse it. For Qwen3.5,
+        # use language_model_only=True (native GPTModel GDN path) to pack.
+        if self.remove_microbatch_padding and model_packs_sequences_internally(self.actor_module):
+            raise ValueError(
+                "remove_microbatch_padding=True (sample packing) is not supported for models that "
+                "pack sequences inside their own forward (e.g. the Qwen3.5 VL Qwen3VLModel): it "
+                "double-packs and corrupts the GatedDeltaNet cu_seqlens. Set "
+                "trainer.policy.language_model_only=True to route Qwen3.5 to the native GPTModel GDN "
+                "packing path, or set trainer.remove_microbatch_padding=False."
+            )
 
         config = get_model_config(self.actor_module[0])
         # This is set to None by default: https://github.com/NVIDIA/Megatron-LM/blob/07b22a05136a3cb08ece05f7de38cf6aeeb165fb/megatron/core/model_parallel_config.py#L95
@@ -500,6 +516,9 @@ class MegatronModelWrapper:
             }
             for k, v in loss_metrics.items():
                 metrics["loss_metrics/" + k] = v
+            metrics.update(
+                compute_minibatch_rollout_logprob_diff_metrics(action_log_probs, rollout_action_logprobs, loss_mask)
+            )
             return loss, metrics
 
         def forward_step(batch_iter, model):

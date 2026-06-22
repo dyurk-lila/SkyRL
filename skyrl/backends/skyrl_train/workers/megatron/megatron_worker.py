@@ -81,6 +81,9 @@ if TYPE_CHECKING:
     from skyrl.train.config.config import InferenceEngineConfig
 
 import skyrl.backends.skyrl_train.workers.megatron.model_bridges as _  # noqa: F401  # register extra bridges
+from skyrl.backends.skyrl_train.workers.megatron.model_bridges import (
+    maybe_force_qwen35_text_bridge,
+)
 
 
 class MegatronWeightExtractor(WeightExtractor):
@@ -330,6 +333,7 @@ class MegatronWorker:
         bf16=True,
         flash_attn=False,
         lora_config=None,
+        language_model_only=False,
     ):
         """
         Initialize the Megatron-Bridge bridge and provider objects + hf_config and tokenizer
@@ -356,7 +360,25 @@ class MegatronWorker:
                 transformer_config_kwargs[key] = None
 
         bridge = AutoBridge.from_hf_pretrained(model_path, trust_remote_code=True)
+
+        # For Qwen3.5, language_model_only routes to the native GPTModel + GDN
+        # path (which supports sample packing) instead of the VL Qwen3VLModel
+        # (which doesn't). Must run before to_megatron_provider; no-op otherwise.
+        if language_model_only and maybe_force_qwen35_text_bridge(bridge, hf_config):
+            logger.info(
+                "language_model_only=True: forcing Qwen3.5 text->GPTModel bridge "
+                "(native GDN thd packing path; vision tower dropped)"
+            )
+
         provider = bridge.to_megatron_provider()
+
+        # Disable MTP for training: its aux loss is unused, and under full
+        # recompute its checkpointed forward passes packed_seq_params positionally
+        # into tensor_parallel.checkpoint (tensors only), breaking packed-sequence
+        # backward. Mirrors the MTP-disable in model_bridges.py.
+        if getattr(provider, "mtp_num_layers", None):
+            logger.info(f"Disabling MTP for training (mtp_num_layers={provider.mtp_num_layers} -> None)")
+            provider.mtp_num_layers = None
 
         # Workaround for megatron-bridge CONFIG_MAPPING dropping None values:
         # MLA models like Moonlight-16B have q_lora_rank=None (no Q compression),
@@ -748,6 +770,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             self.cfg.policy.megatron_config.transformer_config_kwargs,
             bf16=self.cfg.bf16,
             flash_attn=self.cfg.flash_attn,
+            language_model_only=self.cfg.policy.language_model_only,
         )
 
         if self.enable_router_replay:
@@ -765,9 +788,10 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             self.provider.register_pre_wrap_hook(freeze_moe_router)
 
         # wrap with DDP for training
+        wrap_with_ddp = not self.cfg.policy.inference_only_init
         self.actor_module = self.make_megatron_module(
-            wrap_with_ddp=True,
-            ddp_config=self.cfg.policy.megatron_config.ddp_config,
+            wrap_with_ddp=wrap_with_ddp,
+            ddp_config=self.cfg.policy.megatron_config.ddp_config if wrap_with_ddp else None,
             lora_config=self.cfg.policy.model.lora if self._is_lora else None,
             lora_type=self.cfg.policy.megatron_config.lora_config.lora_type,
             bf16=self.cfg.bf16,
@@ -1003,6 +1027,9 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                     "rollout_expert_indices": rollout_expert_indices if self.enable_router_replay else None,
                     # used with global sequence packing (None when token-based batching is active)
                     "sub_seq_lengths": experience.sub_seq_lengths,
+                    "is_padding_batch": (
+                        experience.metadata.get("is_padding_batch", False) if experience.metadata else False
+                    ),
                 }
             )
 
@@ -1068,7 +1095,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             # ...) are meaningless and would drag down the mean-reduced metrics. Summed
             # metrics (e.g. policy_loss) are unaffected since padding contributes 0, but
             # excluding them here keeps both reductions correct.
-            if m_batch["loss_mask"].sum().item() == 0:
+            if m_batch["is_padding_batch"]:
                 continue
             for k, v in metrics.items():
                 all_metrics[k].append(v)
@@ -1248,7 +1275,11 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         use_prefix_cache = inference_engine_cfg.enable_prefix_caching
         generator_dtype = str_to_torch_dtype(inference_engine_cfg.model_dtype)
         cache_reset_task = None
-        if use_prefix_cache and torch.distributed.get_rank() == 0:
+        if (
+            use_prefix_cache
+            and torch.distributed.get_rank() == 0
+            and self.cfg.fully_async.clear_kv_cache_on_weight_sync
+        ):
             # clear prefix cache
             cache_reset_task = inference_engine_client.reset_prefix_cache()
 
@@ -1427,6 +1458,7 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
             self.cfg.ref.megatron_config.transformer_config_kwargs,
             bf16=self.cfg.bf16,
             flash_attn=self.cfg.flash_attn,
+            language_model_only=self.cfg.ref.language_model_only,
         )
 
         self.actor_module = self.make_megatron_module(
