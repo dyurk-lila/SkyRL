@@ -57,14 +57,16 @@ Upstream remote: `https://github.com/NovaSky-AI/SkyRL.git` · sync target: **`up
 -->
 
 <!-- BEGIN AUTO:develop-delta -->
-_Last generated for `origin/main` (7f453704) ↔ `HEAD` (461ff450); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
+_Last generated for `origin/main` (7f453704) ↔ `HEAD` (64dc91d4); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
 
-`develop` is **31 commit(s)** ahead of `main`.
+`develop` is **33 commit(s)** ahead of `main`.
 
 ### Commits on `develop` not on `main`
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `64dc91d4` | [train] Save HF processor on checkpoint export for VLMs (#29 | Vu Dinh | 2026-06-22 |
+| `a6357e3d` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-06-22 |
 | `461ff450` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-06-22 |
 | `dd8ad3fa` | [train] Async batch prefetch (double-buffering) for the SFT  | dyurk-lila | 2026-06-22 |
 | `bca9e5dd` | [train] Vectorize controller-side training-batch collation ( | dyurk-lila | 2026-06-22 |
@@ -114,12 +116,13 @@ _Last generated for `origin/main` (7f453704) ↔ `HEAD` (461ff450); merge-base `
  .github/workflows/gpu_skyrl.yaml                   |   23 +-
  .github/workflows/sync-upstream.yaml               |  143 ++
  NOTICE                                             |   21 +
- UPSTREAM.md                                        |  177 ++
+ UPSTREAM.md                                        |  182 ++
  pyproject.toml                                     |    8 +
  .../megatron/fused_linear_logprob_triton.py        | 2126 ++++++++++++++++++++
  .../distributed/megatron/model_utils.py            |  532 ++++-
  .../skyrl_train/distributed/megatron/optimizer.py  |   15 +-
  .../distributed/megatron/optimizer_dtype.py        |  108 +
+ skyrl/backends/skyrl_train/distributed/strategy.py |   14 +
  .../workers/megatron/megatron_model_wrapper.py     |  184 +-
  skyrl/train/config/config.py                       |   28 +
  skyrl/train/config/sft_config.py                   |    8 +
@@ -128,15 +131,17 @@ _Last generated for `origin/main` (7f453704) ↔ `HEAD` (461ff450); merge-base `
  skyrl/train/sft_trainer.py                         |  324 +--
  skyrl/train/utils/batch_prefetcher.py              |  102 +
  skyrl/train/utils/utils.py                         |    8 +-
+ skyrl/utils/tok.py                                 |   32 +-
  .../cpu/megatron/test_fused_linear_logprob.py      |  372 ++++
  .../distributed/test_optimizer_dtype_coercion.py   |  207 ++
+ .../distributed/test_save_hf_configs_processor.py  |  111 +
  .../megatron/test_fused_linear_logprob_triton.py   |  346 ++++
  .../test_collation_vectorization_equivalence.py    |  349 ++++
  tests/train/test_sft_prefetch.py                   |  462 +++++
  tests/train/utils/test_logging_config.py           |  120 ++
  upstream-sync/bedrock-ci-setup.md                  |   70 +
  upstream-sync/gen_develop_delta.sh                 |  104 +
- 29 files changed, 5886 insertions(+), 256 deletions(-)
+ 32 files changed, 6047 insertions(+), 257 deletions(-)
 ```
 <!-- END AUTO:develop-delta -->
 
