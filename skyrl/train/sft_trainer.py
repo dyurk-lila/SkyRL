@@ -724,6 +724,12 @@ class SFTTrainer:
         self._steps_per_epoch: int = 0
         self._current_epoch: int = 0
 
+    @property
+    def _torch_profiler_enabled(self) -> bool:
+        """Whether the trainer should drive the torch profiler. Gates all
+        profiler RPC dispatch so non-profiling runs pay zero extra round-trips."""
+        return self.cfg.trainer.policy.torch_profiler_config.enable
+
     def _build_collator(self, tokenizer):
         """Select the batch collator from the configured packing mode.
 
@@ -1324,6 +1330,12 @@ class SFTTrainer:
             grad_norm = self.dispatch.optim_step("policy")
 
         metrics = output.metrics
+
+        # Advance the torch profiler schedule once per global step (no-op unless
+        # profiling is enabled; the schedule decides which steps are recorded).
+        if self._torch_profiler_enabled:
+            self.dispatch.profile_step("policy")
+
         loss_val = metrics.get("final_loss", metrics.get("loss", float("nan")))
         return {
             "loss": loss_val,
@@ -1414,35 +1426,43 @@ class SFTTrainer:
 
         if self._ray_gpu_monitor is not None:
             self._ray_gpu_monitor.start()
-        for step in range(num_steps):
-            all_timings: dict[str, float] = {}
+        if self._torch_profiler_enabled:
+            self.dispatch.start_profile("policy")
+        try:
+            for step in range(num_steps):
+                all_timings: dict[str, float] = {}
 
-            with Timer("step", all_timings):
-                step_result = self.train_step(batch, step)
-                all_timings.update(step_result["timings"])
+                with Timer("step", all_timings):
+                    step_result = self.train_step(batch, step)
+                    all_timings.update(step_result["timings"])
 
-            actual_num_tokens = batch["attention_mask"].sum().item()
-            self._total_tokens_processed += actual_num_tokens
-            tokens_per_second = actual_num_tokens / all_timings["step"]
+                actual_num_tokens = batch["attention_mask"].sum().item()
+                self._total_tokens_processed += actual_num_tokens
+                tokens_per_second = actual_num_tokens / all_timings["step"]
 
-            log_dict = {
-                "train/loss": step_result["loss"],
-                "train/grad_norm": step_result["grad_norm"],
-                "train/tokens_per_second": tokens_per_second,
-                "train/tokens_per_second_per_gpu": tokens_per_second / self._num_training_gpus,
-                "train/actual_num_tokens": actual_num_tokens,
-                "train/total_tokens_processed": self._total_tokens_processed,
-            }
-            log_dict.update({f"timing/{k}": v for k, v in all_timings.items()})
-            if self._ray_gpu_monitor is not None:
-                log_dict.update(self._ray_gpu_monitor.flush())
+                log_dict = {
+                    "train/loss": step_result["loss"],
+                    "train/grad_norm": step_result["grad_norm"],
+                    "train/tokens_per_second": tokens_per_second,
+                    "train/tokens_per_second_per_gpu": tokens_per_second / self._num_training_gpus,
+                    "train/actual_num_tokens": actual_num_tokens,
+                    "train/total_tokens_processed": self._total_tokens_processed,
+                }
+                log_dict.update({f"timing/{k}": v for k, v in all_timings.items()})
+                if self._ray_gpu_monitor is not None:
+                    log_dict.update(self._ray_gpu_monitor.flush())
 
-            self.tracker.log(log_dict, step=step, commit=True)
-            logger.info(
-                f"Step {step}: loss={step_result['loss']:.4f}, "
-                f"grad_norm={step_result['grad_norm']}, "
-                f"tokens_per_second={tokens_per_second:.0f}"
-            )
+                self.tracker.log(log_dict, step=step, commit=True)
+                logger.info(
+                    f"Step {step}: loss={step_result['loss']:.4f}, "
+                    f"grad_norm={step_result['grad_norm']}, "
+                    f"tokens_per_second={tokens_per_second:.0f}"
+                )
+        finally:
+            # Always stop/flush the profiler when the loop exits (including via
+            # an exception) so the open trace window isn't leaked. No-op when off.
+            if self._torch_profiler_enabled:
+                self.dispatch.stop_profile("policy")
 
         logger.info("Dummy SFT training complete!")
 
@@ -1616,6 +1636,11 @@ class SFTTrainer:
             reshuffle_after_step = _epoch_of(step) > cur_epoch
             return not reshuffle_after_step
 
+        # Arm the torch profiler on the policy workers before the loop (no-op
+        # unless profiling is enabled). The per-step ``profile_step`` lives in
+        # ``train_step`` and the ``finally`` below flushes the trace.
+        if self._torch_profiler_enabled:
+            self.dispatch.start_profile("policy")
         try:
             while self.global_step <= num_steps:
                 all_timings: dict[str, float] = {}
@@ -1752,6 +1777,10 @@ class SFTTrainer:
 
                 self.global_step += 1
         finally:
+            # Always stop/flush the profiler when the loop exits (including via
+            # an exception) so the open trace window isn't leaked. No-op when off.
+            if self._torch_profiler_enabled:
+                self.dispatch.stop_profile("policy")
             # Always tear down the prefetch thread (drains any in-flight
             # batch and joins the worker) so neither the background thread
             # nor the dataset reference is leaked, even on exception. No-op
