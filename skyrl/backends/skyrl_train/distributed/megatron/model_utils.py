@@ -356,7 +356,26 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
         seq_size = int(vocab_parallel_logits.shape[1])
         num_chunks = (seq_size + chunk_size - 1) // chunk_size
 
-        all_grad_input = []
+        batch_size = int(vocab_parallel_logits.shape[0])
+
+        # Stream each chunk's gradient straight into its sequence slice of a single
+        # preallocated buffer instead of building a Python list and concatenating it.
+        # The list-then-``torch.cat`` form kept every per-chunk
+        # ``[batch_size, chunk_len, partition_vocab_size]`` fp32 grad alive AND
+        # allocated the full concatenated output at the cat moment, so peak was
+        # ~2x the [batch_size, seq_size, partition_vocab_size] fp32 grad. Streaming
+        # drops peak to full-buffer + one live chunk = ~(1 + 1 / num_chunks)x of the
+        # full grad, so the saving grows with num_chunks and approaches (but never
+        # reaches) a flat 2x; it is not a constant halving. The chunks tile
+        # ``[0, seq_size)`` contiguously with no overlap (chunk ``i`` covers
+        # ``[i * chunk_size, min(seq_size, (i + 1) * chunk_size))``), so each slice
+        # is written exactly once. This is byte-identical to the previous cat: the
+        # same per-chunk values land at the same positions.
+        grad_input = torch.empty(
+            (batch_size, seq_size, partition_vocab_size),
+            dtype=torch.float32,
+            device=vocab_parallel_logits.device,
+        )
 
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * chunk_size
@@ -374,20 +393,23 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
             # Build (onehot(target) - softmax) * grad_output without materializing a
             # [B, chunk_len, partition_vocab_size] one-hot (~8x softmax_output in float32 -> OOM at
             # large vocab). `neg` is zero-copy; the subsequent mul_ writes in place, then
-            # _add_chosen_token_grad adds grad_output at the chosen-token positions via scatter_add_.
+            # _add_chosen_token_grad adds grad_output at the chosen-token positions via scatter_add_
+            # (shared with FusedLinearLogprob.backward so the out-of-shard / index convention stays
+            # in lockstep). The finished chunk is then streamed into its slice of the preallocated
+            # grad_input buffer (#23), instead of the list-then-cat the standalone #21 used.
             chunk_target_mask = target_mask[:, chunk_start:chunk_end]
             chunk_masked_target = masked_target[:, chunk_start:chunk_end]
             chunk_grad_output = grad_output[:, chunk_start:chunk_end]
 
-            grad_input = softmax_output.neg_()
-            grad_input.mul_(chunk_grad_output.unsqueeze(-1))
+            chunk_grad_input = softmax_output.neg_()
+            chunk_grad_input.mul_(chunk_grad_output.unsqueeze(-1))
             _add_chosen_token_grad(
-                grad_input, chunk_target_mask, chunk_masked_target, chunk_grad_output, partition_vocab_size
+                chunk_grad_input, chunk_target_mask, chunk_masked_target, chunk_grad_output, partition_vocab_size
             )
 
-            all_grad_input.append(grad_input)
-
-        grad_input = torch.cat(all_grad_input, dim=1)
+            # Write the finished chunk straight into its (non-overlapping) sequence
+            # slice of the preallocated buffer; this copy replaces the deferred cat.
+            grad_input[:, chunk_start:chunk_end, :] = chunk_grad_input
 
         # if you add an argument to the forward method, then you must add a corresponding None here
         return grad_input, None, None, None, None, None, None
