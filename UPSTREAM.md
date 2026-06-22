@@ -57,14 +57,16 @@ Upstream remote: `https://github.com/NovaSky-AI/SkyRL.git` · sync target: **`up
 -->
 
 <!-- BEGIN AUTO:develop-delta -->
-_Last generated for `origin/main` (7f453704) ↔ `HEAD` (34886ebe); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
+_Last generated for `origin/main` (7f453704) ↔ `HEAD` (f027fe88); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
 
-`develop` is **36 commit(s)** ahead of `main`.
+`develop` is **38 commit(s)** ahead of `main`.
 
 ### Commits on `develop` not on `main`
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `f027fe88` | [megatron] Stream ChunkedDistributedLogprob.backward into a  | dyurk-lila | 2026-06-22 |
+| `b12818bc` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-06-22 |
 | `34886ebe` | [train] Skip building unused per-token loss_fn_outputs when  | dyurk-lila | 2026-06-22 |
 | `31c72fae` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-06-22 |
 | `01ba1cd3` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-06-22 |
@@ -119,10 +121,10 @@ _Last generated for `origin/main` (7f453704) ↔ `HEAD` (34886ebe); merge-base `
  .github/workflows/gpu_skyrl.yaml                   |   23 +-
  .github/workflows/sync-upstream.yaml               |  143 ++
  NOTICE                                             |   21 +
- UPSTREAM.md                                        |  188 ++
+ UPSTREAM.md                                        |  196 ++
  pyproject.toml                                     |    8 +
  .../megatron/fused_linear_logprob_triton.py        | 2126 ++++++++++++++++++++
- .../distributed/megatron/model_utils.py            |  532 ++++-
+ .../distributed/megatron/model_utils.py            |  560 +++++-
  .../skyrl_train/distributed/megatron/optimizer.py  |   15 +-
  .../distributed/megatron/optimizer_dtype.py        |  108 +
  skyrl/backends/skyrl_train/distributed/strategy.py |   14 +
@@ -138,8 +140,11 @@ _Last generated for `origin/main` (7f453704) ↔ `HEAD` (34886ebe); merge-base `
  skyrl/train/utils/utils.py                         |    8 +-
  skyrl/utils/tok.py                                 |   32 +-
  .../cpu/megatron/test_fused_linear_logprob.py      |  372 ++++
+ .../test_chunked_logprob_backward_streaming.py     |  260 +++
  .../distributed/test_optimizer_dtype_coercion.py   |  207 ++
  .../distributed/test_save_hf_configs_processor.py  |  111 +
+ .../megatron/test_chunked_logprob_backward.py      |    2 +-
+ .../megatron/test_chunked_logprob_backward_tp.py   |  186 ++
  .../megatron/test_fused_linear_logprob_triton.py   |  346 ++++
  .../skyrl_train/gpu/gpu_ci/test_training_step.py   |  134 ++
  .../workers/test_sft_loss_fn_outputs_gate.py       |  279 +++
@@ -150,7 +155,7 @@ _Last generated for `origin/main` (7f453704) ↔ `HEAD` (34886ebe); merge-base `
  tests/train/utils/test_logging_config.py           |  120 ++
  upstream-sync/bedrock-ci-setup.md                  |   70 +
  upstream-sync/gen_develop_delta.sh                 |  104 +
- 38 files changed, 6762 insertions(+), 382 deletions(-)
+ 41 files changed, 7242 insertions(+), 386 deletions(-)
 ```
 <!-- END AUTO:develop-delta -->
 
