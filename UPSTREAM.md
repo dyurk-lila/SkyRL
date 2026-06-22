@@ -57,14 +57,15 @@ Upstream remote: `https://github.com/NovaSky-AI/SkyRL.git` · sync target: **`up
 -->
 
 <!-- BEGIN AUTO:develop-delta -->
-_Last generated for `origin/main` (7f453704) ↔ `HEAD` (64dc91d4); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
+_Last generated for `origin/main` (7f453704) ↔ `HEAD` (01ba1cd3); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
 
-`develop` is **33 commit(s)** ahead of `main`.
+`develop` is **34 commit(s)** ahead of `main`.
 
 ### Commits on `develop` not on `main`
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `01ba1cd3` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-06-22 |
 | `64dc91d4` | [train] Save HF processor on checkpoint export for VLMs (#29 | Vu Dinh | 2026-06-22 |
 | `a6357e3d` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-06-22 |
 | `461ff450` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-06-22 |
@@ -116,7 +117,7 @@ _Last generated for `origin/main` (7f453704) ↔ `HEAD` (64dc91d4); merge-base `
  .github/workflows/gpu_skyrl.yaml                   |   23 +-
  .github/workflows/sync-upstream.yaml               |  143 ++
  NOTICE                                             |   21 +
- UPSTREAM.md                                        |  182 ++
+ UPSTREAM.md                                        |  187 ++
  pyproject.toml                                     |    8 +
  .../megatron/fused_linear_logprob_triton.py        | 2126 ++++++++++++++++++++
  .../distributed/megatron/model_utils.py            |  532 ++++-
@@ -141,7 +142,7 @@ _Last generated for `origin/main` (7f453704) ↔ `HEAD` (64dc91d4); merge-base `
  tests/train/utils/test_logging_config.py           |  120 ++
  upstream-sync/bedrock-ci-setup.md                  |   70 +
  upstream-sync/gen_develop_delta.sh                 |  104 +
- 32 files changed, 6047 insertions(+), 257 deletions(-)
+ 32 files changed, 6052 insertions(+), 257 deletions(-)
 ```
 <!-- END AUTO:develop-delta -->
 
