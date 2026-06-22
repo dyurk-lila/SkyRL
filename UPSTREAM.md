@@ -57,14 +57,16 @@ Upstream remote: `https://github.com/NovaSky-AI/SkyRL.git` · sync target: **`up
 -->
 
 <!-- BEGIN AUTO:develop-delta -->
-_Last generated for `origin/main` (7f453704) ↔ `HEAD` (f027fe88); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
+_Last generated for `origin/main` (7f453704) ↔ `HEAD` (cb7e187a); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
 
-`develop` is **38 commit(s)** ahead of `main`.
+`develop` is **40 commit(s)** ahead of `main`.
 
 ### Commits on `develop` not on `main`
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `cb7e187a` | feat(profiler): drive torch.profiler around the training loo | dyurk-lila | 2026-06-22 |
+| `b0f52733` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-06-22 |
 | `f027fe88` | [megatron] Stream ChunkedDistributedLogprob.backward into a  | dyurk-lila | 2026-06-22 |
 | `b12818bc` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-06-22 |
 | `34886ebe` | [train] Skip building unused per-token loss_fn_outputs when  | dyurk-lila | 2026-06-22 |
@@ -121,23 +123,36 @@ _Last generated for `origin/main` (7f453704) ↔ `HEAD` (f027fe88); merge-base `
  .github/workflows/gpu_skyrl.yaml                   |   23 +-
  .github/workflows/sync-upstream.yaml               |  143 ++
  NOTICE                                             |   21 +
- UPSTREAM.md                                        |  196 ++
+ UPSTREAM.md                                        |  201 ++
+ docs/api-pages.yaml                                |    2 +-
+ docs/content/docs/configuration/config.mdx         |   35 +
+ examples/train/async/async_trainer.py              |  127 +-
+ examples/train/megatron/run_megatron.sh            |   10 +-
+ .../megatron/run_megatron_nemotron_mini_4b.sh      |    6 +-
+ .../train_scripts/full_context/trainer_full_ctx.py |  141 +-
  pyproject.toml                                     |    8 +
  .../megatron/fused_linear_logprob_triton.py        | 2126 ++++++++++++++++++++
  .../distributed/megatron/model_utils.py            |  560 +++++-
  .../skyrl_train/distributed/megatron/optimizer.py  |   15 +-
  .../distributed/megatron/optimizer_dtype.py        |  108 +
  skyrl/backends/skyrl_train/distributed/strategy.py |   14 +
+ skyrl/backends/skyrl_train/utils/profiler.py       |  202 +-
+ .../skyrl_train/workers/fsdp/fsdp_worker.py        |    4 +
  .../workers/megatron/megatron_model_wrapper.py     |  270 ++-
- skyrl/backends/skyrl_train/workers/worker.py       |  154 +-
+ .../workers/megatron/megatron_worker.py            |    9 +-
+ skyrl/backends/skyrl_train/workers/worker.py       |  208 +-
+ .../skyrl_train/workers/worker_dispatch.py         |   55 +
  skyrl/backends/skyrl_train/workers/worker_utils.py |   21 +-
- skyrl/train/config/config.py                       |   28 +
- skyrl/train/config/sft_config.py                   |    8 +
+ skyrl/train/config/__init__.py                     |    4 +-
+ skyrl/train/config/config.py                       |  172 +-
+ skyrl/train/config/sft_config.py                   |   16 +
  skyrl/train/dataset/collators.py                   |   87 +-
  skyrl/train/dataset/preprocess.py                  |   83 +-
- skyrl/train/sft_trainer.py                         |  339 ++--
+ skyrl/train/fully_async_trainer.py                 |  344 ++--
+ skyrl/train/sft_trainer.py                         |  428 ++--
+ skyrl/train/trainer.py                             |  410 ++--
  skyrl/train/utils/batch_prefetcher.py              |  102 +
- skyrl/train/utils/utils.py                         |    8 +-
+ skyrl/train/utils/utils.py                         |   15 +-
  skyrl/utils/tok.py                                 |   32 +-
  .../cpu/megatron/test_fused_linear_logprob.py      |  372 ++++
  .../test_chunked_logprob_backward_streaming.py     |  260 +++
@@ -146,16 +161,20 @@ _Last generated for `origin/main` (7f453704) ↔ `HEAD` (f027fe88); merge-base `
  .../megatron/test_chunked_logprob_backward.py      |    2 +-
  .../megatron/test_chunked_logprob_backward_tp.py   |  186 ++
  .../megatron/test_fused_linear_logprob_triton.py   |  346 ++++
+ .../gpu/gpu_ci/megatron/test_megatron_worker.py    |    6 +-
  .../skyrl_train/gpu/gpu_ci/test_training_step.py   |  134 ++
+ tests/backends/skyrl_train/utils/test_profiler.py  |  390 ++++
  .../workers/test_sft_loss_fn_outputs_gate.py       |  279 +++
  .../skyrl_train/workers/test_worker_utils.py       |   35 +
  .../test_collation_vectorization_equivalence.py    |  349 ++++
+ tests/train/test_config.py                         |  130 ++
  tests/train/test_sft_callbacks.py                  |  110 +-
+ tests/train/test_sft_config.py                     |   57 +
  tests/train/test_sft_prefetch.py                   |  462 +++++
  tests/train/utils/test_logging_config.py           |  120 ++
  upstream-sync/bedrock-ci-setup.md                  |   70 +
  upstream-sync/gen_develop_delta.sh                 |  104 +
- 41 files changed, 7242 insertions(+), 386 deletions(-)
+ 58 files changed, 8914 insertions(+), 953 deletions(-)
 ```
 <!-- END AUTO:develop-delta -->
 
