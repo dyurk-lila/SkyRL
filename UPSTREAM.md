@@ -57,14 +57,16 @@ Upstream remote: `https://github.com/NovaSky-AI/SkyRL.git` · sync target: **`up
 -->
 
 <!-- BEGIN AUTO:develop-delta -->
-_Last generated for `origin/main` (7f453704) ↔ `HEAD` (bca9e5dd); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
+_Last generated for `origin/main` (7f453704) ↔ `HEAD` (461ff450); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
 
-`develop` is **29 commit(s)** ahead of `main`.
+`develop` is **31 commit(s)** ahead of `main`.
 
 ### Commits on `develop` not on `main`
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `461ff450` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-06-22 |
+| `dd8ad3fa` | [train] Async batch prefetch (double-buffering) for the SFT  | dyurk-lila | 2026-06-22 |
 | `bca9e5dd` | [train] Vectorize controller-side training-batch collation ( | dyurk-lila | 2026-06-22 |
 | `ff5d8dae` | [megatron] Accept dtype-string optimizer_config_kwargs (coer | dyurk-lila | 2026-06-22 |
 | `8199475f` | [megatron] Fused LM-head log-prob + entropy (avoid full [*,  | dyurk-lila | 2026-06-22 |
@@ -112,7 +114,7 @@ _Last generated for `origin/main` (7f453704) ↔ `HEAD` (bca9e5dd); merge-base `
  .github/workflows/gpu_skyrl.yaml                   |   23 +-
  .github/workflows/sync-upstream.yaml               |  143 ++
  NOTICE                                             |   21 +
- UPSTREAM.md                                        |  158 ++
+ UPSTREAM.md                                        |  177 ++
  pyproject.toml                                     |    8 +
  .../megatron/fused_linear_logprob_triton.py        | 2126 ++++++++++++++++++++
  .../distributed/megatron/model_utils.py            |  532 ++++-
@@ -120,18 +122,21 @@ _Last generated for `origin/main` (7f453704) ↔ `HEAD` (bca9e5dd); merge-base `
  .../distributed/megatron/optimizer_dtype.py        |  108 +
  .../workers/megatron/megatron_model_wrapper.py     |  184 +-
  skyrl/train/config/config.py                       |   28 +
+ skyrl/train/config/sft_config.py                   |    8 +
  skyrl/train/dataset/collators.py                   |   87 +-
  skyrl/train/dataset/preprocess.py                  |   83 +-
- skyrl/train/sft_trainer.py                         |   34 +-
+ skyrl/train/sft_trainer.py                         |  324 +--
+ skyrl/train/utils/batch_prefetcher.py              |  102 +
  skyrl/train/utils/utils.py                         |    8 +-
  .../cpu/megatron/test_fused_linear_logprob.py      |  372 ++++
  .../distributed/test_optimizer_dtype_coercion.py   |  207 ++
  .../megatron/test_fused_linear_logprob_triton.py   |  346 ++++
  .../test_collation_vectorization_equivalence.py    |  349 ++++
+ tests/train/test_sft_prefetch.py                   |  462 +++++
  tests/train/utils/test_logging_config.py           |  120 ++
  upstream-sync/bedrock-ci-setup.md                  |   70 +
  upstream-sync/gen_develop_delta.sh                 |  104 +
- 26 files changed, 5113 insertions(+), 148 deletions(-)
+ 29 files changed, 5886 insertions(+), 256 deletions(-)
 ```
 <!-- END AUTO:develop-delta -->
 
