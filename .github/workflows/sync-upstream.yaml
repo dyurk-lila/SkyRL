@@ -16,14 +16,15 @@
 #
 # ACTIVATION: scheduled + workflow_dispatch triggers only register from the repo's DEFAULT branch.
 # This lives on `develop`; it stays dormant until an admin sets `develop` as the default branch.
-# Before relying on it: confirm branch protection + CODEOWNERS on `develop`, and that the token
-# (or a PAT) is allowed to push to `main` under its protection rule.
+# Before relying on it: confirm branch protection + CODEOWNERS on `develop`, and that the
+# LILA_BOT GitHub App is allowed to push to `main` under its protection rule. The built-in
+# GITHUB_TOKEN cannot push upstream commits that touch `.github/workflows/**`.
 
 name: sync-upstream
 
 on:
   schedule:
-    - cron: "0 15 * * 1"   # Mondays 15:00 UTC. For strictly bi-weekly, gate on ISO week parity in the job.
+    - cron: "0 10 * * 1"   # Monday 10:00 UTC: 02:00 PST / 03:00 PDT.
   workflow_dispatch:
     inputs:
       upstream_ref:
@@ -47,11 +48,20 @@ jobs:
   open-sync-pr:
     runs-on: ubuntu-latest
     steps:
+      - name: Generate GitHub App token
+        uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          app-id: ${{ vars.LILA_BOT_APP_ID }}
+          private-key: ${{ secrets.LILA_BOT_NON_BASE64_PRIVATE_KEY }}
+          owner: fl97inc
+
       - name: Checkout fork (full history)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: develop
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Configure git + rerere
         run: |
@@ -111,7 +121,7 @@ jobs:
       - name: Open PR (clean)
         if: env.UP_TO_DATE != '1' && steps.merge.outputs.result == 'clean'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           gh pr create --base develop --head "$BRANCH" \
             --title "chore(sync): upstream ${SHORT_SHA}" \
@@ -129,7 +139,7 @@ jobs:
       - name: Open DRAFT PR with conflict checklist
         if: env.UP_TO_DATE != '1' && steps.merge.outputs.result == 'conflict'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           CHECKLIST=$(sed 's/^/- [ ] /' /tmp/conflicts.txt 2>/dev/null || echo "- [ ] (see CI log)")
           gh pr create --draft --base develop --head "$BRANCH" \
