@@ -123,9 +123,11 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          gh pr create --base develop --head "$BRANCH" \
-            --title "chore(sync): upstream ${SHORT_SHA}" \
-            --body "Automated upstream sync. \`main\` fast-forwarded to \`${TARGET_SHA}\`; this PR merges it into \`develop\`.
+          PR_URL=$(gh pr list --base develop --head "$BRANCH" --state open --json url --jq '.[0].url')
+          if [ -z "$PR_URL" ]; then
+            PR_URL=$(gh pr create --base develop --head "$BRANCH" \
+              --title "chore(sync): upstream ${SHORT_SHA}" \
+              --body "Automated upstream sync. \`main\` fast-forwarded to \`${TARGET_SHA}\`; this PR merges it into \`develop\`.
 
           - [ ] CODEOWNERS review on hotspot files
           - [ ] CI green (incl. \`check_sft_trend.py\` gate)
@@ -133,8 +135,10 @@ jobs:
           - [ ] \`UPSTREAM.md\` updated (last-sync row + drop-list)
           - [ ] tag \`lila-sync-${SHORT_SHA}\` after merge
 
-          Do NOT auto-merge — see upstream-sync/02-recurring-workflow.md." \
-            --label "upstream-sync"
+          Do NOT auto-merge — see upstream-sync/02-recurring-workflow.md.")
+          fi
+          echo "$PR_URL"
+          gh pr edit "$PR_URL" --add-label "upstream-sync" || echo "::warning::Could not add upstream-sync label"
 
       - name: Open DRAFT PR with conflict checklist
         if: env.UP_TO_DATE != '1' && steps.merge.outputs.result == 'conflict'
@@ -142,12 +146,16 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           CHECKLIST=$(sed 's/^/- [ ] /' /tmp/conflicts.txt 2>/dev/null || echo "- [ ] (see CI log)")
-          gh pr create --draft --base develop --head "$BRANCH" \
-            --title "chore(sync): upstream ${SHORT_SHA} (CONFLICTS — manual resolve)" \
-            --body "Automated upstream sync to \`${TARGET_SHA}\` hit conflicts merging the new \`main\` into \`develop\`; the merge was **aborted** (no markers committed). \`main\` was still fast-forwarded. This branch is at the pre-merge \`develop\` base — resolve in your own branch off it.
+          PR_URL=$(gh pr list --base develop --head "$BRANCH" --state open --json url --jq '.[0].url')
+          if [ -z "$PR_URL" ]; then
+            PR_URL=$(gh pr create --draft --base develop --head "$BRANCH" \
+              --title "chore(sync): upstream ${SHORT_SHA} (CONFLICTS — manual resolve)" \
+              --body "Automated upstream sync to \`${TARGET_SHA}\` hit conflicts merging the new \`main\` into \`develop\`; the merge was **aborted** (no markers committed). \`main\` was still fast-forwarded. This branch is at the pre-merge \`develop\` base — resolve in your own branch off it.
 
           Conflicting files:
           ${CHECKLIST}
 
-          Resolution rules: see 'Mandatory hotspot resolution rules' in upstream-sync/01-catch-up-plan.md. Never auto-merge." \
-            --label "upstream-sync"
+          Resolution rules: see 'Mandatory hotspot resolution rules' in upstream-sync/01-catch-up-plan.md. Never auto-merge.")
+          fi
+          echo "$PR_URL"
+          gh pr edit "$PR_URL" --add-label "upstream-sync" || echo "::warning::Could not add upstream-sync label"
