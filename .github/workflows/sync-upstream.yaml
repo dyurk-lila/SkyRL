@@ -126,12 +126,14 @@ jobs:
         if: env.UP_TO_DATE != '1' && steps.merge.outputs.result == 'clean'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
         run: |
-          PR_URL=$(gh pr list --base develop --head "$BRANCH" --state open --json url --jq '.[0].url')
-          if [ -z "$PR_URL" ]; then
-            PR_URL=$(gh pr create --base develop --head "$BRANCH" \
-              --title "chore(sync): upstream ${SHORT_SHA}" \
-              --body "Automated upstream sync. \`main\` fast-forwarded to \`${TARGET_SHA}\`; this PR merges it into \`develop\`.
+          set -euo pipefail
+
+          OWNER="${REPO%/*}"
+          BODY_FILE=$(mktemp)
+          cat > "$BODY_FILE" <<EOF
+          Automated upstream sync. \`main\` fast-forwarded to \`${TARGET_SHA}\`; this PR merges it into \`develop\`.
 
           - [ ] CODEOWNERS review on hotspot files
           - [ ] CI green (incl. \`check_sft_trend.py\` gate)
@@ -139,27 +141,54 @@ jobs:
           - [ ] \`UPSTREAM.md\` updated (last-sync row + drop-list)
           - [ ] tag \`lila-sync-${SHORT_SHA}\` after merge
 
-          Do NOT auto-merge — see upstream-sync/02-recurring-workflow.md.")
+          Do NOT auto-merge — see upstream-sync/02-recurring-workflow.md.
+          EOF
+          PR_JSON=$(gh api \
+            "repos/${REPO}/pulls?head=${OWNER}:${BRANCH}&base=develop&state=open" \
+            --jq '.[0] // empty')
+          if [ -z "$PR_JSON" ]; then
+            PR_JSON=$(gh api -X POST "repos/${REPO}/pulls" \
+              -f base=develop \
+              -f head="$BRANCH" \
+              -f title="chore(sync): upstream ${SHORT_SHA}" \
+              -f body="$(cat "$BODY_FILE")")
           fi
+          PR_NUMBER=$(echo "$PR_JSON" | jq -r .number)
+          PR_URL=$(echo "$PR_JSON" | jq -r .html_url)
           echo "$PR_URL"
-          gh pr edit "$PR_URL" --add-label "upstream-sync" || echo "::warning::Could not add upstream-sync label"
+          gh api -X POST "repos/${REPO}/issues/${PR_NUMBER}/labels" -f labels[]=upstream-sync || echo "::warning::Could not add upstream-sync label"
 
       - name: Open DRAFT PR with conflict checklist
         if: env.UP_TO_DATE != '1' && steps.merge.outputs.result == 'conflict'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
         run: |
+          set -euo pipefail
+
+          OWNER="${REPO%/*}"
           CHECKLIST=$(sed 's/^/- [ ] /' /tmp/conflicts.txt 2>/dev/null || echo "- [ ] (see CI log)")
-          PR_URL=$(gh pr list --base develop --head "$BRANCH" --state open --json url --jq '.[0].url')
-          if [ -z "$PR_URL" ]; then
-            PR_URL=$(gh pr create --draft --base develop --head "$BRANCH" \
-              --title "chore(sync): upstream ${SHORT_SHA} (CONFLICTS — manual resolve)" \
-              --body "Automated upstream sync to \`${TARGET_SHA}\` hit conflicts merging the new \`main\` into \`develop\`; the merge was **aborted** (no markers committed). \`main\` was still fast-forwarded. This branch is at the pre-merge \`develop\` base — resolve in your own branch off it.
+          BODY_FILE=$(mktemp)
+          cat > "$BODY_FILE" <<EOF
+          Automated upstream sync to \`${TARGET_SHA}\` hit conflicts merging the new \`main\` into \`develop\`; the merge was **aborted** (no markers committed). \`main\` was still fast-forwarded. This branch is at the pre-merge \`develop\` base — resolve in your own branch off it.
 
           Conflicting files:
           ${CHECKLIST}
 
-          Resolution rules: see 'Mandatory hotspot resolution rules' in upstream-sync/01-catch-up-plan.md. Never auto-merge.")
+          Resolution rules: see 'Mandatory hotspot resolution rules' in upstream-sync/01-catch-up-plan.md. Never auto-merge.
+          EOF
+          PR_JSON=$(gh api \
+            "repos/${REPO}/pulls?head=${OWNER}:${BRANCH}&base=develop&state=open" \
+            --jq '.[0] // empty')
+          if [ -z "$PR_JSON" ]; then
+            PR_JSON=$(gh api -X POST "repos/${REPO}/pulls" \
+              -f base=develop \
+              -f head="$BRANCH" \
+              -f title="chore(sync): upstream ${SHORT_SHA} (CONFLICTS — manual resolve)" \
+              -f body="$(cat "$BODY_FILE")" \
+              -F draft=true)
           fi
+          PR_NUMBER=$(echo "$PR_JSON" | jq -r .number)
+          PR_URL=$(echo "$PR_JSON" | jq -r .html_url)
           echo "$PR_URL"
-          gh pr edit "$PR_URL" --add-label "upstream-sync" || echo "::warning::Could not add upstream-sync label"
+          gh api -X POST "repos/${REPO}/issues/${PR_NUMBER}/labels" -f labels[]=upstream-sync || echo "::warning::Could not add upstream-sync label"
