@@ -57,14 +57,16 @@ Upstream remote: `https://github.com/NovaSky-AI/SkyRL.git` · sync target: **`up
 -->
 
 <!-- BEGIN AUTO:develop-delta -->
-_Last generated for `origin/main` (76f5f467) ↔ `HEAD` (33247944); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
+_Last generated for `origin/main` (76f5f467) ↔ `HEAD` (1123cdf9); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
 
-`develop` is **46 commit(s)** ahead of `main`.
+`develop` is **48 commit(s)** ahead of `main`.
 
 ### Commits on `develop` not on `main`
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `1123cdf9` | ci(sync): request app permissions for sync PRs | lila-sync-bot | 2026-06-29 |
+| `450c4b02` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-06-29 |
 | `33247944` | ci(sync): use workflow token for sync PRs | lila-sync-bot | 2026-06-29 |
 | `8cccd284` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-06-29 |
 | `7a6a21a9` | ci(sync): tolerate missing upstream-sync label permission | lila-sync-bot | 2026-06-29 |
@@ -127,9 +129,9 @@ _Last generated for `origin/main` (76f5f467) ↔ `HEAD` (33247944); merge-base `
  .github/workflows/cpu_skyrl_train.yaml             |    4 +-
  .github/workflows/develop-delta.yaml               |   91 +
  .github/workflows/gpu_skyrl.yaml                   |   23 +-
- .github/workflows/sync-upstream.yaml               |  162 ++
+ .github/workflows/sync-upstream.yaml               |  165 ++
  NOTICE                                             |   21 +
- UPSTREAM.md                                        |  224 +++
+ UPSTREAM.md                                        |  226 +++
  docs/api-pages.yaml                                |    2 +-
  docs/content/docs/configuration/config.mdx         |   35 +
  examples/train/async/async_trainer.py              |  127 +-
@@ -180,7 +182,7 @@ _Last generated for `origin/main` (76f5f467) ↔ `HEAD` (33247944); merge-base `
  tests/train/utils/test_logging_config.py           |  120 ++
  upstream-sync/bedrock-ci-setup.md                  |   70 +
  upstream-sync/gen_develop_delta.sh                 |  104 +
- 58 files changed, 8956 insertions(+), 953 deletions(-)
+ 58 files changed, 8961 insertions(+), 953 deletions(-)
 ```
 <!-- END AUTO:develop-delta -->
 
