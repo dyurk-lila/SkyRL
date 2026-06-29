@@ -118,6 +118,7 @@ jobs:
             # base branch so reviewers resolve in their own working tree.
             git diff --name-only --diff-filter=U > /tmp/conflicts.txt || true
             git merge --abort
+            git commit --allow-empty -m "chore(sync): record upstream ${SHORT_SHA} conflicts"
             echo "result=conflict" >> "$GITHUB_OUTPUT"
           fi
           git push -u origin "$BRANCH" --force-with-lease
