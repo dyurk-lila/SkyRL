@@ -239,7 +239,7 @@ class RayPPOTrainer:
                 self.total_training_steps = min(self.total_training_steps, self.cfg.trainer.max_training_steps)
 
     @torch.no_grad()
-    async def eval(self) -> Dict[str, float]:
+    async def eval(self, vllm_metrics_scraper: Optional[VLLMMetricsScraper] = None) -> Dict[str, float]:
         """
         Run generation and scoring on the evaluation dataset.
 
@@ -256,6 +256,7 @@ class RayPPOTrainer:
                 cfg=self.cfg,
                 global_step=self.global_step,
                 tokenizer=self.tokenizer,
+                vllm_metrics_scraper=vllm_metrics_scraper,
             )
         else:
             eval_metrics = await evaluate(
@@ -264,6 +265,7 @@ class RayPPOTrainer:
                 cfg=self.cfg,
                 global_step=self.global_step,
                 tokenizer=self.tokenizer,
+                vllm_metrics_scraper=vllm_metrics_scraper,
             )
         return eval_metrics
 
@@ -332,6 +334,9 @@ class RayPPOTrainer:
                     if not step_started:
                         self._fire("on_step_start")
                         step_started = True
+                        if self._vllm_metrics_scraper is not None:
+                            await self._vllm_metrics_scraper.start("vllm/train")
+                            self._vllm_metrics_scraper.pause()
                     with Timer("step", self.all_timings):
                         # for colocate_all=true, inference engine is always on GPU when starting the training step
 
@@ -349,8 +354,12 @@ class RayPPOTrainer:
                         )
 
                         # 1.1. generation phase
+                        if self._vllm_metrics_scraper is not None:
+                            self._vllm_metrics_scraper.resume()
                         with Timer("generate", self.all_timings):
                             generator_output: GeneratorOutput = await self.generate(generator_input)
+                        if self._vllm_metrics_scraper is not None:
+                            self._vllm_metrics_scraper.pause()
 
                         if self.cfg.generator.step_wise_trajectories:
                             # NOTE: We use instance_ids from `trajectory_ids` here instead of re-using `uids`
@@ -368,6 +377,10 @@ class RayPPOTrainer:
                         if self.colocate_all:
                             # if we are not continuing sampling, we sleep the inference engine
                             await self.inference_engine_client.sleep()
+
+                        vllm_metrics: Dict[str, float] = {}
+                        if self._vllm_metrics_scraper is not None:
+                            vllm_metrics = await self._vllm_metrics_scraper.stop()
 
                         # 1.2 postprocess rewards (and merge step-wise turns if enabled)
                         with Timer("postprocess_generator_output", self.all_timings):
@@ -479,18 +492,22 @@ class RayPPOTrainer:
                         or self.global_step == self.total_training_steps
                     )
                     if force_eval or interval_eval:
+                        if self._vllm_metrics_scraper is not None:
+                            await self._vllm_metrics_scraper.start("vllm/eval")
+                            self._vllm_metrics_scraper.pause()
                         self._fire("on_eval_start")
                         with Timer("eval", self.all_timings):
-                            eval_metrics = await self.eval()
+                            eval_metrics = await self.eval(vllm_metrics_scraper=self._vllm_metrics_scraper)
                             self.all_metrics.update(eval_metrics)
                         self._fire("on_eval_end", metrics=eval_metrics)
+                        if self._vllm_metrics_scraper is not None:
+                            vllm_metrics.update(await self._vllm_metrics_scraper.stop())
 
                     log_payload = {
                         **self.all_metrics,
                         **{f"timing/{k}": v for k, v in self.all_timings.items()},
+                        **vllm_metrics,
                     }
-                    if self._vllm_metrics_scraper is not None:
-                        log_payload.update(await self._vllm_metrics_scraper.sample())
 
                     if self._ray_gpu_monitor is not None:
                         log_payload.update(self._ray_gpu_monitor.flush())
