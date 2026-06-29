@@ -11,8 +11,8 @@
 #   1. Fast-forward `main` to `upstream/main` (push). Abort loudly if `main` has diverged.
 #   2. Merge the new `main` into a `sync/develop-<date>` branch cut from `develop`.
 #        - clean    -> open a normal PR into `develop`, request review
-#        - conflicts -> abort the merge (NO markers committed), push the un-merged base, open a
-#                       DRAFT PR with a hotspot checklist so reviewers resolve in their own branch
+#        - conflicts -> commit the conflicted merge result (including conflict markers), push it,
+#                       and open a DRAFT PR with a hotspot checklist for review
 #
 # ACTIVATION: scheduled + workflow_dispatch triggers only register from the repo's DEFAULT branch.
 # This lives on `develop`; it stays dormant until an admin sets `develop` as the default branch.
@@ -114,11 +114,11 @@ jobs:
           if git merge --no-edit "$TARGET_SHA"; then
             echo "result=clean" >> "$GITHUB_OUTPUT"
           else
-            # Do NOT commit conflict markers. Record conflicts, abort, push the clean pre-merge
-            # base branch so reviewers resolve in their own working tree.
+            # Commit the conflicted merge result so reviewers can inspect the
+            # upstream changes and conflict markers directly in the draft PR.
             git diff --name-only --diff-filter=U > /tmp/conflicts.txt || true
-            git merge --abort
-            git commit --allow-empty -m "chore(sync): record upstream ${SHORT_SHA} conflicts"
+            git add -A
+            git commit -m "chore(sync): record upstream ${SHORT_SHA} conflicts"
             echo "result=conflict" >> "$GITHUB_OUTPUT"
           fi
           git push -u origin "$BRANCH" --force-with-lease
@@ -171,7 +171,7 @@ jobs:
           CHECKLIST=$(sed 's/^/- [ ] /' /tmp/conflicts.txt 2>/dev/null || echo "- [ ] (see CI log)")
           BODY_FILE=$(mktemp)
           cat > "$BODY_FILE" <<EOF
-          Automated upstream sync to \`${TARGET_SHA}\` hit conflicts merging the new \`main\` into \`develop\`; the merge was **aborted** (no markers committed). \`main\` was still fast-forwarded. This branch is at the pre-merge \`develop\` base — resolve in your own branch off it.
+          Automated upstream sync to \`${TARGET_SHA}\` hit conflicts merging the new \`main\` into \`develop\`. \`main\` was fast-forwarded, and this draft branch commits the conflicted merge result so the upstream updates and conflict markers are visible in the PR diff.
 
           Conflicting files:
           ${CHECKLIST}
@@ -188,6 +188,11 @@ jobs:
               -f title="chore(sync): upstream ${SHORT_SHA} (CONFLICTS — manual resolve)" \
               -f body="$(cat "$BODY_FILE")" \
               -F draft=true)
+          else
+            PR_NUMBER=$(echo "$PR_JSON" | jq -r .number)
+            PR_JSON=$(gh api -X PATCH "repos/${REPO}/pulls/${PR_NUMBER}" \
+              -f title="chore(sync): upstream ${SHORT_SHA} (CONFLICTS — manual resolve)" \
+              -f body="$(cat "$BODY_FILE")")
           fi
           PR_NUMBER=$(echo "$PR_JSON" | jq -r .number)
           PR_URL=$(echo "$PR_JSON" | jq -r .html_url)
