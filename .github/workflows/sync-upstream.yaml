@@ -11,8 +11,8 @@
 #   1. Fast-forward `main` to `upstream/main` (push). Abort loudly if `main` has diverged.
 #   2. Merge the new `main` into a `sync/develop-<date>` branch cut from `develop`.
 #        - clean    -> open a normal PR into `develop`, request review
-#        - conflicts -> commit the conflicted merge result (including conflict markers), push it,
-#                       and open a DRAFT PR with a hotspot checklist for review
+#        - conflicts -> push a branch at the upstream target and open a DRAFT PR into `develop`,
+#                       so GitHub shows the native merge-conflict UI
 #
 # ACTIVATION: scheduled + workflow_dispatch triggers only register from the repo's DEFAULT branch.
 # This lives on `develop`; it stays dormant until an admin sets `develop` as the default branch.
@@ -114,11 +114,12 @@ jobs:
           if git merge --no-edit "$TARGET_SHA"; then
             echo "result=clean" >> "$GITHUB_OUTPUT"
           else
-            # Commit the conflicted merge result so reviewers can inspect the
-            # upstream changes and conflict markers directly in the draft PR.
+            # Keep the trial merge only long enough to capture conflicted files.
+            # Then make the PR branch point at the upstream target so GitHub
+            # reports native merge conflicts against develop.
             git diff --name-only --diff-filter=U > /tmp/conflicts.txt || true
-            git add -A
-            git commit -m "chore(sync): record upstream ${SHORT_SHA} conflicts"
+            git merge --abort
+            git reset --hard "$TARGET_SHA"
             echo "result=conflict" >> "$GITHUB_OUTPUT"
           fi
           git push -u origin "$BRANCH" --force-with-lease
@@ -171,7 +172,7 @@ jobs:
           CHECKLIST=$(sed 's/^/- [ ] /' /tmp/conflicts.txt 2>/dev/null || echo "- [ ] (see CI log)")
           BODY_FILE=$(mktemp)
           cat > "$BODY_FILE" <<EOF
-          Automated upstream sync to \`${TARGET_SHA}\` hit conflicts merging the new \`main\` into \`develop\`. \`main\` was fast-forwarded, and this draft branch commits the conflicted merge result so the upstream updates and conflict markers are visible in the PR diff.
+          Automated upstream sync to \`${TARGET_SHA}\` hit conflicts merging the new \`main\` into \`develop\`. \`main\` was fast-forwarded, and this draft branch points at the upstream target so GitHub can show the native merge-conflict UI against \`develop\`.
 
           Conflicting files:
           ${CHECKLIST}
