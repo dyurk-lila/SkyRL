@@ -57,14 +57,16 @@ Upstream remote: `https://github.com/NovaSky-AI/SkyRL.git` · sync target: **`up
 -->
 
 <!-- BEGIN AUTO:develop-delta -->
-_Last generated for `origin/main` (76f5f467) ↔ `HEAD` (343bde7b); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
+_Last generated for `origin/main` (76f5f467) ↔ `HEAD` (f00c895a); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
 
-`develop` is **56 commit(s)** ahead of `main`.
+`develop` is **58 commit(s)** ahead of `main`.
 
 ### Commits on `develop` not on `main`
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `f00c895a` | chore(sync): upstream 76f5f467 (CONFLICTS — manual resolve)  | lila-ci-bot[bot] | 2026-06-29 |
+| `81a992bc` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-06-29 |
 | `343bde7b` | ci(sync): use native GitHub conflicts for sync PRs | lila-sync-bot | 2026-06-29 |
 | `d2f3b6e6` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-06-29 |
 | `70d925aa` | ci(sync): publish conflicted sync results | lila-sync-bot | 2026-06-29 |
@@ -139,41 +141,108 @@ _Last generated for `origin/main` (76f5f467) ↔ `HEAD` (343bde7b); merge-base `
  .github/workflows/gpu_skyrl.yaml                   |   23 +-
  .github/workflows/sync-upstream.yaml               |  201 ++
  NOTICE                                             |   21 +
- UPSTREAM.md                                        |  234 +++
+ UPSTREAM.md                                        |  236 +++
  docs/api-pages.yaml                                |    2 +-
  docs/content/docs/configuration/config.mdx         |   35 +
+ .../train/algorithms/dapo/main_dapo_fully_async.py |   38 +-
+ .../algorithms/dapo/run_dapo_aime_qwen3_4b_aime.sh |    2 +-
+ examples/train/algorithms/dapo/run_dapo_gsm8k.sh   |    2 +
+ .../algorithms/dapo/run_dapo_qwen2.5_32b_aime.sh   |    2 +-
+ .../dapo/run_dapo_qwen2.5_math_7b_aime.sh          |    2 +-
+ .../algorithms/dapo/run_dapo_qwen3_1.7b_aime.sh    |    2 +-
+ .../dapo/run_dapo_qwen3_1.7b_aime_fully_async.sh   |    3 +-
+ ...run_dapo_qwen3_1.7b_aime_fully_async_onestep.sh |    3 +-
+ .../run_dapo_qwen3_30b_a3b_lora_megatron_aime.sh   |    2 +-
+ .../dapo/run_dapo_qwen3_30b_a3b_megatron_aime.sh   |    2 +-
+ .../algorithms/sapo/run_sapo_qwen3_4b_aime.sh      |    2 +-
  examples/train/async/async_trainer.py              |  127 +-
+ examples/train/async/main_async.py                 |    5 -
+ .../train/fully_async/fully_async_run_gsm8k.sh     |    6 +-
+ .../fully_async_run_gsm8k_megatron_lora.sh         |    4 +-
+ examples/train/fully_async/main_fully_async.py     |    5 -
+ examples/train/fully_async/main_fully_async_sim.py |    5 -
+ .../sim_trainer/run_fully_async_sim_gsm8k_e2e.sh   |    4 +-
+ .../run_fully_async_sim_gsm8k_external.sh          |    4 +-
+ examples/train/gptoss/run_gsm8k_gptoss.sh          |    3 +-
  examples/train/megatron/run_megatron.sh            |   10 +-
+ .../megatron/run_megatron_dapo_qwen3.5_35b_a3b.sh  |    2 +-
+ .../megatron/run_megatron_dapo_qwen3_30b_a3b.sh    |    2 +-
+ .../run_megatron_dapo_qwen3_30b_a3b_lora.sh        |    2 +-
+ .../train/megatron/run_megatron_dapo_qwen3_4b.sh   |    2 +-
+ .../megatron/run_megatron_dapo_qwen3_4b_lora.sh    |    2 +-
+ .../train/megatron/run_megatron_grpo_glm4_7_30b.sh |    4 +-
  .../megatron/run_megatron_nemotron_mini_4b.sh      |    6 +-
+ .../run_on_policy_distill_math_qwen3_1.7b.sh       |    2 +-
+ .../run_on_policy_distill_math_qwen3_4b.sh         |    2 +-
+ .../router_replay/run_dapo_moonlight_16b_a3b.sh    |    2 +-
+ examples/train/search/run_search_fully_async.sh    |    1 +
+ examples/train/thunder_agent/main_thunder_agent.py |    4 -
+ .../scripts/r2egym_32b/run_trainer.sh              |    1 +
+ examples/train/tis_correction/run_dapo_tis.sh      |    2 +
+ .../harbor/entrypoints/main_harbor_fully_async.py  |    4 -
+ .../harbor/run_codecontest_fully_async.sh          |    1 +
  .../train_scripts/full_context/trainer_full_ctx.py |  141 +-
- pyproject.toml                                     |    8 +
+ integrations/arctic_rl/README.md                   |  207 ++
+ integrations/arctic_rl/__init__.py                 |   17 +
+ integrations/arctic_rl/config.py                   |  603 ++++++
+ integrations/arctic_rl/entrypoint.py               |  190 ++
+ integrations/arctic_rl/envs/__init__.py            |   19 +
+ integrations/arctic_rl/envs/bird.py                |   88 +
+ integrations/arctic_rl/envs/bird_reward.py         |  299 +++
+ integrations/arctic_rl/envs/preprocess_bird.py     |  748 +++++++
+ integrations/arctic_rl/examples/fsdp_bird_entry.py |   53 +
+ .../arctic_rl/examples/run_bird_grpo_32b_32gpu.sh  |  182 ++
+ .../examples/run_bird_grpo_32b_32gpu_fsdp.sh       |  136 ++
+ .../arctic_rl/examples/run_bird_grpo_8b_32gpu.sh   |  164 ++
+ .../arctic_rl/examples/run_bird_grpo_smoke.sh      |  124 ++
+ .../arctic_rl/examples/run_gsm8k_grpo_4gpu.sh      |   94 +
+ integrations/arctic_rl/generator.py                |  178 ++
+ integrations/arctic_rl/trainer.py                  |  853 ++++++++
+ pyproject.toml                                     |   48 +-
  .../megatron/fused_linear_logprob_triton.py        | 2126 ++++++++++++++++++++
  .../distributed/megatron/model_utils.py            |  560 +++++-
  .../skyrl_train/distributed/megatron/optimizer.py  |   15 +-
  .../distributed/megatron/optimizer_dtype.py        |  108 +
  skyrl/backends/skyrl_train/distributed/strategy.py |   14 +
+ .../backends/skyrl_train/inference_engines/base.py |    2 +-
+ .../inference_engines/inference_engine_client.py   |    4 +-
+ .../ray_wrapped_inference_engine.py                |    6 +-
+ .../inference_engines/remote_inference_engine.py   |    7 +-
+ .../inference_engines/vllm/vllm_engine.py          |   22 +-
+ .../inference_engines/vllm/vllm_server.py          |    7 +-
+ .../inference_servers/layerwise_reload.py          |  106 +-
+ .../inference_servers/new_inference_worker_wrap.py |   10 +-
+ .../inference_servers/remote_inference_client.py   |   12 +-
+ .../inference_servers/vllm_server_actor.py         |    9 +-
+ .../skyrl_train/inference_servers/vllm_worker.py   |    6 +-
  skyrl/backends/skyrl_train/utils/profiler.py       |  202 +-
- .../skyrl_train/workers/fsdp/fsdp_worker.py        |    4 +
+ .../skyrl_train/workers/fsdp/fsdp_worker.py        |   10 +-
  .../workers/megatron/megatron_model_wrapper.py     |  270 ++-
- .../workers/megatron/megatron_worker.py            |    9 +-
+ .../workers/megatron/megatron_worker.py            |   15 +-
  skyrl/backends/skyrl_train/workers/worker.py       |  208 +-
  .../skyrl_train/workers/worker_dispatch.py         |   55 +
  skyrl/backends/skyrl_train/workers/worker_utils.py |   21 +-
  skyrl/train/config/__init__.py                     |    4 +-
- skyrl/train/config/config.py                       |  172 +-
+ skyrl/train/config/config.py                       |  185 +-
  skyrl/train/config/sft_config.py                   |   16 +
  skyrl/train/dataset/collators.py                   |   87 +-
  skyrl/train/dataset/preprocess.py                  |   83 +-
- skyrl/train/fully_async_trainer.py                 |  344 ++--
+ skyrl/train/entrypoints/main_base.py               |   15 +-
+ skyrl/train/evaluate.py                            |   30 +-
+ skyrl/train/fully_async_trainer.py                 |  346 ++--
+ skyrl/train/generators/utils.py                    |    1 +
  skyrl/train/sft_trainer.py                         |  428 ++--
- skyrl/train/trainer.py                             |  410 ++--
+ skyrl/train/trainer.py                             |  429 ++--
  skyrl/train/utils/batch_prefetcher.py              |  102 +
- skyrl/train/utils/utils.py                         |   15 +-
+ skyrl/train/utils/utils.py                         |   23 +-
+ skyrl/train/utils/vllm_metrics_scraper.py          |  164 +-
  skyrl/utils/tok.py                                 |   32 +-
  .../cpu/megatron/test_fused_linear_logprob.py      |  372 ++++
  .../test_chunked_logprob_backward_streaming.py     |  260 +++
  .../distributed/test_optimizer_dtype_coercion.py   |  207 ++
  .../distributed/test_save_hf_configs_processor.py  |  111 +
+ .../gpu_ci/inference_servers/test_weight_sync.py   |   69 +-
+ .../inference_servers/test_weight_sync_moe.py      |    6 +-
  .../megatron/test_chunked_logprob_backward.py      |    2 +-
  .../megatron/test_chunked_logprob_backward_tp.py   |  186 ++
  .../megatron/test_fused_linear_logprob_triton.py   |  346 ++++
@@ -182,15 +251,18 @@ _Last generated for `origin/main` (76f5f467) ↔ `HEAD` (343bde7b); merge-base `
  tests/backends/skyrl_train/utils/test_profiler.py  |  390 ++++
  .../workers/test_sft_loss_fn_outputs_gate.py       |  279 +++
  .../skyrl_train/workers/test_worker_utils.py       |   35 +
+ .../generators/test_generator_output_utils.py      |    1 +
  .../test_collation_vectorization_equivalence.py    |  349 ++++
  tests/train/test_config.py                         |  130 ++
  tests/train/test_sft_callbacks.py                  |  110 +-
  tests/train/test_sft_config.py                     |   57 +
  tests/train/test_sft_prefetch.py                   |  462 +++++
+ tests/train/test_vllm_metrics_scraper.py           |  243 +++
  tests/train/utils/test_logging_config.py           |  120 ++
  upstream-sync/bedrock-ci-setup.md                  |   70 +
  upstream-sync/gen_develop_delta.sh                 |  104 +
- 58 files changed, 9005 insertions(+), 953 deletions(-)
+ uv.lock                                            | 2089 +++++++++++--------
+ 128 files changed, 14928 insertions(+), 2019 deletions(-)
 ```
 <!-- END AUTO:develop-delta -->
 
