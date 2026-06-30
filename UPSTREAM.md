@@ -57,14 +57,16 @@ Upstream remote: `https://github.com/NovaSky-AI/SkyRL.git` · sync target: **`up
 -->
 
 <!-- BEGIN AUTO:develop-delta -->
-_Last generated for `origin/main` (76f5f467) ↔ `HEAD` (f00c895a); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
+_Last generated for `origin/main` (76f5f467) ↔ `HEAD` (e5d43639); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
 
-`develop` is **58 commit(s)** ahead of `main`.
+`develop` is **60 commit(s)** ahead of `main`.
 
 ### Commits on `develop` not on `main`
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `e5d43639` | feat(algo): add cispo_anchor to select old vs rollout IS-rat | tbalestri-lila | 2026-06-30 |
+| `31860caf` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-06-29 |
 | `f00c895a` | chore(sync): upstream 76f5f467 (CONFLICTS — manual resolve)  | lila-ci-bot[bot] | 2026-06-29 |
 | `81a992bc` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-06-29 |
 | `343bde7b` | ci(sync): use native GitHub conflicts for sync PRs | lila-sync-bot | 2026-06-29 |
@@ -141,7 +143,7 @@ _Last generated for `origin/main` (76f5f467) ↔ `HEAD` (f00c895a); merge-base `
  .github/workflows/gpu_skyrl.yaml                   |   23 +-
  .github/workflows/sync-upstream.yaml               |  201 ++
  NOTICE                                             |   21 +
- UPSTREAM.md                                        |  236 +++
+ UPSTREAM.md                                        |  308 +++
  docs/api-pages.yaml                                |    2 +-
  docs/content/docs/configuration/config.mdx         |   35 +
  .../train/algorithms/dapo/main_dapo_fully_async.py |   38 +-
@@ -215,6 +217,7 @@ _Last generated for `origin/main` (76f5f467) ↔ `HEAD` (f00c895a); merge-base `
  .../inference_servers/remote_inference_client.py   |   12 +-
  .../inference_servers/vllm_server_actor.py         |    9 +-
  .../skyrl_train/inference_servers/vllm_worker.py   |    6 +-
+ skyrl/backends/skyrl_train/utils/ppo_utils.py      |   53 +-
  skyrl/backends/skyrl_train/utils/profiler.py       |  202 +-
  .../skyrl_train/workers/fsdp/fsdp_worker.py        |   10 +-
  .../workers/megatron/megatron_model_wrapper.py     |  270 ++-
@@ -223,7 +226,7 @@ _Last generated for `origin/main` (76f5f467) ↔ `HEAD` (f00c895a); merge-base `
  .../skyrl_train/workers/worker_dispatch.py         |   55 +
  skyrl/backends/skyrl_train/workers/worker_utils.py |   21 +-
  skyrl/train/config/__init__.py                     |    4 +-
- skyrl/train/config/config.py                       |  185 +-
+ skyrl/train/config/config.py                       |  197 +-
  skyrl/train/config/sft_config.py                   |   16 +
  skyrl/train/dataset/collators.py                   |   87 +-
  skyrl/train/dataset/preprocess.py                  |   83 +-
@@ -232,7 +235,7 @@ _Last generated for `origin/main` (76f5f467) ↔ `HEAD` (f00c895a); merge-base `
  skyrl/train/fully_async_trainer.py                 |  346 ++--
  skyrl/train/generators/utils.py                    |    1 +
  skyrl/train/sft_trainer.py                         |  428 ++--
- skyrl/train/trainer.py                             |  429 ++--
+ skyrl/train/trainer.py                             |  444 ++--
  skyrl/train/utils/batch_prefetcher.py              |  102 +
  skyrl/train/utils/utils.py                         |   23 +-
  skyrl/train/utils/vllm_metrics_scraper.py          |  164 +-
@@ -251,6 +254,8 @@ _Last generated for `origin/main` (76f5f467) ↔ `HEAD` (f00c895a); merge-base `
  tests/backends/skyrl_train/utils/test_profiler.py  |  390 ++++
  .../workers/test_sft_loss_fn_outputs_gate.py       |  279 +++
  .../skyrl_train/workers/test_worker_utils.py       |   35 +
+ tests/train/algorithms/test_losses.py              |  101 +
+ tests/train/algorithms/test_skip_fwd_logprobs.py   |   30 +
  .../generators/test_generator_output_utils.py      |    1 +
  .../test_collation_vectorization_equivalence.py    |  349 ++++
  tests/train/test_config.py                         |  130 ++
@@ -262,7 +267,7 @@ _Last generated for `origin/main` (76f5f467) ↔ `HEAD` (f00c895a); merge-base `
  upstream-sync/bedrock-ci-setup.md                  |   70 +
  upstream-sync/gen_develop_delta.sh                 |  104 +
  uv.lock                                            | 2089 +++++++++++--------
- 128 files changed, 14928 insertions(+), 2019 deletions(-)
+ 131 files changed, 15208 insertions(+), 2022 deletions(-)
 ```
 <!-- END AUTO:develop-delta -->
 
