@@ -57,14 +57,16 @@ Upstream remote: `https://github.com/NovaSky-AI/SkyRL.git` · sync target: **`up
 -->
 
 <!-- BEGIN AUTO:develop-delta -->
-_Last generated for `origin/main` (76f5f467) ↔ `HEAD` (e5d43639); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
+_Last generated for `origin/main` (e17527a1) ↔ `HEAD` (ac182bd2); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
 
-`develop` is **60 commit(s)** ahead of `main`.
+`develop` is **62 commit(s)** ahead of `main`.
 
 ### Commits on `develop` not on `main`
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `ac182bd2` | ci: add agent conflict resolver and ml.train e2e tests for u | dyurk-lila | 2026-07-08 |
+| `56eaedaa` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-06-30 |
 | `e5d43639` | feat(algo): add cispo_anchor to select old vs rollout IS-rat | tbalestri-lila | 2026-06-30 |
 | `31860caf` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-06-29 |
 | `f00c895a` | chore(sync): upstream 76f5f467 (CONFLICTS — manual resolve)  | lila-ci-bot[bot] | 2026-06-29 |
@@ -137,13 +139,14 @@ _Last generated for `origin/main` (76f5f467) ↔ `HEAD` (e5d43639); merge-base `
 
 ```
  .github/CODEOWNERS                                 |   26 +
+ .github/actionlint.yaml                            |    3 +
  .github/workflows/cpu_skyrl.yaml                   |   14 +-
  .github/workflows/cpu_skyrl_train.yaml             |    4 +-
  .github/workflows/develop-delta.yaml               |   91 +
  .github/workflows/gpu_skyrl.yaml                   |   23 +-
- .github/workflows/sync-upstream.yaml               |  201 ++
+ .github/workflows/sync-upstream.yaml               |  616 ++++++
  NOTICE                                             |   21 +
- UPSTREAM.md                                        |  308 +++
+ UPSTREAM.md                                        |  313 +++
  docs/api-pages.yaml                                |    2 +-
  docs/content/docs/configuration/config.mdx         |   35 +
  .../train/algorithms/dapo/main_dapo_fully_async.py |   38 +-
@@ -264,10 +267,10 @@ _Last generated for `origin/main` (76f5f467) ↔ `HEAD` (e5d43639); merge-base `
  tests/train/test_sft_prefetch.py                   |  462 +++++
  tests/train/test_vllm_metrics_scraper.py           |  243 +++
  tests/train/utils/test_logging_config.py           |  120 ++
- upstream-sync/bedrock-ci-setup.md                  |   70 +
+ upstream-sync/bedrock-ci-setup.md                  |  106 +
  upstream-sync/gen_develop_delta.sh                 |  104 +
  uv.lock                                            | 2089 +++++++++++--------
- 131 files changed, 15208 insertions(+), 2022 deletions(-)
+ 132 files changed, 15667 insertions(+), 2022 deletions(-)
 ```
 <!-- END AUTO:develop-delta -->
 
