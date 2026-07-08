@@ -13,6 +13,8 @@
 #        - clean    -> open a normal PR into `develop`, request review
 #        - conflicts -> push a branch at the upstream target and open a DRAFT PR into `develop`,
 #                       so GitHub shows the native merge-conflict UI
+#                       If `ENABLE_CLAUDE_CONFLICT_RESOLUTION=true`, a follow-up Claude Code job
+#                       tries to resolve only obvious conflicts and pushes a separate commit.
 #
 # ACTIVATION: scheduled + workflow_dispatch triggers only register from the repo's DEFAULT branch.
 # This lives on `develop`; it stays dormant until an admin sets `develop` as the default branch.
@@ -23,6 +25,14 @@
 name: sync-upstream
 
 on:
+  pull_request:
+    branches: [develop]
+    paths:
+      - ".github/workflows/sync-upstream.yaml"
+      - "upstream-sync/bedrock-ci-setup.md"
+  pull_request_target:
+    types: [labeled]
+    branches: [develop]
   schedule:
     - cron: "0 10 * * 1"   # Monday 10:00 UTC: 02:00 PST / 03:00 PDT.
   workflow_dispatch:
@@ -31,6 +41,18 @@ on:
         description: "Upstream ref to sync to (default: main)"
         required: false
         default: "main"
+      auto_resolve_conflicts:
+        description: "Try Claude Code on merge conflicts if repo access is enabled"
+        required: false
+        default: "true"
+      run_mltrain_compat_gate:
+        description: "After a clean or agent-resolved sync PR, bump ml.train and run its e2e suite"
+        required: false
+        default: "true"
+      mltrain_compat_pr_number:
+        description: "Manual-only: run ml.train compatibility gate for this existing SkyRL PR number"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -47,10 +69,22 @@ env:
 
 jobs:
   open-sync-pr:
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' &&
+        !github.event.inputs.mltrain_compat_pr_number
+      )
     runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.merge.outputs.result }}
+      branch: ${{ steps.merge.outputs.branch }}
+      target_sha: ${{ steps.fetch.outputs.target_sha }}
+      short_sha: ${{ steps.fetch.outputs.short_sha }}
+      candidate_sha: ${{ steps.merge.outputs.candidate_sha }}
+      pr_number: ${{ steps.conflict-pr.outputs.pull-request-number || steps.clean-pr.outputs.pull-request-number }}
     steps:
       - name: Generate GitHub App token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         id: app-token
         with:
           app-id: ${{ vars.LILA_BOT_APP_ID }}
@@ -61,7 +95,7 @@ jobs:
           permission-pull-requests: write
 
       - name: Checkout fork (full history)
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
           ref: develop
@@ -75,13 +109,23 @@ jobs:
           git config merge.conflictStyle zdiff3
 
       - name: Fetch upstream
+        id: fetch
         run: |
           git remote add upstream "$UPSTREAM_URL" 2>/dev/null || git remote set-url upstream "$UPSTREAM_URL"
           git fetch upstream --tags
           git fetch origin main
-          echo "TARGET_SHA=$(git rev-parse "upstream/${UPSTREAM_REF}")" >> "$GITHUB_ENV"
-          echo "SHORT_SHA=$(git rev-parse --short "upstream/${UPSTREAM_REF}")" >> "$GITHUB_ENV"
-          echo "STAMP=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+          TARGET_SHA=$(git rev-parse "upstream/${UPSTREAM_REF}")
+          SHORT_SHA=$(git rev-parse --short "upstream/${UPSTREAM_REF}")
+          STAMP=$(date -u +%Y-%m-%d)
+          {
+            echo "TARGET_SHA=$TARGET_SHA"
+            echo "SHORT_SHA=$SHORT_SHA"
+            echo "STAMP=$STAMP"
+          } >> "$GITHUB_ENV"
+          {
+            echo "target_sha=$TARGET_SHA"
+            echo "short_sha=$SHORT_SHA"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Skip if develop already contains the target
         run: |
@@ -110,6 +154,7 @@ jobs:
         run: |
           BRANCH="sync/develop-${STAMP}"
           echo "BRANCH=$BRANCH" >> "$GITHUB_ENV"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
           git switch -c "$BRANCH" origin/develop
           if git merge --no-edit "$TARGET_SHA"; then
             echo "result=clean" >> "$GITHUB_OUTPUT"
@@ -122,19 +167,15 @@ jobs:
             git reset --hard "$TARGET_SHA"
             echo "result=conflict" >> "$GITHUB_OUTPUT"
           fi
+          echo "candidate_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           git push -u origin "$BRANCH" --force-with-lease
 
-      - name: Open PR (clean)
+      - name: Write clean PR body
         if: env.UP_TO_DATE != '1' && steps.merge.outputs.result == 'clean'
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
 
-          OWNER="${REPO%/*}"
-          BODY_FILE=$(mktemp)
-          cat > "$BODY_FILE" <<EOF
+          cat > "${RUNNER_TEMP}/sync-pr-clean.md" <<EOF
           Automated upstream sync. \`main\` fast-forwarded to \`${TARGET_SHA}\`; this PR merges it into \`develop\`.
 
           - [ ] CODEOWNERS review on hotspot files
@@ -145,57 +186,431 @@ jobs:
 
           Do NOT auto-merge — see upstream-sync/02-recurring-workflow.md.
           EOF
-          PR_JSON=$(gh api \
-            "repos/${REPO}/pulls?head=${OWNER}:${BRANCH}&base=develop&state=open" \
-            --jq '.[0] // empty')
-          if [ -z "$PR_JSON" ]; then
-            PR_JSON=$(gh api -X POST "repos/${REPO}/pulls" \
-              -f base=develop \
-              -f head="$BRANCH" \
-              -f title="chore(sync): upstream ${SHORT_SHA}" \
-              -f body="$(cat "$BODY_FILE")")
-          fi
-          PR_NUMBER=$(echo "$PR_JSON" | jq -r .number)
-          PR_URL=$(echo "$PR_JSON" | jq -r .html_url)
-          echo "$PR_URL"
-          gh api -X POST "repos/${REPO}/issues/${PR_NUMBER}/labels" -f labels[]=upstream-sync || echo "::warning::Could not add upstream-sync label"
 
-      - name: Open DRAFT PR with conflict checklist
+      - name: Open PR (clean)
+        id: clean-pr
+        if: env.UP_TO_DATE != '1' && steps.merge.outputs.result == 'clean'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          branch: ${{ steps.merge.outputs.branch }}
+          base: develop
+          title: "chore(sync): upstream ${{ steps.fetch.outputs.short_sha }}"
+          body-path: ${{ runner.temp }}/sync-pr-clean.md
+          labels: upstream-sync
+
+      - name: Write conflict PR body
         if: env.UP_TO_DATE != '1' && steps.merge.outputs.result == 'conflict'
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
 
-          OWNER="${REPO%/*}"
           CHECKLIST=$(sed 's/^/- [ ] /' /tmp/conflicts.txt 2>/dev/null || echo "- [ ] (see CI log)")
-          BODY_FILE=$(mktemp)
-          cat > "$BODY_FILE" <<EOF
+          cat > "${RUNNER_TEMP}/sync-pr-conflict.md" <<EOF
           Automated upstream sync to \`${TARGET_SHA}\` hit conflicts merging the new \`main\` into \`develop\`. \`main\` was fast-forwarded, and this draft branch points at the upstream target so GitHub can show the native merge-conflict UI against \`develop\`.
+
+          If repo variable \`ENABLE_CLAUDE_CONFLICT_RESOLUTION=true\`, a follow-up Claude Code job will attempt an easy-only resolution. If it cannot fully resolve the merge, this PR remains the manual-resolution surface.
 
           Conflicting files:
           ${CHECKLIST}
 
           Resolution rules: see 'Mandatory hotspot resolution rules' in upstream-sync/01-catch-up-plan.md. Never auto-merge.
           EOF
-          PR_JSON=$(gh api \
-            "repos/${REPO}/pulls?head=${OWNER}:${BRANCH}&base=develop&state=open" \
-            --jq '.[0] // empty')
-          if [ -z "$PR_JSON" ]; then
-            PR_JSON=$(gh api -X POST "repos/${REPO}/pulls" \
-              -f base=develop \
-              -f head="$BRANCH" \
-              -f title="chore(sync): upstream ${SHORT_SHA} (CONFLICTS — manual resolve)" \
-              -f body="$(cat "$BODY_FILE")" \
-              -F draft=true)
+
+      - name: Open DRAFT PR with conflict checklist
+        id: conflict-pr
+        if: env.UP_TO_DATE != '1' && steps.merge.outputs.result == 'conflict'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          branch: ${{ steps.merge.outputs.branch }}
+          base: develop
+          title: "chore(sync): upstream ${{ steps.fetch.outputs.short_sha }} (CONFLICTS — manual resolve)"
+          body-path: ${{ runner.temp }}/sync-pr-conflict.md
+          labels: upstream-sync
+          draft: always-true
+
+  agent-resolve-conflicts:
+    needs: open-sync-pr
+    if: >-
+      needs.open-sync-pr.outputs.result == 'conflict' &&
+      vars.ENABLE_CLAUDE_CONFLICT_RESOLUTION == 'true' &&
+      (github.event_name != 'workflow_dispatch' || github.event.inputs.auto_resolve_conflicts != 'false')
+    runs-on: solo-unprivileged-1cpu-4g
+    permissions:
+      actions: read
+      contents: write
+      issues: write
+      pull-requests: write
+      id-token: write
+    outputs:
+      resolution_result: ${{ steps.finalize.outputs.resolution_result }}
+      candidate_sha: ${{ steps.finalize.outputs.candidate_sha }}
+    env:
+      BRANCH: ${{ needs.open-sync-pr.outputs.branch }}
+      TARGET_SHA: ${{ needs.open-sync-pr.outputs.target_sha }}
+      SHORT_SHA: ${{ needs.open-sync-pr.outputs.short_sha }}
+      PR_NUMBER: ${{ needs.open-sync-pr.outputs.pr_number }}
+    steps:
+      - name: Generate GitHub App token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        id: app-token
+        with:
+          app-id: ${{ vars.LILA_BOT_APP_ID }}
+          private-key: ${{ secrets.LILA_BOT_NON_BASE64_PRIVATE_KEY }}
+          owner: fl97inc
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+
+      # Least-privilege token for the resolver agent: read only. The workflow
+      # (not the agent) does the commit/push/comment via the write token above,
+      # so a runaway 10-turn agent cannot push code or touch PRs/issues.
+      - name: Generate read-only token for Claude resolver
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        id: resolver-token
+        with:
+          app-id: ${{ vars.LILA_BOT_APP_ID }}
+          private-key: ${{ secrets.LILA_BOT_NON_BASE64_PRIVATE_KEY }}
+          owner: fl97inc
+          permission-contents: read
+          permission-pull-requests: read
+
+      - name: Checkout fork (full history)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          ref: develop
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Recreate conflicted merge for Claude Code
+        id: recreate
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config user.name  "lila-sync-bot"
+          git config user.email "lila-sync-bot@users.noreply.github.com"
+          git config rerere.enabled true
+          git config merge.conflictStyle zdiff3
+
+          git fetch origin develop "$BRANCH"
+          git switch -C "$BRANCH" origin/develop
+
+          if git merge --no-edit "$TARGET_SHA"; then
+            echo "result=clean" >> "$GITHUB_OUTPUT"
           else
-            PR_NUMBER=$(echo "$PR_JSON" | jq -r .number)
-            PR_JSON=$(gh api -X PATCH "repos/${REPO}/pulls/${PR_NUMBER}" \
-              -f title="chore(sync): upstream ${SHORT_SHA} (CONFLICTS — manual resolve)" \
-              -f body="$(cat "$BODY_FILE")")
+            git diff --name-only --diff-filter=U > /tmp/conflicts.txt || true
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
           fi
-          PR_NUMBER=$(echo "$PR_JSON" | jq -r .number)
-          PR_URL=$(echo "$PR_JSON" | jq -r .html_url)
-          echo "$PR_URL"
-          gh api -X POST "repos/${REPO}/issues/${PR_NUMBER}/labels" -f labels[]=upstream-sync || echo "::warning::Could not add upstream-sync label"
+
+      - name: Run Claude Code conflict resolver
+        if: steps.recreate.outputs.result == 'conflict'
+        continue-on-error: true
+        uses: fl97inc/lila-actions/claude-code@039da9d86fd626de1f675d4a3c9994880bec5bc3 # v2.28.0
+        with:
+          track-progress: false
+          # Read-only token: the agent inspects + stages a resolution; the
+          # workflow's finalize step commits/pushes with the write token.
+          github-token: ${{ steps.resolver-token.outputs.token }}
+          # No `uv run`/code-exec: resolving a textual merge conflict needs only
+          # read-only git plus checkout/add for `--ours/--theirs` staging.
+          claude-args: >-
+            --max-turns 100
+            --allowedTools "Read,Grep,Glob,Edit,MultiEdit,Bash(git status:*),Bash(git diff:*),Bash(git show:*),Bash(git log:*),Bash(git ls-files:*),Bash(git checkout:*),Bash(git add:*)"
+          prompt: |
+            You are resolving merge conflicts for the SkyRL upstream sync PR.
+
+            Context:
+            - PR: #${{ env.PR_NUMBER }}
+            - Branch: ${{ env.BRANCH }}
+            - Base branch: develop
+            - Upstream target: ${{ env.TARGET_SHA }} (${{ env.SHORT_SHA }})
+            - Conflicted files are listed in `/tmp/conflicts.txt`.
+
+            Resolve ONLY conflicts that are obviously mechanical or orthogonal:
+            - whitespace, formatting, or indentation-only disagreement
+            - both sides adding independent logic at the same nearby location
+            - simple rename/move context where the intended combined result is clear
+
+            Do NOT resolve conflicts that require product, architecture, dependency, or API ownership judgment. In that case, leave the files unmerged so the workflow keeps the draft manual-resolution PR.
+
+            Rules:
+            - Read the conflicted files, nearby context, and relevant git history before editing.
+            - Preserve both upstream behavior and fork-only develop behavior unless there is a clear duplicate.
+            - Do not add compatibility shims, broad refactors, or speculative fixes.
+            - Stage resolved files with `git add`.
+            - Do not commit or push; the workflow will commit only if every conflict is fully resolved.
+
+      - name: Commit easy conflict resolution or keep manual PR
+        id: finalize
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          COMMENT_FILE: ${{ runner.temp }}/agent-resolve-conflicts-comment.md
+        run: |
+          set -euo pipefail
+
+          if [ "${{ steps.recreate.outputs.result }}" = "clean" ]; then
+            git push -u origin "$BRANCH" --force-with-lease
+            echo "The merge became clean when replayed by the Claude conflict-resolution job. The sync branch was rewritten from \`develop\` plus \`${TARGET_SHA}\` and pushed without an extra resolution edit." > "$COMMENT_FILE"
+            {
+              echo "resolution_result=clean"
+              echo "candidate_sha=$(git rev-parse HEAD)"
+              echo "comment_ready=true"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          UNMERGED=$(git diff --name-only --diff-filter=U || true)
+          if [ -n "$UNMERGED" ]; then
+            git merge --abort || true
+            git reset --hard "$TARGET_SHA"
+            git push -u origin "$BRANCH" --force-with-lease
+            {
+              echo "Claude Code attempted the upstream-sync conflict resolution, but left unresolved conflicts for human review."
+              echo
+              echo "Unresolved files:"
+              printf '%s\n' "$UNMERGED" | sed 's/^/- /'
+              echo
+              echo "The branch was restored to the upstream target so GitHub's native conflict UI remains available."
+            } > "$COMMENT_FILE"
+            {
+              echo "resolution_result=unresolved"
+              echo "candidate_sha=$TARGET_SHA"
+              echo "comment_ready=true"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git diff --check
+          git add -u
+          if git diff --cached --quiet; then
+            git merge --abort || true
+            git reset --hard "$TARGET_SHA"
+            git push -u origin "$BRANCH" --force-with-lease
+            echo "Claude Code did not leave a committable conflict resolution. The branch was restored to the upstream target for manual review." > "$COMMENT_FILE"
+            {
+              echo "resolution_result=empty"
+              echo "candidate_sha=$TARGET_SHA"
+              echo "comment_ready=true"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git commit -m "chore(sync): resolve upstream ${SHORT_SHA} conflicts"
+          git push -u origin "$BRANCH" --force-with-lease
+
+          {
+            echo "Claude Code resolved the merge conflicts and pushed a separate resolution commit."
+            echo
+            echo "Review checklist:"
+            echo "- [ ] Confirm the resolution preserved upstream and develop behavior"
+            echo "- [ ] CODEOWNERS review on hotspot files"
+            echo "- [ ] CI green"
+          } > "$COMMENT_FILE"
+          gh pr edit "$PR_NUMBER" --repo "$REPO" \
+            --title "chore(sync): upstream ${SHORT_SHA} (agent-resolved conflicts)" \
+            --body-file "$COMMENT_FILE"
+          {
+            echo "resolution_result=resolved"
+            echo "candidate_sha=$(git rev-parse HEAD)"
+            echo "comment_ready=true"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Comment conflict-resolution result
+        if: steps.finalize.outputs.comment_ready == 'true'
+        uses: peter-evans/create-or-update-comment@e8674b075228eee787fea43ef493e45ece1004c9 # v5
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          repository: ${{ github.repository }}
+          issue-number: ${{ env.PR_NUMBER }}
+          body-path: ${{ runner.temp }}/agent-resolve-conflicts-comment.md
+
+  resolve-manual-mltrain-compat-pr:
+    if: >-
+      (
+        github.event_name == 'workflow_dispatch' &&
+        github.event.inputs.mltrain_compat_pr_number != ''
+      ) ||
+      (
+        github.event_name == 'pull_request_target' &&
+        !github.event.pull_request.draft &&
+        contains(github.event.pull_request.labels.*.name, 'run_mltrain_compat_gate')
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      pr_number: ${{ steps.resolve.outputs.pr_number }}
+      branch: ${{ steps.resolve.outputs.branch }}
+      target_sha: ${{ steps.resolve.outputs.target_sha }}
+      short_sha: ${{ steps.resolve.outputs.short_sha }}
+      candidate_sha: ${{ steps.resolve.outputs.candidate_sha }}
+      pin_url: ${{ steps.resolve.outputs.pin_url }}
+    steps:
+      - name: Generate GitHub App token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        id: app-token
+        with:
+          app-id: ${{ vars.LILA_BOT_APP_ID }}
+          private-key: ${{ secrets.LILA_BOT_NON_BASE64_PRIVATE_KEY }}
+          owner: fl97inc
+          permission-contents: read
+          permission-pull-requests: read
+
+      - name: Resolve requested SkyRL PR
+        id: resolve
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.inputs.mltrain_compat_pr_number || github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          TARGET_SHA=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)
+          BRANCH=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefName --jq .headRefName)
+          PIN_URL="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRepository --jq '.headRepository.url').git"
+          SHORT_SHA=$(echo "$TARGET_SHA" | cut -c1-7)
+
+          {
+            echo "pr_number=$PR_NUMBER"
+            echo "branch=$BRANCH"
+            echo "target_sha=$TARGET_SHA"
+            echo "short_sha=$SHORT_SHA"
+            echo "candidate_sha=$TARGET_SHA"
+            echo "pin_url=$PIN_URL"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved PR #${PR_NUMBER}: ${BRANCH} @ ${TARGET_SHA} from ${PIN_URL}"
+
+  mltrain-compat-gate:
+    needs: [open-sync-pr, agent-resolve-conflicts, resolve-manual-mltrain-compat-pr]
+    if: >-
+      always() &&
+      (
+        (
+          (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
+          needs.open-sync-pr.result == 'success' &&
+          needs.open-sync-pr.outputs.pr_number != '' &&
+          vars.ENABLE_MLTRAIN_COMPAT_GATE == 'true' &&
+          (github.event_name != 'workflow_dispatch' || github.event.inputs.run_mltrain_compat_gate != 'false') &&
+          !github.event.inputs.mltrain_compat_pr_number &&
+          (
+            needs.open-sync-pr.outputs.result == 'clean' ||
+            needs.agent-resolve-conflicts.outputs.resolution_result == 'clean' ||
+            needs.agent-resolve-conflicts.outputs.resolution_result == 'resolved'
+          )
+        ) ||
+        (
+          github.event_name == 'workflow_dispatch' &&
+          github.event.inputs.mltrain_compat_pr_number != '' &&
+          vars.ENABLE_MLTRAIN_COMPAT_GATE == 'true' &&
+          github.event.inputs.run_mltrain_compat_gate != 'false' &&
+          needs.resolve-manual-mltrain-compat-pr.result == 'success'
+        ) ||
+        (
+          github.event_name == 'pull_request_target' &&
+          !github.event.pull_request.draft &&
+          contains(github.event.pull_request.labels.*.name, 'run_mltrain_compat_gate') &&
+          vars.ENABLE_MLTRAIN_COMPAT_GATE == 'true' &&
+          needs.resolve-manual-mltrain-compat-pr.result == 'success'
+        )
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    env:
+      SKYRL_REPO: ${{ github.repository }}
+      SKYRL_PR_NUMBER: ${{ needs.resolve-manual-mltrain-compat-pr.outputs.pr_number || needs.open-sync-pr.outputs.pr_number }}
+      SKYRL_SHORT_SHA: ${{ needs.resolve-manual-mltrain-compat-pr.outputs.short_sha || needs.open-sync-pr.outputs.short_sha }}
+      SKYRL_CANDIDATE_SHA: ${{ needs.resolve-manual-mltrain-compat-pr.outputs.candidate_sha || needs.agent-resolve-conflicts.outputs.candidate_sha || needs.open-sync-pr.outputs.candidate_sha }}
+      SKYRL_PIN_REPO_URL: ${{ needs.resolve-manual-mltrain-compat-pr.outputs.pin_url || format('https://github.com/{0}.git', github.repository) }}
+    steps:
+      # SkyRL-scoped token: comment on the SkyRL sync PR only.
+      - name: Generate SkyRL comment token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        id: skyrl-token
+        with:
+          app-id: ${{ vars.LILA_BOT_APP_ID }}
+          private-key: ${{ secrets.LILA_BOT_NON_BASE64_PRIVATE_KEY }}
+          owner: fl97inc
+          repositories: |
+            SkyRL
+          permission-issues: write
+          permission-pull-requests: write
+
+      # ml.train-scoped token: dispatch + read the test_skyrl_update run ONLY.
+      # No contents/pull-requests write on ml.train -- SkyRL never pushes there.
+      - name: Generate ml.train dispatch token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        id: mltrain-token
+        with:
+          app-id: ${{ vars.LILA_BOT_APP_ID }}
+          private-key: ${{ secrets.LILA_BOT_NON_BASE64_PRIVATE_KEY }}
+          owner: fl97inc
+          repositories: |
+            ml.train
+          permission-actions: write
+
+      - name: Dispatch ml.train test_skyrl_update and resolve the run
+        id: dispatch
+        env:
+          GH_TOKEN: ${{ steps.mltrain-token.outputs.token }}
+          MLTRAIN_REPO: fl97inc/ml.train
+        run: |
+          set -euo pipefail
+          tag="${SKYRL_SHORT_SHA}"
+          echo "Dispatching test_skyrl_update.yaml for SkyRL ${SKYRL_CANDIDATE_SHA} (tag ${tag})"
+          run_url="$(gh workflow run test_skyrl_update.yaml \
+            --repo "$MLTRAIN_REPO" \
+            --ref main \
+            --field "skyrl_sha=${SKYRL_CANDIDATE_SHA}" \
+            --field "run_id_tag=${tag}" \
+            --field "skyrl_repo_url=${SKYRL_PIN_REPO_URL}" \
+            --field "skyrl_pr_number=${SKYRL_PR_NUMBER}")"
+          run_id="${run_url##*/}"
+          if ! [[ "$run_id" =~ ^[0-9]+$ ]]; then
+            echo "::error::gh workflow run did not return a workflow run URL: ${run_url}"
+            exit 1
+          fi
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "run_url=$run_url" >> "$GITHUB_OUTPUT"
+
+      - name: Await ml.train run
+        id: watch
+        env:
+          GH_TOKEN: ${{ steps.mltrain-token.outputs.token }}
+        run: |
+          # gh run watch --exit-status polls to completion and exits non-zero if
+          # the ml.train run failed, mirroring its conclusion into this job.
+          gh run watch "${{ steps.dispatch.outputs.run_id }}" \
+            --repo fl97inc/ml.train --interval 30 --exit-status
+
+      - name: Write ml.train result comment
+        id: result-comment
+        if: always() && steps.dispatch.outputs.run_id != ''
+        env:
+          RESULT: ${{ steps.watch.outcome == 'success' && 'success' || 'failure' }}
+          COMMENT_FILE: ${{ runner.temp }}/mltrain-compat-result.md
+        run: |
+          {
+            echo "## ml.train SkyRL Compatibility Gate"
+            echo
+            echo "- SkyRL candidate: \`${SKYRL_CANDIDATE_SHA}\`"
+            echo "- ml.train run: ${{ steps.dispatch.outputs.run_url }}"
+            echo "- Result: **${RESULT}**"
+            echo
+            echo "See the ml.train run summary for the compatibility report and per-job (SFT/RL) nightly e2e results."
+          } > "$COMMENT_FILE"
+
+      - name: Comment ml.train result on the SkyRL PR
+        if: always() && steps.result-comment.outcome == 'success'
+        uses: peter-evans/create-or-update-comment@e8674b075228eee787fea43ef493e45ece1004c9 # v5
+        with:
+          token: ${{ steps.skyrl-token.outputs.token }}
+          repository: ${{ github.repository }}
+          issue-number: ${{ env.SKYRL_PR_NUMBER }}
+          body-path: ${{ runner.temp }}/mltrain-compat-result.md
