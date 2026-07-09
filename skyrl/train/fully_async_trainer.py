@@ -25,11 +25,12 @@ from loguru import logger
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
-from skyrl.backends.skyrl_train.inference_engines.utils import (
+from skyrl.backends.skyrl_train.inference_servers.engine_utils import (
     get_sampling_params_for_backend,
 )
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
 from skyrl.backends.skyrl_train.utils.io import io
+from skyrl.backends.skyrl_train.utils.ppo_utils import LOSSES_WITH_OLD_LOGPROBS
 from skyrl.train.generators.base import GeneratorOutput
 from skyrl.train.generators.utils import (
     concatenate_generator_outputs,
@@ -363,9 +364,14 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         assert (
             not self.cfg.generator.batched
         ), "batched is not supported for fully async training since a batched generate() call does not support pause/continue."
-        assert self.cfg.generator.inference_engine.async_engine, "async_engine must be True for fully async training."
         # TODO(Charlie): we can support it, just multi-turn partial rollout but synchronous.
         assert not self.colocate_all, "colocate_all is not supported for async training yet."
+        assert self.cfg.trainer.algorithm.policy_loss_type not in LOSSES_WITH_OLD_LOGPROBS, (
+            f"Found trainer.algorithm.policy_loss_type={self.cfg.trainer.algorithm.policy_loss_type} in "
+            f"{sorted([loss.value for loss in LOSSES_WITH_OLD_LOGPROBS])}. Fully async training should use "
+            "rollout logprobs (i.e. rollout_is or dppo) instead of recomputing logprobs, since stale "
+            "policies are not kept for logprob computation."
+        )
 
         # TODO(Charlie): need to assert we are doing TIS and returning logprobs
 

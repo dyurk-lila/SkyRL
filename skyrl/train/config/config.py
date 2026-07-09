@@ -44,9 +44,8 @@ class DataLoaderConfig(BaseConfig):
         default=None,
         metadata={
             "help": (
-                "Prompt DataLoader worker processes. Default of None auto-derives the value "
-                "(0 with the inference HTTP endpoint, else 8). Set 0 for in-process loading "
-                "that never respawns workers at epoch boundaries."
+                "Prompt DataLoader worker processes. Default of None auto-derives to 8. "
+                "Set 0 for in-process loading that never respawns workers at epoch boundaries."
             )
         },
     )
@@ -163,37 +162,18 @@ TORCH_PROFILER_EXPORT_TYPES = ("chrome_trace", "stacks")
 
 @dataclass
 class TorchProfilerConfig(BaseConfig):
-    """Configuration for the ``torch.profiler``-based training-loop profiler.
-
-    Mirrors ``torch.profiler.profile`` + ``torch.profiler.schedule`` so every
-    knob is overridable. Defaults reproduce the previous hardcoded behavior
-    (CPU+CUDA, ``record_shapes``+``with_stack``) but are now fully configurable.
-    The trainer drives it (``start`` before the loop, one ``step`` per global
-    step, ``stop`` after); the schedule decides which steps are recorded.
-
-    Scope: this profiles **only the policy model's training step**
-    (forward/backward + optimizer). In an RL run it does **not** profile the
-    critic or ref models, and it does **not** profile generation/inference --
-    only the policy training compute on the configured ``ranks``.
-    """
+    """Configuration for the ``torch.profiler``-based training-loop profiler."""
 
     enable: bool = False
     ranks: List[int] = field(default_factory=lambda: [0])
     save_path: Optional[str] = None
-    """Trace output dir. Required when ``enable=True``; use an absolute local path.
-    Ray workers run from a ``/tmp/ray/.../working_dir_files`` runtime dir, so a
-    relative path would scatter traces there -- and ``torch.profiler`` cannot write
-    to cloud URIs (``s3://``/``gs://``)."""
 
     # torch.profiler.schedule -- one cycle = wait + warmup + active steps.
     skip_first: int = 10
-    """Steps to skip before the schedule begins (warmup/steady-state)."""
     wait: int = 0
     warmup: int = 1
     active: int = 1
-    """Number of steps recorded per cycle."""
     repeat: int = 1
-    """Number of cycles. 0 = repeat for the whole run."""
 
     # torch.profiler.profile capture knobs.
     activities: List[str] = field(default_factory=lambda: ["cpu", "cuda"])
@@ -203,8 +183,6 @@ class TorchProfilerConfig(BaseConfig):
     with_flops: bool = False
     with_modules: bool = False
     export_type: str = "chrome_trace"
-    """``chrome_trace`` -> ``*.pt.trace.json`` (HTA-friendly) or ``stacks`` ->
-    flamegraph-style self-CUDA-time stacks (requires ``with_stack=True``)."""
 
     def validate(
         self,
@@ -213,28 +191,10 @@ class TorchProfilerConfig(BaseConfig):
         colocate_policy_ref: Optional[bool] = None,
         fsdp_cpu_offload: Optional[bool] = None,
     ) -> None:
-        """Validate the profiler config. No-op when disabled.
-
-        Called from both ``validate_cfg`` (RL) and ``validate_sft_cfg`` (SFT) so
-        an invalid config fails fast at startup rather than silently degrading
-        (e.g. an unknown ``export_type`` would otherwise fall through to the
-        chrome-trace branch, and an unknown ``activities`` entry would disable
-        profiling mid-run via the wrapper's exception isolation).
-
-        The ``strategy``/``colocate_*``/``fsdp_cpu_offload`` args (passed by the RL
-        validator, which has the full root config) gate an incompatibility check:
-        the FSDP2 manual CPU-offload path moves params with ``torch.utils.swap_tensors``,
-        which fails (``RuntimeError: Couldn't swap <param>``) while ``torch.profiler``
-        holds weakrefs to those params during an active window. SFT calls this with no
-        context (single-model, never colocated) so the check is skipped there.
-        """
         if not self.enable:
             return
         if not self.ranks:
             raise ValueError("`torch_profiler_config.ranks` must be non-empty when profiling is enabled.")
-        # `save_path` is a required, explicit, local path -- no implicit default. Ray
-        # workers run from a /tmp/ray runtime working dir, so a relative path would
-        # scatter traces there, and torch.profiler can't write cloud URIs.
         if not self.save_path:
             raise ValueError(
                 "`torch_profiler_config.save_path` must be set when profiling is enabled. "
@@ -248,11 +208,9 @@ class TorchProfilerConfig(BaseConfig):
                 f"`torch_profiler_config.save_path` must be a local path; got cloud URI "
                 f"{self.save_path!r}. torch.profiler cannot write to cloud storage."
             )
-        # An empty `activities` passes the membership check below vacuously, but
-        # `torch.profiler.profile(activities=[])` records nothing -- fail fast instead.
         if not self.activities:
             raise ValueError("`torch_profiler_config.activities` must be non-empty when profiling is enabled.")
-        bad_activities = [a for a in self.activities if a.lower() not in TORCH_PROFILER_ACTIVITIES]
+        bad_activities = [activity for activity in self.activities if activity.lower() not in TORCH_PROFILER_ACTIVITIES]
         if bad_activities:
             raise ValueError(
                 f"invalid `torch_profiler_config.activities` entries {bad_activities}. "
@@ -275,15 +233,6 @@ class TorchProfilerConfig(BaseConfig):
         if self.active < 1:
             raise ValueError(f"`torch_profiler_config.active` must be >= 1, got {self.active}.")
 
-        # Cross-field: reject configs that would crash mid-run on the FSDP2 swap-based
-        # CPU offload. The manual offload path (fsdp_strategy: `manual_offload`, used
-        # when `fsdp_config.cpu_offload=False`) calls `model.to("cpu")` -> nn.Module._apply
-        # -> torch.utils.swap_tensors, which raises "Couldn't swap <param>" if any weakref
-        # to a param is alive. torch.profiler holds such weakrefs to every param it observes
-        # during an active window. That offload only fires mid-loop under colocation
-        # (colocate_all, or colocate_policy_ref for the policy/ref pair). Megatron offloads
-        # via its own flat-buffer/`.data` reassignment path (no swap_tensors) and is immune;
-        # `fsdp_config.cpu_offload=True` uses FSDP2-native offload (also no manual swap).
         if strategy == "fsdp" and fsdp_cpu_offload is False and (colocate_all or colocate_policy_ref):
             raise ValueError(
                 "`torch_profiler_config.enable=true` is incompatible with this FSDP configuration: "
@@ -297,6 +246,13 @@ class TorchProfilerConfig(BaseConfig):
                 "disable colocation (`placement.colocate_all=false` and `placement.colocate_policy_ref=false`), "
                 "or use the Megatron backend (`trainer.strategy=megatron`)."
             )
+
+
+@dataclass
+class MegatronTorchProfilerConfig(BaseConfig):
+    enable: bool = False
+    ranks: List[int] = field(default_factory=list)
+    save_path: Optional[str] = None
 
 
 @dataclass
@@ -343,6 +299,7 @@ class MegatronConfig(BaseConfig):
     moe_router_dtype: str = "fp32"
     """Pass through to Megatron-Bridge - can be set to 'fp64' for additional numerical stability."""
     ddp_config: MegatronDDPConfig = field(default_factory=MegatronDDPConfig)
+    torch_profiler_config: MegatronTorchProfilerConfig = field(default_factory=MegatronTorchProfilerConfig)
     lora_config: MegatronLoraConfig = field(default_factory=MegatronLoraConfig)
     optimizer_config_kwargs: Dict[str, Any] = field(
         default_factory=lambda: copy.deepcopy(DEFAULT_MEGATRON_OPTIMIZER_KWARGS)
@@ -409,9 +366,7 @@ class PolicyConfig(BaseConfig):
     """Save memory snapshots to ``{ckpt_path}/memory_snapshots/``.
     Visualize by dragging pickle files to https://docs.pytorch.org/memory_viz."""
     torch_profiler_config: TorchProfilerConfig = field(default_factory=TorchProfilerConfig)
-    """Backend-agnostic ``torch.profiler`` config (FSDP + Megatron). When
-    ``enable`` is true the trainer drives the profiler around the training loop
-    and writes traces to ``save_path``. See :class:`TorchProfilerConfig`."""
+    """Backend-agnostic ``torch.profiler`` config (FSDP + Megatron)."""
     megatron_config: MegatronConfig = field(default_factory=MegatronConfig)
     model_config_kwargs: dict = field(default_factory=dict)
     """Pass-through kwargs for the HuggingFace model config (FSDP backends).
@@ -509,13 +464,8 @@ class CISPOConfig(BaseConfig):
     cispo_eps_clip_high: float = 5.0
     """Offset for upper bound of importance sampling ratio clipping (as opposed to PPO token update clipping)."""
     cispo_anchor: str = "old"
-    """Behavior policy the IS ratio is anchored on: ``"old"`` (default) uses the recomputed
-    old log-probs (``ratio = pi_theta / pi_old``), matching the original CISPO paper. ``"rollout"``
-    uses the rollout/sampler log-probs (``ratio = pi_theta / pi_rollout``), which makes the clamped
-    objective engage under fully-async training where the sampler lags the trainer (with ``"old"``
-    the ratio is ~1 at a single gradient step and the clamp never bites). With ``"rollout"`` the
-    ratio is the full off-policy correction, so ``off_policy_correction.tis_ratio_type`` must be
-    ``None`` (else the off-policy gap is double-counted)."""
+    """Behavior policy the IS ratio is anchored on: ``"old"`` uses recomputed old log-probs
+    and ``"rollout"`` uses sampler log-probs."""
 
     def __post_init__(self):
         if self.cispo_anchor not in ("old", "rollout"):
@@ -725,7 +675,6 @@ class InferenceEngineConfig(BaseConfig):
     pipeline_parallel_size: int = 1
     expert_parallel_size: int = 1
     data_parallel_size: int = 1
-    async_engine: bool = True
     vllm_v1_disable_multiproc: bool = True
     """Sets ``VLLM_ENABLE_V1_MULTIPROCESSING=0`` for reproducibility."""
     enable_prefix_caching: bool = True
@@ -747,14 +696,6 @@ class InferenceEngineConfig(BaseConfig):
     its sleep/wake memory pool. On older vLLM, sleep mode + expandable segments is a hard
     error, so leave this off."""
     max_num_seqs: int = 1024
-    remote_urls: List[str] = field(default_factory=lambda: [])
-    enable_http_endpoint: bool = False
-    """When ``True``, launch an OpenAI-compatible HTTP endpoint for the inference engine client so that generators can send requests to this server instead of using ``.generate()`` Python calls.
-    
-    NOTE: When using HTTP endpoints directly, make sure to set ``trainer.algorithm.temperature`` to the temperature used during generation
-    """
-    http_endpoint_host: str = "127.0.0.1"
-    http_endpoint_port: int = 8000
     served_model_name: Optional[str] = None
     """Model name for HTTP endpoint validation. If set, must be used in the ``model`` field of
     ``/chat/completions`` requests instead of the model path. If ``None``, the model path is used."""
@@ -767,8 +708,6 @@ class InferenceEngineConfig(BaseConfig):
     multimodal models (e.g. Qwen3.5) skip vision encoder initialization."""
     engine_init_kwargs: Dict[str, Any] = field(default_factory=dict)
     """Pass-through kwargs for the vLLM engine. Names must match the engine's args."""
-    override_existing_update_group: str = "auto"
-    """``"auto"``, ``"enable"``, or ``"disable"``."""
     external_proxy_url: Optional[str] = None
     """Data-plane URL (load-balanced router) for the new inference layer."""
     external_server_urls: Optional[List[str]] = None
@@ -817,9 +756,6 @@ class GeneratorConfig(BaseConfig):
     apply_overlong_filtering: bool = False
     """Apply DAPO Overlong Filtering: mask out all tokens in the loss mask for trajectories that
     exceed max length (truncated, no EOS token)."""
-    rope_scaling: Optional[Dict[str, Any]] = None
-    """Can differ from the trainer's ``rope_scaling``, useful for thinking models."""
-    rope_theta: Optional[float] = None
     step_wise_trajectories: bool = False
     vision_language_generator: bool = False
     """If True, use SkyRLVLMGymGenerator (multi-modal text+image rollouts)"""
@@ -946,8 +882,6 @@ class TrainerConfig(BaseConfig):
     """Optional list of tags to apply to the W&B run. Has no effect on other backends."""
     dump_data_batch: bool = False
     dump_eval_results: bool = True
-    rope_scaling: Optional[Dict[str, Any]] = None
-    rope_theta: Optional[float] = None
     log_example_interval: int = 1
     """Log an example prompt every N training steps, ``0``/``-1`` to disable"""
     logprobs_chunk_size: Optional[int] = 1024
@@ -955,24 +889,14 @@ class TrainerConfig(BaseConfig):
     This lowers peak GPU memory at the cost of ~2x wall-clock time.
     ``None`` disables chunking (Megatron backend only; FSDP requires a positive int).
     See https://github.com/NovaSky-AI/SkyRL/pull/1610 for more details."""
-    fused_linear_logprob: bool = False
-    """Megatron only. Fuse the LM-head projection into the chunked log-prob computation so the
-    full ``[*, seq, vocab // TP]`` logits tensor is never materialized (the dominant activation
-    transient on the log-prob path at large vocab / long context). The model returns its
-    pre-projection hidden state and the head GEMM is applied per sequence-chunk inside the fused
-    log-prob (recomputed in backward). Numerically equivalent to the stock logits path (verified
-    in ``tests/backends/skyrl_train/cpu/megatron/test_fused_linear_logprob.py``); ``False`` keeps
-    the byte-identical stock behaviour. Uses ``logprobs_chunk_size`` for the chunk width.
-    NOTE: not applied when the model uses MuP output scaling (``use_mup``) or any post-projection
-    logit transform — those fall back to the stock path automatically (see
-    ``_install_fused_lm_head_capture`` in the Megatron model wrapper)."""
-    fused_linear_logprob_backend: str = "torch"
-    """Implementation for ``fused_linear_logprob`` (ignored when that is ``False``):
-    ``"torch"`` — pure-PyTorch chunked kernel; runs anywhere (CPU/GPU), no extra deps; bounds but
-    still materializes the per-chunk logits. The verified default.
-    ``"triton"`` — vendored flash-style Triton kernel (ported from verl); tiles over vocab so the
-    per-chunk logits never materialize (lower memory + faster), GPU + ``triton`` required. Falls
-    back to ``"torch"`` with a warning if Triton is unavailable."""
+    fused_lm_head_logprob: bool = False
+    """Megatron only. Fuse the LM-head projection into log-prob / entropy
+    computation so the full ``[B, S, vocab//TP]`` logits tensor is never
+    materialized. Uses ``logprobs_chunk_size`` to bound peak memory."""
+    fused_lm_head_logprob_backend: str = "torch"
+    """Fused LM-head backend: ``"torch"`` (default) or ``"triton"``.
+    The Triton backend requires CUDA + triton and falls back to ``"torch"``
+    when unavailable. Ignored unless ``fused_lm_head_logprob`` is true."""
 
     def __post_init__(self):
         # ref model defaults to the policy model
@@ -990,15 +914,15 @@ class TrainerConfig(BaseConfig):
                 "logprobs_chunk_size=None (no chunking) is only supported with the Megatron backend. "
                 f"Set a positive integer for strategy={self.strategy!r}."
             )
-        if self.fused_linear_logprob and self.strategy != "megatron":
+        if self.fused_lm_head_logprob and self.strategy != "megatron":
             raise ValueError(
-                "fused_linear_logprob=True is only supported with the Megatron backend, "
+                "fused_lm_head_logprob=True is only supported with the Megatron backend, "
                 f"got strategy={self.strategy!r}."
             )
-        if self.fused_linear_logprob_backend not in ("torch", "triton"):
+        if self.fused_lm_head_logprob_backend not in ("torch", "triton"):
             raise ValueError(
-                "fused_linear_logprob_backend must be 'torch' or 'triton', "
-                f"got {self.fused_linear_logprob_backend!r}."
+                "fused_lm_head_logprob_backend must be 'torch' or 'triton', "
+                f"got {self.fused_lm_head_logprob_backend!r}."
             )
 
 
@@ -1012,6 +936,40 @@ def validate_dict_keys_against_dataclass(datacls: Type[Any], d: dict):
     valid_fields = {f.name for f in dataclasses.fields(datacls)}
     if invalid_keys := set(d.keys() - valid_fields):
         raise ValueError(f"Invalid fields {invalid_keys} for {datacls.__name__}. Valid fields are {valid_fields}.")
+
+
+def _has_nested_key(cfg: Any, path: str) -> bool:
+    node = cfg
+    for key in path.split("."):
+        if not isinstance(node, (dict, DictConfig)) or key not in node:
+            return False
+        node = node[key]
+    return True
+
+
+_MISSING = object()
+
+
+def _get_nested_value(cfg: Any, path: str) -> Any:
+    node = cfg
+    for key in path.split("."):
+        if not isinstance(node, (dict, DictConfig)) or key not in node:
+            return _MISSING
+        node = node[key]
+    if isinstance(node, DictConfig):
+        return OmegaConf.to_container(node, resolve=True)
+    return node
+
+
+def _delete_nested_key(cfg: Any, path: str) -> None:
+    keys = path.split(".")
+    node = cfg
+    for key in keys[:-1]:
+        if not isinstance(node, (dict, DictConfig)) or key not in node:
+            return
+        node = node[key]
+    if isinstance(node, (dict, DictConfig)) and keys[-1] in node:
+        del node[keys[-1]]
 
 
 def _resolve_class_type(type_annotation: Any) -> Optional[Type]:
@@ -1099,23 +1057,16 @@ class SkyRLTrainConfig(BaseConfig):
         if self.generator.max_input_length is None:
             self.generator.max_input_length = self.trainer.max_prompt_length
 
-        # generator rope params default to trainer rope params
-        if self.generator.rope_scaling is None and self.trainer.rope_scaling is not None:
-            self.generator.rope_scaling = self.trainer.rope_scaling
-        if self.generator.rope_theta is None and self.trainer.rope_theta is not None:
-            self.generator.rope_theta = self.trainer.rope_theta
         # Copy temperature from generator sampling params to algorithm config
         # so workers can access it without needing the generator config
         if self.trainer.algorithm.temperature is None:
             self.trainer.algorithm.temperature = self.generator.sampling_params.temperature
 
         if self.data.dataloader.num_workers is None:
-            # TODO(Charlie): debug why inference http endpoint is slow when num_workers is 8
-            self.data.dataloader.num_workers = 0 if self.generator.inference_engine.enable_http_endpoint else 8
+            self.data.dataloader.num_workers = 8
         if self.data.dataloader.persistent_workers and self.data.dataloader.num_workers == 0:
             raise ValueError(
-                "data.dataloader.persistent_workers requires num_workers > 0, but it was either"
-                " set explicitly to 0 or forced to 0 by the inference HTTP endpoint."
+                "data.dataloader.persistent_workers requires num_workers > 0, but it was set explicitly to 0."
             )
 
         # TODO(devpatel): Bandaid solution, replace this once we have a better
@@ -1169,6 +1120,80 @@ class SkyRLTrainConfig(BaseConfig):
                     "To add custom config fields, subclass the relevant config dataclass."
                 )
         overrides = OmegaConf.from_cli(args)
+        unsupported_rope_paths = (
+            "trainer.rope_scaling",
+            "trainer.rope_theta",
+            "trainer.rope_parameters",
+            "generator.rope_scaling",
+            "generator.rope_theta",
+            "generator.rope_parameters",
+            "generator.inference_engine.rope_scaling",
+            "generator.inference_engine.rope_theta",
+            "generator.inference_engine.rope_parameters",
+            "generator.inference_engine.engine_init_kwargs.rope_scaling",
+            "generator.inference_engine.engine_init_kwargs.rope_theta",
+            "generator.inference_engine.engine_init_kwargs.rope_parameters",
+            "generator.inference_engine.engine_init_kwargs.hf_overrides.rope_scaling",
+            "generator.inference_engine.engine_init_kwargs.hf_overrides.rope_theta",
+        )
+        if any(_has_nested_key(overrides, path) for path in unsupported_rope_paths):
+            raise ValueError(
+                "`rope_scaling`, `rope_theta`, and `rope_parameters` are no longer supported as native "
+                "config overrides, use `generator.inference_engine.engine_init_kwargs.hf_overrides.rope_parameters` "
+                "and `trainer.policy.model_config_kwargs.rope_parameters` or "
+                "`trainer.policy.megatron_config.transformer_config_kwargs.rope_parameters` instead"
+            )
+        inference_rope_parameters = _get_nested_value(
+            overrides, "generator.inference_engine.engine_init_kwargs.hf_overrides.rope_parameters"
+        )
+        if inference_rope_parameters is not _MISSING:
+            trainer_strategy = _get_nested_value(overrides, "trainer.strategy")
+            trainer_strategy = "fsdp" if trainer_strategy is _MISSING else trainer_strategy
+            trainer_rope_parameters_path = (
+                "trainer.policy.megatron_config.transformer_config_kwargs.rope_parameters"
+                if trainer_strategy == "megatron"
+                else "trainer.policy.model_config_kwargs.rope_parameters"
+            )
+            trainer_rope_parameters = _get_nested_value(overrides, trainer_rope_parameters_path)
+            if inference_rope_parameters != trainer_rope_parameters:
+                raise ValueError(
+                    "`generator.inference_engine.engine_init_kwargs.hf_overrides.rope_parameters` must match "
+                    f"the trainer-side override at `{trainer_rope_parameters_path}`"
+                )
+        async_engine_path = "generator.inference_engine.async_engine"
+        async_engine = _get_nested_value(overrides, async_engine_path)
+        if async_engine is not _MISSING:
+            if async_engine is True or (isinstance(async_engine, str) and async_engine.lower() == "true"):
+                _delete_nested_key(overrides, async_engine_path)
+            elif async_engine is False or (isinstance(async_engine, str) and async_engine.lower() == "false"):
+                raise ValueError(
+                    "`async_engine=False` is no longer supported; SkyRL always uses the async "
+                    "HTTP/vLLM inference path. Remove the override."
+                )
+            else:
+                raise ValueError("`async_engine` is no longer supported as a config field. Remove the override.")
+        removed_inference_engine_overrides = {
+            "generator.inference_engine.enable_http_endpoint": (
+                "`enable_http_endpoint` is no longer supported; SkyRL always uses the HTTP/vLLM inference path. "
+                "Remove the override."
+            ),
+            "generator.inference_engine.override_existing_update_group": (
+                "`override_existing_update_group` is no longer supported; update-group handling is managed "
+                "automatically by the vLLM-native inference path. Remove the override."
+            ),
+        }
+        for path, message in removed_inference_engine_overrides.items():
+            if _has_nested_key(overrides, path):
+                raise ValueError(message)
+        if (
+            "generator" in overrides
+            and "inference_engine" in overrides.generator
+            and "remote_urls" in overrides.generator.inference_engine
+        ):
+            raise ValueError(
+                "`remote_urls` is no longer supported, external inference servers can be used with "
+                "`external_proxy_url` and `external_server_urls` instead"
+            )
         # Accept the deprecated ``trainer.use_sample_packing`` key as an alias
         # for ``trainer.remove_microbatch_padding``. Remap it before
         # construction so the strict key validation does not reject the old

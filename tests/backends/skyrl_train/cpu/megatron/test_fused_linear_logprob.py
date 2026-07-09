@@ -1,7 +1,7 @@
 """CPU/gloo correctness tests for the fused LM-head log-prob path.
 
-Runs WITHOUT GPUs or megatron-core: it exercises ``FusedLinearLogprob`` /
-``from_parallel_logits_to_logprobs(lm_head_weight=...)`` against the stock logits path
+Runs WITHOUT GPUs or megatron-core: it exercises ``FusedLinearLogprob`` via
+``from_parallel_hidden_to_logprobs`` against the stock logits path
 (``from_parallel_logits_to_logprobs`` over fully-materialized logits) on a real Gloo
 tensor-parallel process group. It checks the forward log-prob, the gradient w.r.t. the
 hidden state, AND the gradient w.r.t. the LM-head weight all match the unfused reference,
@@ -50,6 +50,8 @@ if _megatron_stubbed:
     for _name in ("megatron.core.parallel_state", "megatron.core", "megatron"):
         sys.modules.pop(_name, None)
 from skyrl.backends.skyrl_train.distributed.megatron.model_utils import (  # noqa: E402
+    _fused_vocab_parallel_entropy_from_hidden,
+    from_parallel_hidden_to_logprobs,
     from_parallel_logits_to_logprobs,
     vocab_parallel_entropy,
 )
@@ -85,11 +87,12 @@ def _stock_logprobs(hidden, weight_shard, target, vstart, vend, chunk_size):
 
 
 def _fused_logprobs(hidden, weight_shard, target, vstart, vend, chunk_size, grad_seed):
-    """Fused path on this rank's weight shard, via the public lm_head_weight entry point."""
+    """Fused path on this rank's weight shard."""
     leaf_h = hidden.detach().clone().requires_grad_(True)
     leaf_w = weight_shard.detach().clone().requires_grad_(True)
-    lp = from_parallel_logits_to_logprobs(
-        leaf_h,  # hidden state, NOT logits
+    lp = from_parallel_hidden_to_logprobs(
+        leaf_h,
+        leaf_w,
         target,
         vocab_start_index=vstart,
         vocab_end_index=vend,
@@ -97,7 +100,7 @@ def _fused_logprobs(hidden, weight_shard, target, vstart, vend, chunk_size, grad
         inference_only=False,
         cp_group=None,
         chunk_size=chunk_size,
-        lm_head_weight=leaf_w,
+        fused_backend="torch",
     )
     lp.backward(grad_seed.clone())
     return lp.detach(), leaf_h.grad.detach(), leaf_w.grad.detach()
@@ -189,13 +192,11 @@ def test_fused_matches_stock_logits_path(world_size, chunk_size, with_oov):
 
 
 # ======================================================================================
-# Entropy dual-output parity (verl's established (log_probs, entropy) pattern).
+# Entropy metric parity.
 #
-# The fused path can now ALSO return per-token entropy in the SAME chunked TP loop. We assert
-# it matches the stock reference ``vocab_parallel_entropy`` over the materialized logit shard,
-# in BOTH the forward (per-token entropy) and the backward (the entropy gradient term added to
-# grad-hidden / grad-weight). This is the load-bearing new path for routing ALL RL losses
-# (ppo/grpo/...) through fusion, not just SFT cross_entropy.
+# The current fused path supports a no-grad entropy metric, not the old dual-output
+# entropy-loss backward path. We assert that forward metric matches stock
+# ``vocab_parallel_entropy`` over the materialized logit shard.
 # ======================================================================================
 
 
@@ -225,8 +226,6 @@ def _entropy_worker(rank, world_size, port, chunk_size, with_oov, ret_dict):
         batch_size, seq_len, hidden_size, vocab_size = 3, 24, 32, 256
         hidden = torch.randn(batch_size, seq_len, hidden_size) * 0.5
         weight_full = torch.randn(vocab_size, hidden_size) * 0.1
-        target_high = vocab_size + 50 if with_oov else vocab_size
-        target = torch.randint(0, target_high, (batch_size, seq_len), dtype=torch.long)
 
         assert vocab_size % world_size == 0
         shard = vocab_size // world_size
@@ -239,60 +238,21 @@ def _entropy_worker(rank, world_size, port, chunk_size, with_oov, ret_dict):
         ref_w = weight_shard.detach().clone().requires_grad_(True)
         ent_ref = vocab_parallel_entropy(ref_h @ ref_w.t())  # [B, S]
 
-        fh = hidden.detach().clone().requires_grad_(True)
-        fw = weight_shard.detach().clone().requires_grad_(True)
-        lp_fused, ent_fused = from_parallel_logits_to_logprobs(
-            fh,
-            target,
-            vocab_start_index=vstart,
-            vocab_end_index=vend,
-            tp_group=dist.group.WORLD,
-            inference_only=False,
-            cp_group=None,
+        ent_fused = _fused_vocab_parallel_entropy_from_hidden(
+            hidden,
+            weight_shard,
+            dist.group.WORLD,
             chunk_size=chunk_size,
-            lm_head_weight=fw,
-            return_entropy=True,  # NEW dual output
         )
-        # Entropy is per-position & target-independent: returned RAW [B, S] (NOT shifted/trimmed),
-        # so it lines up with the reference [B, S] directly.
         fwd_ent_ok = torch.allclose(ent_fused, ent_ref, atol=1e-4, rtol=1e-4)
         ent_dtype = str(ent_fused.dtype)
         ent_sum = float(ent_fused.detach().sum())  # for target-independence check across OOV
-
-        # ---- Backward entropy + logprob parity (the load-bearing new path) ----
-        # Stock combined backward: accumulate the logprob grad and the entropy grad on the SAME
-        # leaves (matches what the wrapper does: logprob -> policy loss, entropy -> entropy term).
-        s_h = hidden.detach().clone().requires_grad_(True)
-        s_w = weight_shard.detach().clone().requires_grad_(True)
-        lp_stock = from_parallel_logits_to_logprobs(
-            s_h @ s_w.t(),
-            target,
-            vocab_start_index=vstart,
-            vocab_end_index=vend,
-            tp_group=dist.group.WORLD,
-            inference_only=False,
-            cp_group=None,
-            chunk_size=chunk_size,
-        )
-        ent_stock = vocab_parallel_entropy(s_h @ s_w.t())
-        g_lp = torch.linspace(0.5, 1.5, steps=lp_stock.numel(), dtype=lp_stock.dtype).reshape(lp_stock.shape)
-        g_ent = torch.linspace(-0.7, 0.9, steps=ent_stock.numel(), dtype=ent_stock.dtype).reshape(ent_stock.shape)
-        torch.autograd.backward([lp_stock, ent_stock], [g_lp.clone(), g_ent.clone()])
-        gh_ref, gw_ref = s_h.grad.detach(), s_w.grad.detach()
-
-        # Fused dual-output backward: lp_fused is [B, S-1] (same trim as stock), ent_fused [B, S].
-        torch.autograd.backward([lp_fused, ent_fused], [g_lp.clone(), g_ent.clone()])
-        gh_fused, gw_fused = fh.grad.detach(), fw.grad.detach()
 
         ret_dict[rank] = {
             "fwd_ent_ok": bool(fwd_ent_ok),
             "ent_dtype": ent_dtype,
             "ent_sum": ent_sum,
-            "gh_ok": bool(torch.allclose(gh_fused, gh_ref, atol=1e-4, rtol=1e-4)),
-            "gw_ok": bool(torch.allclose(gw_fused, gw_ref, atol=1e-4, rtol=1e-4)),
             "fwd_ent_max_abs": float((ent_fused - ent_ref).abs().max()),
-            "gh_max_abs": float((gh_fused - gh_ref).abs().max()),
-            "gw_max_abs": float((gw_fused - gw_ref).abs().max()),
         }
     finally:
         model_utils.mpu.get_tensor_model_parallel_group = _orig_tp_group_accessor
@@ -316,7 +276,7 @@ def _run_entropy(world_size, chunk_size, with_oov):
 @pytest.mark.parametrize("chunk_size", [8, 1000])
 @pytest.mark.parametrize("with_oov", [False, True])
 def test_fused_entropy_matches_stock_vocab_parallel_entropy(world_size, chunk_size, with_oov):
-    """Fused per-token entropy (fwd + grad) matches stock ``vocab_parallel_entropy``.
+    """Fused per-token entropy metric matches stock ``vocab_parallel_entropy``.
 
     world_size=2 also exercises the entropy-specific all-reduce(SUM) of ``sum(softmax*logits)``
     that the fused entropy adds on top of the logprob path's MAX/SUM reductions, matching stock.
@@ -326,8 +286,6 @@ def test_fused_entropy_matches_stock_vocab_parallel_entropy(world_size, chunk_si
     for rank, r in results.items():
         assert r["ent_dtype"] == "torch.float32", r
         assert r["fwd_ent_ok"], f"entropy forward mismatch rank={rank}: {r}"
-        assert r["gh_ok"], f"entropy grad-hidden mismatch rank={rank}: {r}"
-        assert r["gw_ok"], f"entropy grad-weight mismatch rank={rank}: {r}"
 
 
 def test_fused_entropy_is_target_independent():
