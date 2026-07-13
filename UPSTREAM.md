@@ -57,14 +57,16 @@ Upstream remote: `https://github.com/NovaSky-AI/SkyRL.git` · sync target: **`up
 -->
 
 <!-- BEGIN AUTO:develop-delta -->
-_Last generated for `origin/main` (e17527a1) ↔ `HEAD` (8327e4fd); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
+_Last generated for `origin/main` (02700539) ↔ `HEAD` (ef991ff1); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
 
-`develop` is **64 commit(s)** ahead of `main`.
+`develop` is **66 commit(s)** ahead of `main`.
 
 ### Commits on `develop` not on `main`
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `ef991ff1` | ci(sync): preserve pre-pushed PR branches (#54) | dyurk-lila | 2026-07-13 |
+| `62393b91` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-07-09 |
 | `8327e4fd` | chore(sync): upstream e17527a1 (CONFLICTS — manual resolve)  | dyurk-lila | 2026-07-09 |
 | `23e475f6` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-07-08 |
 | `ac182bd2` | ci: add agent conflict resolver and ml.train e2e tests for u | dyurk-lila | 2026-07-08 |
@@ -152,10 +154,10 @@ _Last generated for `origin/main` (e17527a1) ↔ `HEAD` (8327e4fd); merge-base `
  .github/workflows/gpu_skyrl.yaml                   |    23 +-
  .github/workflows/gpu_skyrl_train_megatron.yaml    |     4 +-
  .../workflows/gpu_skyrl_train_old_inference.yaml   |    71 -
- .github/workflows/sync-upstream.yaml               |   616 +
+ .github/workflows/sync-upstream.yaml               |   654 +
  NOTICE                                             |    21 +
  README.md                                          |     3 -
- UPSTREAM.md                                        |   316 +
+ UPSTREAM.md                                        |   536 +
  ci/anyscale_gpu_ci_skyrl_train_old_inference.yaml  |    10 -
  ci/gpu_ci_run_skyrl_train.sh                       |    10 -
  ci/gpu_ci_run_skyrl_train_old_inference.sh         |    17 -
@@ -490,7 +492,7 @@ _Last generated for `origin/main` (e17527a1) ↔ `HEAD` (8327e4fd); merge-base `
  upstream-sync/bedrock-ci-setup.md                  |   106 +
  upstream-sync/gen_develop_delta.sh                 |   104 +
  uv.lock                                            | 13473 +++++++++----------
- 350 files changed, 23636 insertions(+), 17532 deletions(-)
+ 350 files changed, 23894 insertions(+), 17532 deletions(-)
 ```
 <!-- END AUTO:develop-delta -->
 
