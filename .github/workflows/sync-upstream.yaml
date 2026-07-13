@@ -81,7 +81,7 @@ jobs:
       target_sha: ${{ steps.fetch.outputs.target_sha }}
       short_sha: ${{ steps.fetch.outputs.short_sha }}
       candidate_sha: ${{ steps.merge.outputs.candidate_sha }}
-      pr_number: ${{ steps.conflict-pr.outputs.pull-request-number || steps.clean-pr.outputs.pull-request-number }}
+      pr_number: ${{ steps.sync_pr.outputs.pr_number }}
     steps:
       - name: Generate GitHub App token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
@@ -187,18 +187,6 @@ jobs:
           Do NOT auto-merge — see upstream-sync/02-recurring-workflow.md.
           EOF
 
-      - name: Open PR (clean)
-        id: clean-pr
-        if: env.UP_TO_DATE != '1' && steps.merge.outputs.result == 'clean'
-        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8
-        with:
-          token: ${{ steps.app-token.outputs.token }}
-          branch: ${{ steps.merge.outputs.branch }}
-          base: develop
-          title: "chore(sync): upstream ${{ steps.fetch.outputs.short_sha }}"
-          body-path: ${{ runner.temp }}/sync-pr-clean.md
-          labels: upstream-sync
-
       - name: Write conflict PR body
         if: env.UP_TO_DATE != '1' && steps.merge.outputs.result == 'conflict'
         run: |
@@ -216,18 +204,68 @@ jobs:
           Resolution rules: see 'Mandatory hotspot resolution rules' in upstream-sync/01-catch-up-plan.md. Never auto-merge.
           EOF
 
-      - name: Open DRAFT PR with conflict checklist
-        id: conflict-pr
-        if: env.UP_TO_DATE != '1' && steps.merge.outputs.result == 'conflict'
-        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8
+      - name: Open or update sync PR
+        id: sync_pr
+        if: env.UP_TO_DATE != '1'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          MERGE_RESULT: ${{ steps.merge.outputs.result }}
+          CLEAN_BODY_PATH: ${{ runner.temp }}/sync-pr-clean.md
+          CONFLICT_BODY_PATH: ${{ runner.temp }}/sync-pr-conflict.md
         with:
-          token: ${{ steps.app-token.outputs.token }}
-          branch: ${{ steps.merge.outputs.branch }}
-          base: develop
-          title: "chore(sync): upstream ${{ steps.fetch.outputs.short_sha }} (CONFLICTS — manual resolve)"
-          body-path: ${{ runner.temp }}/sync-pr-conflict.md
-          labels: upstream-sync
-          draft: always-true
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const fs = require("fs");
+            const { owner, repo } = context.repo;
+            const base = "develop";
+            const branch = process.env.BRANCH;
+            const result = process.env.MERGE_RESULT;
+            const conflict = result === "conflict";
+
+            if (!conflict && result !== "clean") {
+              throw new Error(`Unexpected merge result: ${result}`);
+            }
+
+            const title = conflict
+              ? `chore(sync): upstream ${process.env.SHORT_SHA} (CONFLICTS — manual resolve)`
+              : `chore(sync): upstream ${process.env.SHORT_SHA}`;
+            const bodyPath = conflict
+              ? process.env.CONFLICT_BODY_PATH
+              : process.env.CLEAN_BODY_PATH;
+            const body = fs.readFileSync(bodyPath, "utf8");
+            const head = `${owner}:${branch}`;
+
+            const existing = await github.rest.pulls.list({
+              owner, repo, base, head, state: "open",
+            });
+            let pull;
+            if (existing.data.length > 0) {
+              pull = (await github.rest.pulls.update({
+                owner,
+                repo,
+                pull_number: existing.data[0].number,
+                title,
+                body,
+              })).data;
+            } else {
+              pull = (await github.rest.pulls.create({
+                owner, repo, base, head: branch, title, body, draft: conflict,
+              })).data;
+            }
+
+            if (!pull?.number) {
+              throw new Error(`No open PR exists for ${branch} -> ${base}`);
+            }
+            try {
+              await github.rest.issues.addLabels({
+                owner, repo, issue_number: pull.number, labels: ["upstream-sync"],
+              });
+            } catch (error) {
+              core.warning(`Could not add upstream-sync label: ${error.message}`);
+            }
+            core.setOutput("pr_number", pull.number);
+            core.setOutput("pr_url", pull.html_url);
+            core.info(pull.html_url);
 
   agent-resolve-conflicts:
     needs: open-sync-pr
