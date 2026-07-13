@@ -57,14 +57,16 @@ Upstream remote: `https://github.com/NovaSky-AI/SkyRL.git` · sync target: **`up
 -->
 
 <!-- BEGIN AUTO:develop-delta -->
-_Last generated for `origin/main` (02700539) ↔ `HEAD` (ef991ff1); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
+_Last generated for `origin/main` (02700539) ↔ `HEAD` (f141d150); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
 
-`develop` is **66 commit(s)** ahead of `main`.
+`develop` is **68 commit(s)** ahead of `main`.
 
 ### Commits on `develop` not on `main`
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `f141d150` | [bugfix] Fused LM Head Compatibility with HybridModel (#53) | dyurk-lila | 2026-07-13 |
+| `1b3f2bc3` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-07-13 |
 | `ef991ff1` | ci(sync): preserve pre-pushed PR branches (#54) | dyurk-lila | 2026-07-13 |
 | `62393b91` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-07-09 |
 | `8327e4fd` | chore(sync): upstream e17527a1 (CONFLICTS — manual resolve)  | dyurk-lila | 2026-07-09 |
@@ -157,7 +159,7 @@ _Last generated for `origin/main` (02700539) ↔ `HEAD` (ef991ff1); merge-base `
  .github/workflows/sync-upstream.yaml               |   654 +
  NOTICE                                             |    21 +
  README.md                                          |     3 -
- UPSTREAM.md                                        |   536 +
+ UPSTREAM.md                                        |   538 +
  ci/anyscale_gpu_ci_skyrl_train_old_inference.yaml  |    10 -
  ci/gpu_ci_run_skyrl_train.sh                       |    10 -
  ci/gpu_ci_run_skyrl_train_old_inference.sh         |    17 -
@@ -342,6 +344,7 @@ _Last generated for `origin/main` (02700539) ↔ `HEAD` (ef991ff1); merge-base `
  .../integrations/skyrl_train/trainer.py            |     7 +-
  .../skyrl_train/distributed/fsdp_strategy.py       |    11 +-
  .../megatron/fused_linear_logprob_triton.py        |  1959 +++
+ .../distributed/megatron/fused_lm_head.py          |    95 +
  .../distributed/megatron/megatron_utils.py         |    65 +-
  .../distributed/megatron/model_utils.py            |   502 +
  .../skyrl_train/distributed/megatron/optimizer.py  |    15 +-
@@ -379,7 +382,7 @@ _Last generated for `origin/main` (02700539) ↔ `HEAD` (ef991ff1); merge-base `
  .../weight_sync/weight_extractor_utils.py          |     6 +-
  .../skyrl_train/weight_sync/weight_loader.py       |    25 -
  .../skyrl_train/workers/fsdp/fsdp_worker.py        |    23 +-
- .../workers/megatron/megatron_model_wrapper.py     |   290 +-
+ .../workers/megatron/megatron_model_wrapper.py     |   267 +-
  .../workers/megatron/megatron_worker.py            |    91 +-
  .../backends/skyrl_train/workers/model_wrapper.py  |     8 +-
  skyrl/backends/skyrl_train/workers/worker.py       |   225 +-
@@ -412,6 +415,7 @@ _Last generated for `origin/main` (02700539) ↔ `HEAD` (ef991ff1); merge-base `
  skyrl/utils/tok.py                                 |    32 +-
  .../cpu/megatron/test_fused_linear_logprob.py      |   330 +
  .../test_chunked_logprob_backward_streaming.py     |   260 +
+ .../skyrl_train/distributed/test_fused_lm_head.py  |   228 +
  .../distributed/test_optimizer_dtype_coercion.py   |   207 +
  .../skyrl_train/distributed/test_packing_utils.py  |    39 +
  .../distributed/test_preprocess_packed_seqs_cp.py  |    11 +-
@@ -492,7 +496,7 @@ _Last generated for `origin/main` (02700539) ↔ `HEAD` (ef991ff1); merge-base `
  upstream-sync/bedrock-ci-setup.md                  |   106 +
  upstream-sync/gen_develop_delta.sh                 |   104 +
  uv.lock                                            | 13473 +++++++++----------
- 350 files changed, 23894 insertions(+), 17532 deletions(-)
+ 352 files changed, 24196 insertions(+), 17532 deletions(-)
 ```
 <!-- END AUTO:develop-delta -->
 
