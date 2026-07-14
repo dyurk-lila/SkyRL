@@ -351,6 +351,9 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
         # Some async-specific validations
         assert (
+            self.cfg.trainer.fully_async.enabled
+        ), "trainer.fully_async.enabled must be True when using the fully async trainer."
+        assert (
             self.cfg.trainer.train_batch_size == self.cfg.trainer.policy_mini_batch_size
         ), "train_batch_size must equal policy_mini_batch_size for fully async training"
         assert (
@@ -552,9 +555,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     # A training step completed: count it for this epoch's bookkeeping.
                     trained_steps_this_epoch += 1
 
-                    # Advance the torch profiler schedule once per global step
-                    # (no-op unless profiling is enabled). One schedule step ==
-                    # one full async global step; the schedule decides which are recorded.
+                    # One profiler step per async global step.
                     self._profiler_step()
 
                     # 5. Set logs for this training step.
@@ -649,10 +650,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
                 # End of an epoch.
         finally:
-            # Always stop/flush the profiler when the loop exits -- including
-            # via an exception -- so the open kineto trace window isn't leaked.
-            # No-op when profiling is disabled.
             self._profiler_stop()
+
         pbar.close()
 
         if not stop_training:

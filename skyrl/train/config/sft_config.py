@@ -143,9 +143,7 @@ class SFTConfig(BaseConfig):
     """Save memory snapshots to ``{ckpt_path}/memory_snapshots/``.
     Visualize by dragging pickle files to https://docs.pytorch.org/memory_viz."""
     torch_profiler_config: TorchProfilerConfig = field(default_factory=TorchProfilerConfig)
-    """torch.profiler config (FSDP + Megatron). Set ``enable=true`` to capture
-    traces of the policy training step around the training loop; see
-    :class:`TorchProfilerConfig`."""
+    """torch.profiler config for policy training steps."""
 
     # ---- SFT-specific flat fields ----
     strategy: str = "megatron"  # "megatron" or "fsdp"
@@ -204,14 +202,25 @@ class SFTConfig(BaseConfig):
     # ---- Data loading ----
     num_workers: int = 8
     """Number of worker processes for parallel tokenization during dataset loading. Set to 0 for single-threaded."""
-    prefetch_data: bool = True
-    """Async double-buffer the per-step collate. When True, the CPU-side collate
-    for step N+1 runs on a single background thread while step N's
-    forward/backward runs on the GPU, hiding the collate latency. The collate is
-    deterministic within an epoch, so the prefetched batch is byte-identical to
-    the synchronous path; at an epoch boundary (data reshuffle) the prefetch is
-    skipped and the next batch is computed synchronously on the post-shuffle
-    order. Set to False to A/B against the serial data-loading path."""
+    async_batch_collation: bool = True
+    """Overlap the next stateful-dataloader batch with the current GPU step.
+
+    Checkpoint state remains pinned after the current batch. Set to False for
+    serial data loading."""
+
+    # ---- Dataloader / sampler ----
+    dataloader_num_workers: int = 0
+    """Number of worker processes for the training/eval ``StatefulDataLoader``. ``0`` loads in the main process."""
+    dataloader_persistent_workers: bool = False
+    """Keep dataloader workers alive across epochs. Only takes effect when ``dataloader_num_workers > 0``."""
+    sampler: str = "random"
+    """Training sampler: ``"random"`` (shuffle each epoch), ``"sequential"`` (in-order), or ``"custom"``
+    (load from ``sampler_class_path``)."""
+    sampler_class_path: Optional[str] = None
+    """Import path (``"module.path.ClassName"``) to a custom stateful sampler. Required when ``sampler='custom'``.
+    Instantiated as ``ClassName(tokenized, **sampler_kwargs)``."""
+    sampler_kwargs: dict = field(default_factory=dict)
+    """Keyword arguments forwarded to the custom sampler constructor."""
 
     # ---- Tokenized dataset caching ----
     cache_dir: str = os.path.join(
@@ -280,6 +289,7 @@ class SFTConfig(BaseConfig):
 
 
 _VALID_STRATEGIES = ("megatron", "fsdp")
+_VALID_SAMPLERS = ("random", "sequential", "custom")
 
 
 def validate_sft_cfg(cfg: SFTConfig) -> None:
@@ -316,6 +326,14 @@ def validate_sft_cfg(cfg: SFTConfig) -> None:
         raise ValueError(f"dummy_run_max_steps must be > 0, got {cfg.dummy_run_max_steps}")
     if cfg.max_training_steps is not None and cfg.max_training_steps <= 0:
         raise ValueError(f"max_training_steps must be > 0, got {cfg.max_training_steps}")
+
+    # Dataloader / sampler config
+    if cfg.sampler not in _VALID_SAMPLERS:
+        raise ValueError(f"Unknown sampler '{cfg.sampler}'. Must be one of {_VALID_SAMPLERS}.")
+    if cfg.sampler == "custom" and not cfg.sampler_class_path:
+        raise ValueError("sampler='custom' requires sampler_class_path to be set.")
+    if cfg.dataloader_num_workers < 0:
+        raise ValueError(f"dataloader_num_workers must be >= 0, got {cfg.dataloader_num_workers}")
 
     cfg.torch_profiler_config.validate()
 

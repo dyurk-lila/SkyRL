@@ -49,23 +49,18 @@ def compute_minibatch_rollout_logprob_diff_metrics(
     }
 
 
+# Reserved ``loss_fn_config`` key consumed before AlgorithmConfig validation.
+RETURN_PER_TOKEN_OUTPUTS_KEY = "return_per_token_outputs"
+
+
 def pop_return_per_token_outputs(
     loss_fn_config: Optional[Dict[str, Any]],
 ) -> Tuple[Optional[Dict[str, Any]], bool]:
-    """Pop the ``return_per_token_outputs`` flag (default ``True``) from a shallow copy of ``loss_fn_config``.
-
-    Args:
-        loss_fn_config: Optional per-call loss-function config overrides, or ``None``.
-
-    Returns:
-        ``(loss_fn_config, return_per_token_outputs)`` where ``loss_fn_config`` is a
-        fresh copy with ``return_per_token_outputs`` removed when the input was not
-        ``None``, otherwise the original ``None``.
-    """
+    """Return a copied config and whether per-token outputs should be built."""
     if loss_fn_config is None:
         return None, True
     loss_fn_config = dict(loss_fn_config)
-    return loss_fn_config, loss_fn_config.pop("return_per_token_outputs", True)
+    return loss_fn_config, loss_fn_config.pop(RETURN_PER_TOKEN_OUTPUTS_KEY, True)
 
 
 def reduce_metrics(metrics: Dict[str, List[float]], sum_loss_metrics: bool = False) -> Dict[str, float]:

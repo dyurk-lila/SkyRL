@@ -16,10 +16,10 @@ from loguru import logger
 from omegaconf import OmegaConf
 from ray import ObjectRef
 from ray.util.placement_group import (
-    PlacementGroupSchedulingStrategy,
     placement_group,
     placement_group_table,
 )
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedModel
@@ -234,9 +234,7 @@ class Worker(DistributedTorchRayActor):
         super().__init__(*args, **kwargs)
         self.cfg = cfg
         self._transfer_strategy_cls = None  # Set in init_weight_transfer_communicator
-        # torch.profiler wrapper. Constructed in ``init_model`` when
-        # ``policy.torch_profiler_config.enable`` is set; driven by the trainer
-        # via the start_profile/profile_step/stop_profile RPCs below.
+        # Populated by init_model when torch profiling is enabled.
         self.profiler = None
 
         if self.cfg.algorithm.temperature is None:
@@ -298,14 +296,7 @@ class Worker(DistributedTorchRayActor):
             setattr(self.cfg.algorithm, key, value)
 
     # ------------------------------------------------------------------
-    # torch.profiler control RPCs (dispatched by the trainer via "pass_through").
-    #
-    # These live on the shared Worker base so they're on the snapshotted Ray
-    # actor method table of every PolicyWorker (Megatron + FSDP) without a
-    # subclass. They no-op when ``self.profiler`` is None (profiling disabled
-    # or rank not selected), so the trainer can call them on every step. The
-    # ``Profiler`` itself is exception-isolated; these are an extra guard so a
-    # profiler fault can never abort a training step.
+    # torch.profiler RPCs, dispatched via WorkerDispatch pass_through.
     # ------------------------------------------------------------------
 
     def start_profile(self) -> None:
@@ -314,12 +305,7 @@ class Worker(DistributedTorchRayActor):
             self.profiler.start()
 
     def profile_step(self) -> None:
-        """Advance the profiler schedule by one global step (no-op when disabled).
-
-        Call exactly once per global step. ``torch.profiler``'s schedule decides
-        which steps are actually recorded; trace files are written automatically
-        at the close of each active window.
-        """
+        """Advance the profiler schedule by one global step."""
         if self.profiler is not None:
             self.profiler.step()
 
@@ -329,22 +315,7 @@ class Worker(DistributedTorchRayActor):
             self.profiler.stop()
 
     def dump_profiler_summary(self):
-        """Return this rank's last-window kernel self-time summary, or None.
-
-        Pickle-safe dict (``{"window_count", "pairs": [(name, self_us), ...]}``)
-        or None when profiling is disabled / no profiler on this rank. The
-        low-level per-kernel attribution data path for downstream consumers; the
-        trace files remain the high-level (HTA) source.
-
-        NOTE: SkyRL itself does not call this RPC (or ``get_kernel_summary``) in
-        its own training loop -- the high-level trace files are SkyRL's
-        deliverable. This is a deliberately-provided forward-looking API for
-        downstream consumers that want per-kernel self-time attribution without
-        re-parsing the on-disk trace. Keep it wired end-to-end (Profiler ->
-        Worker -> WorkerDispatch) so such a consumer needs only to call
-        ``dispatch.dump_profiler_summary("policy")``; do not remove it as
-        "dead code".
-        """
+        """Return this rank's last-window kernel summary, or None."""
         return self.profiler.get_kernel_summary() if self.profiler is not None else None
 
     def _get_module_for_offload(self):
@@ -868,7 +839,9 @@ class PolicyWorkerBase(Worker):
             loss_fn: Optional train loss function name to use instead of config default.
                 Public Tinker aliases such as ``ppo`` should be normalized by the backend
                 before reaching the worker.
-            loss_fn_config: Optional config overrides for the resolved train loss function
+            loss_fn_config: Optional config overrides for the resolved train loss function.
+                May include reserved key ``return_per_token_outputs`` to skip
+                per-token ``loss_fn_outputs`` when callers read only ``metrics``.
 
         Returns:
             Metrics dict for the worker's local micro batch
@@ -898,7 +871,7 @@ class PolicyWorkerBase(Worker):
             # Fall back to config default
             current_loss_fn = self.policy_loss_fn
 
-        # Pop the per-request flag that gates the per-token loss_fn_outputs build.
+        # Consume the reserved gate before merging AlgorithmConfig overrides.
         loss_fn_config, return_per_token_outputs = pop_return_per_token_outputs(loss_fn_config)
 
         # Build config for loss function, applying any overrides
@@ -943,24 +916,15 @@ class PolicyWorkerBase(Worker):
             loss = unscaled_loss * microbatch_weight
             self.strategy.backward(loss, self.model, self.optimizer)
 
-            # Build per-sequence loss_fn_outputs (per-token logprobs + NLL) for consumers
-            # that read them (Tinker API, RL). When the caller opts out
-            # (``return_per_token_outputs=False``, e.g. SkyRL's SFTTrainer which reads
-            # only ``metrics``), skip the per-token NLL, the two detached [mb, seq] D2H
-            # copies, and the ``.tolist()`` loop, returning one empty dict per sequence.
-            # The ``loss_fn_output_type`` tag carried by the WorkerOutput is unaffected.
+            # Only build per-token outputs for callers that consume them.
             if return_per_token_outputs:
-                # Compute elementwise loss for Tinker API (per-token NLL)
+                # Tinker consumes per-token NLL.
                 with torch.no_grad():
                     elementwise_loss = -action_log_probs
                     if loss_mask is not None:
                         elementwise_loss = elementwise_loss * loss_mask
 
-                # Build per-sequence loss_fn_outputs (matches Tinker's ForwardBackwardOutput structure)
-                # Trim to actual response length per sample (Tinker expects variable-length arrays
-                # that align with the input weights, not padded to batch max).
-                # Compute valid_lens vectorized on GPU, then move tensors to CPU exactly
-                # once before iterating in Python — avoids ~3N GPU->CPU syncs per micro-batch.
+                # Trim each sample with one CPU transfer per tensor.
                 batch_size = action_log_probs.shape[0]
                 seq_len = action_log_probs.shape[1]
                 if action_mask is not None:
@@ -970,7 +934,6 @@ class PolicyWorkerBase(Worker):
                 else:
                     valid_lens_t = torch.full((batch_size,), seq_len, device=action_log_probs.device, dtype=torch.long)
 
-                # Bulk GPU->CPU sync: one transfer for logprobs, elementwise_loss, and valid_lens.
                 action_log_probs_cpu = action_log_probs.detach().cpu()
                 elementwise_loss_cpu = elementwise_loss.detach().cpu()
                 valid_lens = valid_lens_t.cpu().tolist()
@@ -1153,6 +1116,13 @@ class PolicyWorkerBase(Worker):
         Runs the model + loss under ``torch.no_grad()`` (no backward, no KL/entropy terms),
         and returns the same metrics shape as the SFT branch of ``_forward_backward_micro``,
         minus ``lr`` (no optimizer state involved).
+
+        Args:
+            experience: Experience object for one micro batch.
+            loss_fn: Eval loss function name (e.g., "cross_entropy").
+            loss_fn_config: Optional config overrides for the resolved loss function.
+                May include reserved key ``return_per_token_outputs`` to skip
+                per-token ``loss_fn_outputs`` when callers read only ``metrics``.
         """
         self.model.eval()
         experience.to_device(torch.cuda.current_device())
@@ -1168,7 +1138,7 @@ class PolicyWorkerBase(Worker):
 
         current_loss_fn = PolicyLossRegistry.get(loss_fn)
 
-        # Pop the per-request flag that gates the per-token loss_fn_outputs build.
+        # Consume the reserved gate before merging AlgorithmConfig overrides.
         loss_fn_config, return_per_token_outputs = pop_return_per_token_outputs(loss_fn_config)
 
         # Build config for loss function, applying any overrides
@@ -1200,19 +1170,13 @@ class PolicyWorkerBase(Worker):
                 rollout_logprobs=rollout_action_logprobs,
             )
 
-            # Build per-sequence loss_fn_outputs (per-token logprobs + NLL) only when
-            # the caller consumes them. SkyRL's SFTTrainer eval path opts out
-            # (``return_per_token_outputs=False``) since it reads only ``metrics``,
-            # skipping the per-token NLL, two detached [mb, seq] D2H copies, and the
-            # ``.tolist()`` loop. The Tinker/RL forward contract is unchanged by default.
+            # Only build per-token outputs for callers that consume them.
             if return_per_token_outputs:
                 elementwise_loss = -action_log_probs
                 if loss_mask is not None:
                     elementwise_loss = elementwise_loss * loss_mask
 
-                # Compute valid_lens vectorized on GPU, then move tensors to CPU
-                # exactly once before iterating in Python. Avoids ~3N GPU->CPU syncs
-                # per micro-batch (item()/cpu()/tolist() inside the per-sample loop).
+                # Trim each sample with one CPU transfer per tensor.
                 batch_size = action_log_probs.shape[0]
                 seq_len = action_log_probs.shape[1]
                 if action_mask is not None:
@@ -1222,7 +1186,6 @@ class PolicyWorkerBase(Worker):
                 else:
                     valid_lens_t = torch.full((batch_size,), seq_len, device=action_log_probs.device, dtype=torch.long)
 
-                # Bulk GPU->CPU sync: one transfer for logprobs, elementwise_loss, and valid_lens.
                 action_log_probs_cpu = action_log_probs.detach().cpu()
                 elementwise_loss_cpu = elementwise_loss.detach().cpu()
                 valid_lens = valid_lens_t.cpu().tolist()

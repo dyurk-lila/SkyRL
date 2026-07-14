@@ -337,6 +337,65 @@ def test_cross_field_defaults():
     )  # same as `generator.sampling_params.max_generate_length`
 
 
+def test_fake_int4_qat_defaults():
+    """Defaults must stay pinned to the llm-compressor RTN convention, disabled."""
+    cfg = SkyRLTrainConfig.from_cli_overrides([])
+    fq = cfg.trainer.policy.model.fake_int4_qat
+    assert fq.enabled is False
+    assert fq.group_size == 32
+    assert fq.scale_divisor == 7.5
+    assert fq.q_min == -8.0
+    assert fq.bf16_base_path is None
+
+
+def test_fake_int4_qat_cli_overrides():
+    """All convention knobs must be settable from the CLI (the Kimi K2.x convention)."""
+    cfg = SkyRLTrainConfig.from_cli_overrides(
+        [
+            "trainer.strategy=megatron",
+            "trainer.policy.model.lora.rank=32",
+            "trainer.policy.megatron_config.lora_config.merge_lora=false",
+            "trainer.policy.model.fake_int4_qat.enabled=true",
+            "trainer.policy.model.fake_int4_qat.group_size=32",
+            "trainer.policy.model.fake_int4_qat.scale_divisor=7.0",
+            "trainer.policy.model.fake_int4_qat.q_min=-7",
+            "trainer.policy.model.fake_int4_qat.bf16_base_path=/data/bf16-dump",
+        ]
+    )
+    fq = cfg.trainer.policy.model.fake_int4_qat
+    assert fq.enabled is True
+    assert fq.scale_divisor == 7.0
+    assert fq.q_min == -7.0
+    assert fq.bf16_base_path == "/data/bf16-dump"
+
+
+def test_fake_int4_qat_requires_lora():
+    with pytest.raises(AssertionError, match="currently requires LoRA"):
+        SkyRLTrainConfig.from_cli_overrides(["trainer.policy.model.fake_int4_qat.enabled=true"])
+
+
+def test_fake_int4_qat_requires_megatron():
+    with pytest.raises(AssertionError, match="strategy=megatron"):
+        SkyRLTrainConfig.from_cli_overrides(
+            [
+                "trainer.policy.model.lora.rank=32",
+                "trainer.policy.megatron_config.lora_config.merge_lora=false",
+                "trainer.policy.model.fake_int4_qat.enabled=true",
+            ]
+        )
+
+
+def test_fake_int4_qat_requires_unmerged_lora_sync():
+    with pytest.raises(AssertionError, match="merge_lora=False"):
+        SkyRLTrainConfig.from_cli_overrides(
+            [
+                "trainer.strategy=megatron",
+                "trainer.policy.model.lora.rank=32",
+                "trainer.policy.model.fake_int4_qat.enabled=true",
+            ]
+        )
+
+
 class TestTrainerUseSamplePackingAlias:
     """`trainer.use_sample_packing` is a deprecated alias for `trainer.remove_microbatch_padding`
     on the RL entrypoint config (mirrors the ``fsdp2``->``fsdp`` alias)."""
@@ -425,23 +484,19 @@ class TestMaxSeqLenValidation:
 
 
 class TestTorchProfilerConfigValidation:
-    """``TorchProfilerConfig.validate()`` rejects unusable profiler settings up
-    front (so an enabled run fails fast instead of silently degrading), and is a
-    no-op when profiling is disabled."""
+    """TorchProfilerConfig validation coverage."""
 
     @staticmethod
     def _cfg(**overrides):
         from skyrl.train.config.config import TorchProfilerConfig
 
-        # `save_path` is required when enabled; supply a valid local default so
-        # tests targeting *other* fields don't trip the save_path guard.
+        # Valid default for tests targeting other fields.
         overrides.setdefault("save_path", "/tmp/skyrl_prof_test")
         return TorchProfilerConfig(enable=True, **overrides)
 
     def test_disabled_skips_all_checks(self):
         from skyrl.train.config.config import TorchProfilerConfig
 
-        # Garbage values must be tolerated while disabled (the default state).
         TorchProfilerConfig(
             enable=False, export_type="bogus", activities=["gpu"], ranks=[], active=0, save_path=None
         ).validate()
@@ -454,14 +509,12 @@ class TestTorchProfilerConfigValidation:
             self._cfg(ranks=[]).validate()
 
     def test_missing_save_path_rejected(self):
-        # save_path has no implicit default; an enabled run must set it explicitly.
         with pytest.raises(ValueError, match=r"save_path.*must be set"):
             self._cfg(save_path=None).validate()
         with pytest.raises(ValueError, match=r"save_path.*must be set"):
             self._cfg(save_path="").validate()
 
     def test_cloud_save_path_rejected(self):
-        # torch.profiler can only write the local filesystem; cloud URIs fail fast.
         for uri in ("s3://bucket/run/traces", "gs://bucket/run/traces", "gcs://bucket/run/traces"):
             with pytest.raises(ValueError, match=r"save_path.*local path"):
                 self._cfg(save_path=uri).validate()
@@ -471,8 +524,6 @@ class TestTorchProfilerConfigValidation:
             self._cfg(activities=["cpu", "gpu"]).validate()
 
     def test_empty_activities_rejected(self):
-        # An empty list profiles nothing; the membership check would pass it
-        # vacuously, so it needs its own guard.
         with pytest.raises(ValueError, match=r"activities.*non-empty"):
             self._cfg(activities=[]).validate()
 
@@ -486,7 +537,6 @@ class TestTorchProfilerConfigValidation:
     def test_stacks_requires_with_stack(self):
         with pytest.raises(ValueError, match=r"with_stack"):
             self._cfg(export_type="stacks", with_stack=False).validate()
-        # With with_stack=True it is accepted.
         self._cfg(export_type="stacks", with_stack=True).validate()
 
     def test_negative_schedule_field_rejected(self):
@@ -498,7 +548,6 @@ class TestTorchProfilerConfigValidation:
             self._cfg(active=0).validate()
 
     def test_validate_cfg_invokes_profiler_validation(self):
-        # The RL entrypoint validator must surface profiler config errors.
         cfg = _make_validated_test_config()
         cfg.trainer.policy.torch_profiler_config.enable = True
         cfg.trainer.policy.torch_profiler_config.save_path = "/tmp/skyrl_prof_test"
@@ -506,40 +555,29 @@ class TestTorchProfilerConfigValidation:
         with pytest.raises(ValueError, match=r"export_type"):
             validate_cfg(cfg)
 
-    # -- FSDP swap-offload incompatibility (cross-field) --------------------------
-    # The FSDP2 manual CPU-offload path moves params via torch.utils.swap_tensors,
-    # which crashes mid-run ("Couldn't swap <param>") while the profiler holds
-    # weakrefs to those params. That offload only fires under colocation; Megatron
-    # and fsdp cpu_offload=true use non-swap paths and are safe.
+    # FSDP manual-offload incompatibility.
 
     def test_fsdp_colocate_all_manual_offload_rejected(self):
         with pytest.raises(ValueError, match=r"Couldn't swap"):
             self._cfg().validate(strategy="fsdp", colocate_all=True, colocate_policy_ref=True, fsdp_cpu_offload=False)
 
     def test_fsdp_colocate_policy_ref_only_rejected(self):
-        # colocate_policy_ref alone still offloads the policy/ref pair mid-loop.
         with pytest.raises(ValueError, match=r"Couldn't swap"):
             self._cfg().validate(strategy="fsdp", colocate_all=False, colocate_policy_ref=True, fsdp_cpu_offload=False)
 
     def test_fsdp_no_colocation_allowed(self):
-        # No colocation -> no in-loop offload -> safe.
         self._cfg().validate(strategy="fsdp", colocate_all=False, colocate_policy_ref=False, fsdp_cpu_offload=False)
 
     def test_fsdp_native_cpu_offload_allowed(self):
-        # cpu_offload=true uses FSDP2-native offload (no manual swap_tensors) -> safe.
         self._cfg().validate(strategy="fsdp", colocate_all=True, colocate_policy_ref=True, fsdp_cpu_offload=True)
 
     def test_megatron_colocation_allowed(self):
-        # Megatron offloads via flat-buffer/.data reassignment (no swap_tensors) -> safe.
         self._cfg().validate(strategy="megatron", colocate_all=True, colocate_policy_ref=True, fsdp_cpu_offload=False)
 
     def test_offload_check_skipped_without_context(self):
-        # Called with no context (e.g. the SFT path), the cross-field check is skipped.
         self._cfg().validate()
 
     def test_validate_cfg_rejects_profiler_under_default_colocation(self):
-        # End-to-end: the default config is fsdp + colocate_all + cpu_offload=false,
-        # so simply enabling the profiler must fail fast through validate_cfg.
         cfg = _make_validated_test_config()
         cfg.trainer.policy.torch_profiler_config.enable = True
         cfg.trainer.policy.torch_profiler_config.save_path = "/tmp/skyrl_prof_test"
@@ -551,4 +589,4 @@ class TestTorchProfilerConfigValidation:
         cfg.trainer.policy.torch_profiler_config.enable = True
         cfg.trainer.policy.torch_profiler_config.save_path = "/tmp/skyrl_prof_test"
         cfg.trainer.policy.fsdp_config.cpu_offload = True
-        validate_cfg(cfg)  # must not raise on the profiler/offload check
+        validate_cfg(cfg)

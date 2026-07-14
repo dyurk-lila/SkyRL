@@ -191,36 +191,21 @@ class RayPPOTrainer:
 
     @property
     def _torch_profiler_enabled(self) -> bool:
-        """Whether the trainer should drive the torch profiler on policy workers.
-        Gates all profiler RPC dispatch so non-profiling runs pay nothing."""
+        """Whether to dispatch policy profiler RPCs."""
         return self.cfg.trainer.policy.torch_profiler_config.enable
 
     def _profiler_start(self) -> None:
-        """Arm the torch profiler on the policy workers before the training loop.
-
-        No-op unless profiling is enabled. Shared by every trainer flavor
-        (sync / fully-async / one-step async) so the driving logic lives in one
-        place; subclasses that override ``train()`` call this at loop start.
-        """
+        """Start policy profiling when enabled."""
         if self._torch_profiler_enabled:
             self.dispatch.start_profile("policy")
 
     def _profiler_step(self) -> None:
-        """Advance the torch profiler schedule once per global step.
-
-        No-op unless profiling is enabled. One call == one full global step
-        (not per minibatch); the torch schedule decides which steps are
-        recorded. Call exactly once per global step from every ``train()``.
-        """
+        """Advance policy profiling by one global step."""
         if self._torch_profiler_enabled:
             self.dispatch.profile_step("policy")
 
     def _profiler_stop(self) -> None:
-        """Stop/flush the torch profiler after the training loop.
-
-        No-op unless profiling is enabled. Call from a ``finally`` so an open
-        kineto trace window isn't leaked when the loop raises.
-        """
+        """Stop policy profiling when enabled."""
         if self._torch_profiler_enabled:
             self.dispatch.stop_profile("policy")
 
@@ -246,6 +231,11 @@ class RayPPOTrainer:
 
         The eval metrics are recorded after having finished training `self.global_step` steps.
         Metrics recorded in global_step 0 corresponds to evaluations before training.
+
+        Args:
+            vllm_metrics_scraper: when provided, the eval loop calls
+                ``resume()``/``pause()`` around each generation so the scraper
+                attributes only generation time to the open ``vllm/eval`` window.
 
         Returns:
             A dictionary of evaluation metrics.
@@ -321,7 +311,6 @@ class RayPPOTrainer:
         # as well as hf model at step end
         will_save_ckpts = False
         hf_model_save = False
-
         self._profiler_start()
         try:
             for epoch in range(start_epoch, self.cfg.trainer.epochs):
@@ -335,6 +324,10 @@ class RayPPOTrainer:
                     if not step_started:
                         self._fire("on_step_start")
                         step_started = True
+                        # Open the train-rollout metrics window once per logical
+                        # step; paused so only the generation spans count toward the
+                        # throughput denominator (dynamic sampling may generate more
+                        # than once before the step completes).
                         if self._vllm_metrics_scraper is not None:
                             await self._vllm_metrics_scraper.start("vllm/train")
                             self._vllm_metrics_scraper.pause()
@@ -379,6 +372,9 @@ class RayPPOTrainer:
                             # if we are not continuing sampling, we sleep the inference engine
                             await self.inference_engine_client.sleep()
 
+                        # The train rollout for this step is done generating; close
+                        # its metrics window. ``vllm/eval/*`` is collected separately
+                        # around eval below.
                         vllm_metrics: Dict[str, float] = {}
                         if self._vllm_metrics_scraper is not None:
                             vllm_metrics = await self._vllm_metrics_scraper.stop()
@@ -432,10 +428,8 @@ class RayPPOTrainer:
                         with Timer("train_critic_and_policy", self.all_timings):
                             status = self.train_critic_and_policy(training_input)
 
-                        # Advance the torch profiler schedule once per global step
-                        # (no-op unless profiling is enabled). One schedule step ==
-                        # one full RL global step; the schedule decides which are recorded.
-                        self._profiler_step()
+                            # One profiler step per RL global step.
+                            self._profiler_step()
 
                         self._fire("on_step_end", batch=training_input, metrics=status)
                         step_started = False
@@ -493,6 +487,8 @@ class RayPPOTrainer:
                         or self.global_step == self.total_training_steps
                     )
                     if force_eval or interval_eval:
+                        # Open the eval-rollout window; the scraper itself measures
+                        # the generation spans via resume()/pause() inside eval().
                         if self._vllm_metrics_scraper is not None:
                             await self._vllm_metrics_scraper.start("vllm/eval")
                             self._vllm_metrics_scraper.pause()
@@ -507,6 +503,8 @@ class RayPPOTrainer:
                     log_payload = {
                         **self.all_metrics,
                         **{f"timing/{k}": v for k, v in self.all_timings.items()},
+                        # vllm/train/* = train rollout, vllm/eval/* = eval rollout,
+                        # each over its own generation time (owned by the scraper).
                         **vllm_metrics,
                     }
 
@@ -541,9 +539,6 @@ class RayPPOTrainer:
                 if stop_training:
                     break
         finally:
-            # Always stop/flush the profiler when the training loop exits --
-            # including via an exception -- so the open kineto trace window
-            # isn't leaked. No-op when profiling is disabled.
             self._profiler_stop()
 
         pbar.close()
