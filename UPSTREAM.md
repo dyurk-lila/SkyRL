@@ -57,14 +57,16 @@ Upstream remote: `https://github.com/NovaSky-AI/SkyRL.git` · sync target: **`up
 -->
 
 <!-- BEGIN AUTO:develop-delta -->
-_Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (112462c6); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
+_Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (26b4faad); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
 
-`develop` is **76 commit(s)** ahead of `main`.
+`develop` is **78 commit(s)** ahead of `main`.
 
 ### Commits on `develop` not on `main`
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `26b4faad` | refactor(inference): expose reusable remote generator (#63) | dyurk-lila | 2026-07-20 |
+| `82e07b7c` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-07-20 |
 | `112462c6` | perf(r3): limit route expansion to local layers (#58) | dyurk-lila | 2026-07-20 |
 | `ddc6dc69` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-07-20 |
 | `081166d6` | perf(r3): accelerate routed-expert JSON transport (#57) | dyurk-lila | 2026-07-20 |
@@ -168,7 +170,7 @@ _Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (112462c6); merge-base `
  .github/workflows/sync-upstream.yaml               |  654 ++++
  NOTICE                                             |   21 +
  README.md                                          |    3 -
- UPSTREAM.md                                        |  593 +++
+ UPSTREAM.md                                        |  595 +++
  ci/anyscale_gpu_ci.yaml                            |    4 +-
  ci/anyscale_gpu_ci_h100.yaml                       |    4 +-
  ci/anyscale_gpu_ci_skyrl_train.yaml                |    4 +-
@@ -396,7 +398,7 @@ _Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (112462c6); merge-base `
  .../skyrl_train/inference_servers/engine_utils.py  |   89 +
  .../inference_servers/layerwise_reload.py          |  113 +-
  .../inference_servers/new_inference_worker_wrap.py |   12 +-
- .../inference_servers/remote_inference_client.py   |   65 +-
+ .../inference_servers/remote_inference_client.py   |  325 +-
  .../inference_servers/routed_experts_wire.py       |   45 +
  .../skyrl_train/inference_servers/server_group.py  |    6 +-
  .../skyrl_train/inference_servers/setup.py         |    7 +-
@@ -502,7 +504,7 @@ _Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (112462c6); merge-base `
  .../skyrl_train/inference_engines/vllm/__init__.py |    0
  .../skyrl_train/inference_engines/vllm/utils.py    |   24 -
  .../inference_servers/test_build_vllm_cli_args.py  |   19 +-
- .../test_remote_inference_client.py                |   78 +
+ .../test_remote_inference_client.py                |   84 +-
  .../inference_servers/test_routed_experts_wire.py  |   92 +
  tests/backends/skyrl_train/test_fake_int4_qat.py   |  161 +
  .../skyrl_train/test_token_based_batching_utils.py |   12 +
@@ -549,7 +551,7 @@ _Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (112462c6); merge-base `
  upstream-sync/bedrock-ci-setup.md                  |  106 +
  upstream-sync/gen_develop_delta.sh                 |  104 +
  uv.lock                                            | 3778 +++++++++-----------
- 397 files changed, 21952 insertions(+), 13188 deletions(-)
+ 397 files changed, 22102 insertions(+), 13306 deletions(-)
 ```
 <!-- END AUTO:develop-delta -->
 
