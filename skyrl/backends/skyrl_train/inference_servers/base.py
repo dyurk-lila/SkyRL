@@ -31,6 +31,7 @@ class InferenceEngineInput(TypedDict):
     sampling_params: Optional[Dict[str, Any]]
     session_ids: Optional[List[Hashable]]
     mm_features: Optional[List[MultiModalFeatures]]
+    routed_experts_prompt_starts: Optional[List[int]]
 
 
 class InferenceEngineOutput(TypedDict):
