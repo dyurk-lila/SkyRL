@@ -57,14 +57,16 @@ Upstream remote: `https://github.com/NovaSky-AI/SkyRL.git` · sync target: **`up
 -->
 
 <!-- BEGIN AUTO:develop-delta -->
-_Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (250cdd85); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
+_Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (081166d6); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
 
-`develop` is **72 commit(s)** ahead of `main`.
+`develop` is **74 commit(s)** ahead of `main`.
 
 ### Commits on `develop` not on `main`
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `081166d6` | perf(r3): accelerate routed-expert JSON transport (#57) | dyurk-lila | 2026-07-20 |
+| `f475788e` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-07-20 |
 | `250cdd85` | fix(r3): align routed-expert metadata and padding (#56) | dyurk-lila | 2026-07-20 |
 | `63fbf69f` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-07-14 |
 | `ded01538` | chore(sync): upstream 02700539 (CONFLICTS — manual resolve)  | lila-ci-bot[bot] | 2026-07-14 |
@@ -164,7 +166,7 @@ _Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (250cdd85); merge-base `
  .github/workflows/sync-upstream.yaml               |  654 ++++
  NOTICE                                             |   21 +
  README.md                                          |    3 -
- UPSTREAM.md                                        |  577 +++
+ UPSTREAM.md                                        |  589 +++
  ci/anyscale_gpu_ci.yaml                            |    4 +-
  ci/anyscale_gpu_ci_h100.yaml                       |    4 +-
  ci/anyscale_gpu_ci_skyrl_train.yaml                |    4 +-
@@ -363,7 +365,7 @@ _Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (250cdd85); merge-base `
  .../arctic_rl/examples/run_gsm8k_grpo_4gpu.sh      |   94 +
  integrations/arctic_rl/generator.py                |  178 +
  integrations/arctic_rl/trainer.py                  |  853 +++++
- pyproject.toml                                     |   69 +-
+ pyproject.toml                                     |   71 +-
  skyrl-agent/examples/run_skyrl/run_skyrl_swe.sh    |    1 -
  .../examples/run_skyrl/skyrl_web_research_hle.sh   |    1 -
  skyrl-agent/pyproject.toml                         |    2 +-
@@ -388,15 +390,16 @@ _Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (250cdd85); merge-base `
  .../skyrl_train/inference_engines/vllm/utils.py    |   33 -
  .../inference_engines/vllm/vllm_engine.py          |  776 ----
  .../inference_engines/vllm/vllm_server.py          |  164 -
- .../base.py                                        |  107 +-
+ .../base.py                                        |  111 +-
  .../skyrl_train/inference_servers/engine_utils.py  |   89 +
  .../inference_servers/layerwise_reload.py          |  113 +-
  .../inference_servers/new_inference_worker_wrap.py |   12 +-
- .../inference_servers/remote_inference_client.py   |   43 +-
+ .../inference_servers/remote_inference_client.py   |   65 +-
+ .../inference_servers/routed_experts_wire.py       |   45 +
  .../skyrl_train/inference_servers/server_group.py  |    6 +-
  .../skyrl_train/inference_servers/setup.py         |    7 +-
  .../skyrl_train/inference_servers/utils.py         |    4 +-
- .../inference_servers/vllm_server_actor.py         |  181 +-
+ .../inference_servers/vllm_server_actor.py         |  203 +-
  .../skyrl_train/inference_servers/vllm_worker.py   |  127 -
  skyrl/backends/skyrl_train/training_batch.py       |   17 +-
  skyrl/backends/skyrl_train/utils/io/io.py          |   34 +
@@ -428,7 +431,7 @@ _Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (250cdd85); merge-base `
  skyrl/train/config/config.py                       |  338 +-
  skyrl/train/config/sft_config.py                   |   34 +
  skyrl/train/dataset/collators.py                   |  106 +-
- skyrl/train/dataset/preprocess.py                  |  197 +-
+ skyrl/train/dataset/preprocess.py                  |  214 +-
  skyrl/train/dataset/replay_buffer.py               |    7 +-
  skyrl/train/dataset/samplers.py                    |   84 +
  skyrl/train/entrypoints/main_base.py               |  139 +-
@@ -436,17 +439,17 @@ _Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (250cdd85); merge-base `
  skyrl/train/entrypoints/serve.py                   |   11 +-
  skyrl/train/evaluate.py                            |   32 +-
  skyrl/train/fully_async_trainer.py                 |  353 +-
- skyrl/train/generators/base.py                     |    2 +-
- skyrl/train/generators/skyrl_gym_generator.py      |   45 +-
+ skyrl/train/generators/base.py                     |    5 +-
+ skyrl/train/generators/skyrl_gym_generator.py      |   61 +-
  skyrl/train/generators/skyrl_vlm_generator.py      |    8 +-
  skyrl/train/generators/utils.py                    |   20 +-
  skyrl/train/sft_trainer.py                         |  814 +++--
- skyrl/train/trainer.py                             |  459 ++-
+ skyrl/train/trainer.py                             |  463 ++-
  skyrl/train/utils/async_batch_collator.py          |   58 +
  skyrl/train/utils/trainer_utils.py                 |   45 +-
  skyrl/train/utils/utils.py                         |   82 +-
  skyrl/train/utils/vllm_metrics_scraper.py          |  164 +-
- skyrl/utils/routed_experts.py                      |   14 +
+ skyrl/utils/routed_experts.py                      |   48 +
  skyrl/utils/tok.py                                 |   32 +-
  skyrl/utils/token_metadata.py                      |  204 ++
  .../backends/skyrl_train/_fake_int4_qat_golden.py  |   36 +
@@ -497,7 +500,8 @@ _Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (250cdd85); merge-base `
  .../skyrl_train/inference_engines/vllm/__init__.py |    0
  .../skyrl_train/inference_engines/vllm/utils.py    |   24 -
  .../inference_servers/test_build_vllm_cli_args.py  |   19 +-
- .../test_remote_inference_client.py                |   30 +
+ .../test_remote_inference_client.py                |   78 +
+ .../inference_servers/test_routed_experts_wire.py  |   92 +
  tests/backends/skyrl_train/test_fake_int4_qat.py   |  161 +
  .../skyrl_train/test_token_based_batching_utils.py |   12 +
  tests/backends/skyrl_train/test_train_batch.py     |   16 +-
@@ -514,9 +518,9 @@ _Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (250cdd85); merge-base `
  tests/tinker/test_engine.py                        |    9 +
  tests/train/algorithms/test_losses.py              |  101 +
  tests/train/algorithms/test_skip_fwd_logprobs.py   |   30 +
- tests/train/dataset/test_preprocess.py             |   46 +-
- .../generators/test_generator_output_utils.py      |    1 +
- tests/train/generators/test_skyrl_gym_generator.py |   56 +-
+ tests/train/dataset/test_preprocess.py             |  130 +-
+ .../generators/test_generator_output_utils.py      |    3 +-
+ tests/train/generators/test_skyrl_gym_generator.py |   57 +-
  tests/train/gpu_e2e_test/gsm8k_colocate.sh         |    5 +-
  .../train/gpu_e2e_test/gsm8k_colocate_megatron.sh  |    5 +-
  tests/train/gpu_e2e_test/gsm8k_fully_async.sh      |    5 +-
@@ -535,15 +539,15 @@ _Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (250cdd85); merge-base `
  tests/train/test_sft_dataloader.py                 |  557 +++
  tests/train/test_sft_packing_collate.py            |   70 +-
  tests/train/test_sft_tokenization.py               |   72 +-
- tests/train/test_trainer_utils.py                  |    9 +
+ tests/train/test_trainer_utils.py                  |   12 +
  tests/train/test_vllm_metrics_scraper.py           |  243 ++
  tests/train/util.py                                |    6 +-
  tests/train/utils/test_logging_config.py           |  120 +
  tests/utils/test_token_metadata.py                 |   88 +
  upstream-sync/bedrock-ci-setup.md                  |  106 +
  upstream-sync/gen_develop_delta.sh                 |  104 +
- uv.lock                                            | 3768 +++++++++-----------
- 395 files changed, 21501 insertions(+), 13116 deletions(-)
+ uv.lock                                            | 3778 +++++++++-----------
+ 397 files changed, 21890 insertions(+), 13148 deletions(-)
 ```
 <!-- END AUTO:develop-delta -->
 
