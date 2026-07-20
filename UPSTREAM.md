@@ -57,14 +57,16 @@ Upstream remote: `https://github.com/NovaSky-AI/SkyRL.git` · sync target: **`up
 -->
 
 <!-- BEGIN AUTO:develop-delta -->
-_Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (26b4faad); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
+_Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (8674de8c); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
 
-`develop` is **78 commit(s)** ahead of `main`.
+`develop` is **80 commit(s)** ahead of `main`.
 
 ### Commits on `develop` not on `main`
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `8674de8c` | refactor(generators): assemble incremental routed expert tra | dyurk-lila | 2026-07-20 |
+| `49f4f0b7` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-07-20 |
 | `26b4faad` | refactor(inference): expose reusable remote generator (#63) | dyurk-lila | 2026-07-20 |
 | `82e07b7c` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-07-20 |
 | `112462c6` | perf(r3): limit route expansion to local layers (#58) | dyurk-lila | 2026-07-20 |
@@ -170,7 +172,7 @@ _Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (26b4faad); merge-base `
  .github/workflows/sync-upstream.yaml               |  654 ++++
  NOTICE                                             |   21 +
  README.md                                          |    3 -
- UPSTREAM.md                                        |  595 +++
+ UPSTREAM.md                                        |  597 ++++
  ci/anyscale_gpu_ci.yaml                            |    4 +-
  ci/anyscale_gpu_ci_h100.yaml                       |    4 +-
  ci/anyscale_gpu_ci_skyrl_train.yaml                |    4 +-
@@ -394,11 +396,11 @@ _Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (26b4faad); merge-base `
  .../skyrl_train/inference_engines/vllm/utils.py    |   33 -
  .../inference_engines/vllm/vllm_engine.py          |  776 ----
  .../inference_engines/vllm/vllm_server.py          |  164 -
- .../base.py                                        |  111 +-
+ .../base.py                                        |  112 +-
  .../skyrl_train/inference_servers/engine_utils.py  |   89 +
  .../inference_servers/layerwise_reload.py          |  113 +-
  .../inference_servers/new_inference_worker_wrap.py |   12 +-
- .../inference_servers/remote_inference_client.py   |  325 +-
+ .../inference_servers/remote_inference_client.py   |  353 +-
  .../inference_servers/routed_experts_wire.py       |   45 +
  .../skyrl_train/inference_servers/server_group.py  |    6 +-
  .../skyrl_train/inference_servers/setup.py         |    7 +-
@@ -444,7 +446,7 @@ _Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (26b4faad); merge-base `
  skyrl/train/evaluate.py                            |   32 +-
  skyrl/train/fully_async_trainer.py                 |  353 +-
  skyrl/train/generators/base.py                     |    5 +-
- skyrl/train/generators/skyrl_gym_generator.py      |   61 +-
+ skyrl/train/generators/skyrl_gym_generator.py      |  106 +-
  skyrl/train/generators/skyrl_vlm_generator.py      |    8 +-
  skyrl/train/generators/utils.py                    |   20 +-
  skyrl/train/sft_trainer.py                         |  814 +++--
@@ -453,9 +455,9 @@ _Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (26b4faad); merge-base `
  skyrl/train/utils/trainer_utils.py                 |   45 +-
  skyrl/train/utils/utils.py                         |   82 +-
  skyrl/train/utils/vllm_metrics_scraper.py          |  164 +-
- skyrl/utils/routed_experts.py                      |   48 +
+ skyrl/utils/routed_experts.py                      |  102 +
  skyrl/utils/tok.py                                 |   32 +-
- skyrl/utils/token_metadata.py                      |  204 ++
+ skyrl/utils/token_metadata.py                      |  253 ++
  .../backends/skyrl_train/_fake_int4_qat_golden.py  |   36 +
  .../test_chunked_logprob_backward_streaming.py     |  116 +
  .../skyrl_train/distributed/test_fused_lm_head.py  |  228 ++
@@ -504,7 +506,7 @@ _Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (26b4faad); merge-base `
  .../skyrl_train/inference_engines/vllm/__init__.py |    0
  .../skyrl_train/inference_engines/vllm/utils.py    |   24 -
  .../inference_servers/test_build_vllm_cli_args.py  |   19 +-
- .../test_remote_inference_client.py                |   84 +-
+ .../test_remote_inference_client.py                |   93 +-
  .../inference_servers/test_routed_experts_wire.py  |   92 +
  tests/backends/skyrl_train/test_fake_int4_qat.py   |  161 +
  .../skyrl_train/test_token_based_batching_utils.py |   12 +
@@ -523,8 +525,9 @@ _Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (26b4faad); merge-base `
  tests/train/algorithms/test_losses.py              |  101 +
  tests/train/algorithms/test_skip_fwd_logprobs.py   |   30 +
  tests/train/dataset/test_preprocess.py             |  130 +-
+ tests/train/generators/test_datatypes.py           |    1 -
  .../generators/test_generator_output_utils.py      |    3 +-
- tests/train/generators/test_skyrl_gym_generator.py |   57 +-
+ tests/train/generators/test_skyrl_gym_generator.py |  111 +-
  tests/train/gpu_e2e_test/gsm8k_colocate.sh         |    5 +-
  .../train/gpu_e2e_test/gsm8k_colocate_megatron.sh  |    5 +-
  tests/train/gpu_e2e_test/gsm8k_fully_async.sh      |    5 +-
@@ -547,11 +550,11 @@ _Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (26b4faad); merge-base `
  tests/train/test_vllm_metrics_scraper.py           |  243 ++
  tests/train/util.py                                |    6 +-
  tests/train/utils/test_logging_config.py           |  120 +
- tests/utils/test_token_metadata.py                 |   88 +
+ tests/utils/test_token_metadata.py                 |  151 +
  upstream-sync/bedrock-ci-setup.md                  |  106 +
  upstream-sync/gen_develop_delta.sh                 |  104 +
  uv.lock                                            | 3778 +++++++++-----------
- 397 files changed, 22102 insertions(+), 13306 deletions(-)
+ 398 files changed, 22379 insertions(+), 13335 deletions(-)
 ```
 <!-- END AUTO:develop-delta -->
 
