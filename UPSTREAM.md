@@ -57,14 +57,16 @@ Upstream remote: `https://github.com/NovaSky-AI/SkyRL.git` · sync target: **`up
 -->
 
 <!-- BEGIN AUTO:develop-delta -->
-_Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (081166d6); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
+_Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (112462c6); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
 
-`develop` is **74 commit(s)** ahead of `main`.
+`develop` is **76 commit(s)** ahead of `main`.
 
 ### Commits on `develop` not on `main`
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `112462c6` | perf(r3): limit route expansion to local layers (#58) | dyurk-lila | 2026-07-20 |
+| `ddc6dc69` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-07-20 |
 | `081166d6` | perf(r3): accelerate routed-expert JSON transport (#57) | dyurk-lila | 2026-07-20 |
 | `f475788e` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-07-20 |
 | `250cdd85` | fix(r3): align routed-expert metadata and padding (#56) | dyurk-lila | 2026-07-20 |
@@ -166,7 +168,7 @@ _Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (081166d6); merge-base `
  .github/workflows/sync-upstream.yaml               |  654 ++++
  NOTICE                                             |   21 +
  README.md                                          |    3 -
- UPSTREAM.md                                        |  589 +++
+ UPSTREAM.md                                        |  593 +++
  ci/anyscale_gpu_ci.yaml                            |    4 +-
  ci/anyscale_gpu_ci_h100.yaml                       |    4 +-
  ci/anyscale_gpu_ci_skyrl_train.yaml                |    4 +-
@@ -405,7 +407,7 @@ _Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (081166d6); merge-base `
  skyrl/backends/skyrl_train/utils/io/io.py          |   34 +
  skyrl/backends/skyrl_train/utils/ppo_utils.py      |   67 +-
  skyrl/backends/skyrl_train/utils/profiler.py       |  156 +-
- skyrl/backends/skyrl_train/utils/replay_utils.py   |  258 +-
+ skyrl/backends/skyrl_train/utils/replay_utils.py   |  327 +-
  skyrl/backends/skyrl_train/weight_sync/__init__.py |    8 -
  skyrl/backends/skyrl_train/weight_sync/base.py     |    2 +-
  .../skyrl_train/weight_sync/broadcast_strategy.py  |  258 +-
@@ -416,7 +418,7 @@ _Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (081166d6); merge-base `
  .../skyrl_train/workers/fsdp/fsdp_worker.py        |   23 +-
  .../skyrl_train/workers/megatron/fake_int4_qat.py  |  146 +
  .../workers/megatron/megatron_model_wrapper.py     |  442 ++-
- .../workers/megatron/megatron_worker.py            |  184 +-
+ .../workers/megatron/megatron_worker.py            |  190 +-
  .../backends/skyrl_train/workers/model_wrapper.py  |    8 +-
  skyrl/backends/skyrl_train/workers/worker.py       |  192 +-
  .../skyrl_train/workers/worker_dispatch.py         |   57 +-
@@ -508,7 +510,7 @@ _Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (081166d6); merge-base `
  tests/backends/skyrl_train/util.py                 |    5 +-
  .../skyrl_train/utils/test_local_read_files.py     |   43 +
  tests/backends/skyrl_train/utils/test_profiler.py  |  358 ++
- .../skyrl_train/utils/test_replay_utils.py         |  206 ++
+ .../skyrl_train/utils/test_replay_utils.py         |  229 ++
  .../weight_sync/test_remote_weight_loader.py       |  175 -
  .../weight_sync/test_transfer_strategies.py        |   17 +-
  .../workers/test_sft_loss_fn_outputs_gate.py       |  226 ++
@@ -547,7 +549,7 @@ _Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (081166d6); merge-base `
  upstream-sync/bedrock-ci-setup.md                  |  106 +
  upstream-sync/gen_develop_delta.sh                 |  104 +
  uv.lock                                            | 3778 +++++++++-----------
- 397 files changed, 21890 insertions(+), 13148 deletions(-)
+ 397 files changed, 21952 insertions(+), 13188 deletions(-)
 ```
 <!-- END AUTO:develop-delta -->
 
