@@ -57,14 +57,16 @@ Upstream remote: `https://github.com/NovaSky-AI/SkyRL.git` · sync target: **`up
 -->
 
 <!-- BEGIN AUTO:develop-delta -->
-_Last generated for `origin/main` (02700539) ↔ `HEAD` (ded01538); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
+_Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (250cdd85); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
 
-`develop` is **70 commit(s)** ahead of `main`.
+`develop` is **72 commit(s)** ahead of `main`.
 
 ### Commits on `develop` not on `main`
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `250cdd85` | fix(r3): align routed-expert metadata and padding (#56) | dyurk-lila | 2026-07-20 |
+| `63fbf69f` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-07-14 |
 | `ded01538` | chore(sync): upstream 02700539 (CONFLICTS — manual resolve)  | lila-ci-bot[bot] | 2026-07-14 |
 | `a7df0d99` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-07-13 |
 | `f141d150` | [bugfix] Fused LM Head Compatibility with HybridModel (#53) | dyurk-lila | 2026-07-13 |
@@ -162,7 +164,7 @@ _Last generated for `origin/main` (02700539) ↔ `HEAD` (ded01538); merge-base `
  .github/workflows/sync-upstream.yaml               |  654 ++++
  NOTICE                                             |   21 +
  README.md                                          |    3 -
- UPSTREAM.md                                        |  542 +++
+ UPSTREAM.md                                        |  577 +++
  ci/anyscale_gpu_ci.yaml                            |    4 +-
  ci/anyscale_gpu_ci_h100.yaml                       |    4 +-
  ci/anyscale_gpu_ci_skyrl_train.yaml                |    4 +-
@@ -396,10 +398,11 @@ _Last generated for `origin/main` (02700539) ↔ `HEAD` (ded01538); merge-base `
  .../skyrl_train/inference_servers/utils.py         |    4 +-
  .../inference_servers/vllm_server_actor.py         |  181 +-
  .../skyrl_train/inference_servers/vllm_worker.py   |  127 -
+ skyrl/backends/skyrl_train/training_batch.py       |   17 +-
  skyrl/backends/skyrl_train/utils/io/io.py          |   34 +
  skyrl/backends/skyrl_train/utils/ppo_utils.py      |   67 +-
  skyrl/backends/skyrl_train/utils/profiler.py       |  156 +-
- skyrl/backends/skyrl_train/utils/replay_utils.py   |   22 +-
+ skyrl/backends/skyrl_train/utils/replay_utils.py   |  258 +-
  skyrl/backends/skyrl_train/weight_sync/__init__.py |    8 -
  skyrl/backends/skyrl_train/weight_sync/base.py     |    2 +-
  .../skyrl_train/weight_sync/broadcast_strategy.py  |  258 +-
@@ -409,12 +412,12 @@ _Last generated for `origin/main` (02700539) ↔ `HEAD` (ded01538); merge-base `
  .../skyrl_train/weight_sync/weight_loader.py       |   25 -
  .../skyrl_train/workers/fsdp/fsdp_worker.py        |   23 +-
  .../skyrl_train/workers/megatron/fake_int4_qat.py  |  146 +
- .../workers/megatron/megatron_model_wrapper.py     |  346 +-
- .../workers/megatron/megatron_worker.py            |  170 +-
+ .../workers/megatron/megatron_model_wrapper.py     |  442 ++-
+ .../workers/megatron/megatron_worker.py            |  184 +-
  .../backends/skyrl_train/workers/model_wrapper.py  |    8 +-
  skyrl/backends/skyrl_train/workers/worker.py       |  192 +-
  .../skyrl_train/workers/worker_dispatch.py         |   57 +-
- skyrl/backends/skyrl_train/workers/worker_utils.py |   16 +-
+ skyrl/backends/skyrl_train/workers/worker_utils.py |   26 +-
  skyrl/backends/skyrl_train_backend.py              |  234 +-
  skyrl/benchmarks/bench_fused_linear_logprob.py     |  221 ++
  skyrl/benchmarks/load_test_concurrency.py          |    1 -
@@ -425,7 +428,8 @@ _Last generated for `origin/main` (02700539) ↔ `HEAD` (ded01538); merge-base `
  skyrl/train/config/config.py                       |  338 +-
  skyrl/train/config/sft_config.py                   |   34 +
  skyrl/train/dataset/collators.py                   |  106 +-
- skyrl/train/dataset/preprocess.py                  |  100 +-
+ skyrl/train/dataset/preprocess.py                  |  197 +-
+ skyrl/train/dataset/replay_buffer.py               |    7 +-
  skyrl/train/dataset/samplers.py                    |   84 +
  skyrl/train/entrypoints/main_base.py               |  139 +-
  skyrl/train/entrypoints/main_generate.py           |    2 +-
@@ -433,16 +437,18 @@ _Last generated for `origin/main` (02700539) ↔ `HEAD` (ded01538); merge-base `
  skyrl/train/evaluate.py                            |   32 +-
  skyrl/train/fully_async_trainer.py                 |  353 +-
  skyrl/train/generators/base.py                     |    2 +-
- skyrl/train/generators/skyrl_gym_generator.py      |   18 +-
+ skyrl/train/generators/skyrl_gym_generator.py      |   45 +-
  skyrl/train/generators/skyrl_vlm_generator.py      |    8 +-
- skyrl/train/generators/utils.py                    |    3 +-
+ skyrl/train/generators/utils.py                    |   20 +-
  skyrl/train/sft_trainer.py                         |  814 +++--
- skyrl/train/trainer.py                             |  449 ++-
+ skyrl/train/trainer.py                             |  459 ++-
  skyrl/train/utils/async_batch_collator.py          |   58 +
- skyrl/train/utils/trainer_utils.py                 |   10 +-
+ skyrl/train/utils/trainer_utils.py                 |   45 +-
  skyrl/train/utils/utils.py                         |   82 +-
  skyrl/train/utils/vllm_metrics_scraper.py          |  164 +-
+ skyrl/utils/routed_experts.py                      |   14 +
  skyrl/utils/tok.py                                 |   32 +-
+ skyrl/utils/token_metadata.py                      |  204 ++
  .../backends/skyrl_train/_fake_int4_qat_golden.py  |   36 +
  .../test_chunked_logprob_backward_streaming.py     |  116 +
  .../skyrl_train/distributed/test_fused_lm_head.py  |  228 ++
@@ -468,7 +474,7 @@ _Last generated for `origin/main` (02700539) ↔ `HEAD` (ded01538); merge-base `
  .../gpu/gpu_ci/megatron/test_megatron_models.py    |    2 +-
  .../gpu/gpu_ci/megatron/test_megatron_vlm_init.py  |  358 ++
  .../gpu/gpu_ci/megatron/test_megatron_worker.py    |   13 +-
- .../gpu/gpu_ci/megatron/test_router_replay.py      |    2 +-
+ .../gpu/gpu_ci/megatron/test_router_replay.py      |   21 +-
  .../gpu/gpu_ci/megatron/test_sft_packing_parity.py |   11 +-
  .../gpu/gpu_ci/test_engine_generation.py           |    9 +-
  .../gpu/gpu_ci/test_expert_parallel_inference.py   |    3 +-
@@ -493,9 +499,12 @@ _Last generated for `origin/main` (02700539) ↔ `HEAD` (ded01538); merge-base `
  .../inference_servers/test_build_vllm_cli_args.py  |   19 +-
  .../test_remote_inference_client.py                |   30 +
  tests/backends/skyrl_train/test_fake_int4_qat.py   |  161 +
+ .../skyrl_train/test_token_based_batching_utils.py |   12 +
+ tests/backends/skyrl_train/test_train_batch.py     |   16 +-
  tests/backends/skyrl_train/util.py                 |    5 +-
  .../skyrl_train/utils/test_local_read_files.py     |   43 +
  tests/backends/skyrl_train/utils/test_profiler.py  |  358 ++
+ .../skyrl_train/utils/test_replay_utils.py         |  206 ++
  .../weight_sync/test_remote_weight_loader.py       |  175 -
  .../weight_sync/test_transfer_strategies.py        |   17 +-
  .../workers/test_sft_loss_fn_outputs_gate.py       |  226 ++
@@ -505,8 +514,9 @@ _Last generated for `origin/main` (02700539) ↔ `HEAD` (ded01538); merge-base `
  tests/tinker/test_engine.py                        |    9 +
  tests/train/algorithms/test_losses.py              |  101 +
  tests/train/algorithms/test_skip_fwd_logprobs.py   |   30 +
+ tests/train/dataset/test_preprocess.py             |   46 +-
  .../generators/test_generator_output_utils.py      |    1 +
- tests/train/generators/test_skyrl_gym_generator.py |   35 +-
+ tests/train/generators/test_skyrl_gym_generator.py |   56 +-
  tests/train/gpu_e2e_test/gsm8k_colocate.sh         |    5 +-
  .../train/gpu_e2e_test/gsm8k_colocate_megatron.sh  |    5 +-
  tests/train/gpu_e2e_test/gsm8k_fully_async.sh      |    5 +-
@@ -525,13 +535,15 @@ _Last generated for `origin/main` (02700539) ↔ `HEAD` (ded01538); merge-base `
  tests/train/test_sft_dataloader.py                 |  557 +++
  tests/train/test_sft_packing_collate.py            |   70 +-
  tests/train/test_sft_tokenization.py               |   72 +-
+ tests/train/test_trainer_utils.py                  |    9 +
  tests/train/test_vllm_metrics_scraper.py           |  243 ++
  tests/train/util.py                                |    6 +-
  tests/train/utils/test_logging_config.py           |  120 +
+ tests/utils/test_token_metadata.py                 |   88 +
  upstream-sync/bedrock-ci-setup.md                  |  106 +
  upstream-sync/gen_develop_delta.sh                 |  104 +
  uv.lock                                            | 3768 +++++++++-----------
- 385 files changed, 20534 insertions(+), 12847 deletions(-)
+ 395 files changed, 21501 insertions(+), 13116 deletions(-)
 ```
 <!-- END AUTO:develop-delta -->
 
