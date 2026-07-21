@@ -243,6 +243,7 @@ class RemoteInferenceGenerator:
         return_routed_experts: bool = False,
         routed_experts_prompt_start: Optional[int] = None,
         mm_features: Optional[MultiModalFeatures] = None,
+        cache_salt: Optional[str] = None,
     ) -> RemoteGenerateResult:
         """Generate one raw-token completion, optionally returning R3 routes."""
         if routed_experts_prompt_start is not None:
@@ -266,6 +267,8 @@ class RemoteInferenceGenerator:
         }
         if mm_features:
             payload["features"] = mm_features
+        if cache_salt is not None:
+            payload["cache_salt"] = cache_salt
 
         headers = {"Content-Type": "application/json"}
         if session_id:
@@ -374,6 +377,17 @@ class RemoteInferenceClient(InferenceEngineInterface):
     _gen_sem: Optional[asyncio.Semaphore] = field(default=None, repr=False)
     _detok_sem: Optional[asyncio.Semaphore] = field(default=None, repr=False)
     _sem_loop: Optional[asyncio.AbstractEventLoop] = field(default=None, repr=False)
+    # Monotonic counter of weight syncs (see `increment_weight_version`); source of the prefix-cache salt.
+    _weight_version: int = field(default=0, repr=False)
+
+    @property
+    def weight_version(self) -> int:
+        """Number of weight syncs to the engines so far (0 before the first sync); the policy version."""
+        return self._weight_version
+
+    def increment_weight_version(self) -> None:
+        """Advance the weight version. Called once per completed weight sync to the engines."""
+        self._weight_version += 1
 
     def __post_init__(self):
         if self.data_parallel_size <= 0:
@@ -494,6 +508,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
                 raise ValueError("routed_experts_prompt_starts requires enable_return_routed_experts=True")
             if len(routed_experts_prompt_starts) != len(prompt_token_ids):
                 raise ValueError("routed_experts_prompt_starts must have one entry per prompt")
+        cache_salt = input_batch.get("cache_salt")
         get_logprobs = sampling_params.get("logprobs") is not None
 
         # Two semaphores decouple the generate and detokenize stages:
@@ -521,6 +536,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
                         routed_experts_prompt_starts[idx] if routed_experts_prompt_starts is not None else None
                     ),
                     model=model,
+                    cache_salt=cache_salt,
                 )
             async with gen_sem:
                 return await self._generate_single(
@@ -532,6 +548,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
                         routed_experts_prompt_starts[idx] if routed_experts_prompt_starts is not None else None
                     ),
                     model=model,
+                    cache_salt=cache_salt,
                 )
 
         async def _throttled_detokenize(token_ids: List[int]) -> str:
@@ -563,6 +580,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
         model: str,
         mm_features: Optional[MultiModalFeatures] = None,
         routed_experts_prompt_start: Optional[int] = None,
+        cache_salt: Optional[str] = None,
     ) -> Dict[str, Any]:
         result = await self._get_generator().generate(
             prompt_token_ids=prompt_token_ids,
@@ -572,6 +590,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
             return_routed_experts=self.enable_return_routed_experts,
             routed_experts_prompt_start=routed_experts_prompt_start,
             mm_features=mm_features,
+            cache_salt=cache_salt,
         )
         return {
             "stop_reason": result.stop_reason,

@@ -302,6 +302,24 @@ class TorchProfilerConfig(BaseConfig):
 
 
 @dataclass
+class MegatronHFExportConfig(BaseConfig):
+    distributed_save: bool = False
+    """Fan the Megatron->HF safetensors export across ranks instead of writing the
+    whole checkpoint from rank 0. The on-disk result is the standard HF sharded
+    format either way; this only parallelizes the write, which is decisive for
+    multi-hundred-GB checkpoints whose serial rank-0 write stalls every rank."""
+    save_every_n_ranks: int = 1
+    """In distributed save, only ranks 0, N, 2N, ... write shards (e.g. 8 = one
+    writer per 8-GPU node). Ignored when ``distributed_save`` is False."""
+
+    def __post_init__(self) -> None:
+        # save_every_n_ranks indexes ranks via modulo/floor-div in the bridge's
+        # distributed save; < 1 raises ZeroDivisionError there. Fail fast instead.
+        if self.save_every_n_ranks < 1:
+            raise ValueError(f"save_every_n_ranks must be >= 1, got {self.save_every_n_ranks}")
+
+
+@dataclass
 class MegatronLoraConfig(BaseConfig):
     lora_type: str = "lora"
     merge_lora: bool = True
@@ -345,6 +363,7 @@ class MegatronConfig(BaseConfig):
     moe_router_dtype: str = "fp32"
     """Pass through to Megatron-Bridge - can be set to 'fp64' for additional numerical stability."""
     ddp_config: MegatronDDPConfig = field(default_factory=MegatronDDPConfig)
+    hf_export_config: MegatronHFExportConfig = field(default_factory=MegatronHFExportConfig)
     lora_config: MegatronLoraConfig = field(default_factory=MegatronLoraConfig)
     optimizer_config_kwargs: Dict[str, Any] = field(
         default_factory=lambda: copy.deepcopy(DEFAULT_MEGATRON_OPTIMIZER_KWARGS)
@@ -358,6 +377,23 @@ class MegatronConfig(BaseConfig):
     freeze_moe_router: bool = False
     """If True, freeze MoE router parameters so they are not updated during training. No-op on
     non-MoE models."""
+    mtp_num_layers: Optional[int] = None
+    """Number of Multi-Token Prediction (MTP) heads to build. ``None`` honors the model's HF config
+    (``num_nextn_predict_layers``); an int overrides it (``0`` force-disables MTP). Active heads are
+    trained with the decoupled draft loss and synced to vLLM for speculative decoding."""
+    mtp_loss_weight: float = 0.1
+    """Weight ``w`` of the draft loss in ``policy_loss + w * draft_loss``. The draft loss is fully
+    decoupled: trunk, re-embedding, output weight and teacher are all detached, so its gradient
+    reaches only the ``.mtp.`` head params. Only used when MTP heads are active."""
+    mtp_loss_chunk_size: Optional[int] = 1024
+    """Sequence-chunk size for the draft loss, with gradient checkpointing, to bound peak memory at
+    large vocab (e.g. Qwen3.5's 248K, where the full-sequence softmax OOMs). Numerically identical to
+    no chunking. ``None`` disables it; ignored when ``mtp_loss_topk`` is set."""
+    mtp_loss_topk: Optional[int] = None
+    """If set, use a top-k approximation of the soft-CE draft loss: distill only the teacher's top-k
+    tokens (renormalized), ``O(seq*k)`` memory instead of ``O(seq*vocab)`` -- fits at large vocab
+    without fragmentation. Reconciled across the TP group, so it scales to any parallel size.
+    ``None`` uses the exact full-vocab loss. Typical: 64-128."""
 
     def __post_init__(self):
         # Backfill defaults for any keys the user didn't override so an override dict
@@ -504,10 +540,10 @@ class KLCovConfig(BaseConfig):
 @dataclass
 class CISPOConfig(BaseConfig):
 
-    cispo_eps_clip_low: float = 0.0
-    """Offset for lower bound of importance sampling ratio clipping (as opposed to PPO token update clipping)."""
-    cispo_eps_clip_high: float = 5.0
-    """Offset for upper bound of importance sampling ratio clipping (as opposed to PPO token update clipping)."""
+    cispo_eps_clip_low: float = 1.0
+    """Lower clipping offset; the default gives a lower ratio bound of 0."""
+    cispo_eps_clip_high: float = 4.0
+    """Upper clipping offset; the default gives an upper ratio bound of 5."""
     cispo_anchor: str = "old"
     """Behavior policy the IS ratio is anchored on: ``"old"`` (default) uses the recomputed
     old log-probs (``ratio = pi_theta / pi_old``), matching the original CISPO paper. ``"rollout"``
@@ -660,6 +696,10 @@ class FullyAsyncConfig(BaseConfig):
     If False, we reuse KV cache from stale policies during generation
     (avoids recomputation at the cost of using slightly stale KV cache).
     """
+    allow_recomputed_logprobs: bool = False
+    """Allow legacy losses that recompute pre-update policy logprobs during fully async training.
+    This does not correct for rollout-policy staleness and is intended for reproducing legacy runs.
+    """
 
     # --- Trainer simulation (no real trainer components) ---
     simulate_training: bool = False
@@ -758,6 +798,9 @@ class InferenceEngineConfig(BaseConfig):
     multimodal models (e.g. Qwen3.5) skip vision encoder initialization."""
     engine_init_kwargs: Dict[str, Any] = field(default_factory=dict)
     """Pass-through kwargs for the vLLM engine. Names must match the engine's args."""
+    speculative_config: Optional[Dict[str, Any]] = None
+    """Speculative-decoding config passed through to vLLM for MTP drafter decoding.
+    (needs ``policy.megatron_config.mtp_num_layers`` > 0 to train mtp). ``None`` disables it."""
     external_proxy_url: Optional[str] = None
     """Data-plane URL (load-balanced router) for the new inference layer."""
     external_server_urls: Optional[List[str]] = None
@@ -803,6 +846,11 @@ class GeneratorConfig(BaseConfig):
     eval_n_samples_per_prompt: int = 1
     zero_reward_on_non_stop: bool = False
     """Set reward to 0 when ``stop_reason`` is not ``"stop"`` (i.e., generation was truncated or aborted)."""
+    use_cache_salt: bool = True
+    """Salt vLLM's prefix cache with the policy version so cache blocks are only shared across trajectories that started
+    with the same policy weight version. The salt is keyed on the engine's weight version, captured at the start of each
+    ``generate`` call. Matters for fully-async RL; a no-op for synchronous training (which resets the
+    cache each sync) and when prefix caching is off, so it is safe to leave on by default."""
     apply_overlong_filtering: bool = False
     """Apply DAPO Overlong Filtering: mask out all tokens in the loss mask for trajectories that
     exceed max length (truncated, no EOS token)."""
@@ -847,6 +895,18 @@ class EnvironmentConfig(BaseConfig):
     skyrl_gym: SkyRLGymConfig = field(default_factory=SkyRLGymConfig)
 
 
+@dataclass
+class MTPConfig(BaseConfig):
+    enabled: bool = False
+    """Whether to train MTP draft heads and use them for speculative decoding."""
+    num_speculative_tokens: int = 1
+    """Draft depth vLLM speculates per step, independent of the trained head count. Single-head
+    checkpoints (Qwen3.5/Qwen3-Next/DeepSeek-V3) reuse the one head autoregressively at depths > 1;
+    expect acceptance to decay with depth (the head is trained at depth 1)."""
+    loss_weight: float = 0.1
+    """Weight ``w`` of the draft loss in ``policy_loss + w * draft_loss``."""
+
+
 # ---------------------------------------------------------------------------
 # Trainer (top-level)
 # ---------------------------------------------------------------------------
@@ -866,6 +926,7 @@ class TrainerConfig(BaseConfig):
     ref: RefConfig = field(default_factory=RefConfig)
     critic: CriticConfig = field(default_factory=CriticConfig)
     algorithm: AlgorithmConfig = field(default_factory=AlgorithmConfig)
+    mtp: MTPConfig = field(default_factory=MTPConfig)
     fully_async: FullyAsyncConfig = field(default_factory=FullyAsyncConfig)
     gradient_checkpointing: bool = True
     gradient_checkpointing_use_reentrant: bool = False
@@ -932,7 +993,22 @@ class TrainerConfig(BaseConfig):
     """Optional list of tags to apply to the W&B run. Has no effect on other backends."""
     dump_data_batch: bool = False
     dump_eval_results: bool = True
-    log_example_interval: int = 1
+    print_example_interval: int = 1
+    """Pretty-print an example prompt/response/reward to stdout every N
+    training steps; ``0``/``-1`` disables. Renamed from ``log_example_interval``."""
+    num_logger_eval_samples: int = -1
+    """Number of evaluation trajectory (prompt, response, score) tuples to upload to a wandb
+    table on each eval. ``-1`` (default) or ``0`` disables. When positive,
+    up to this many samples are taken from the start of each eval pass and
+    logged via :class:`TrajectoryLogger`. Column count is fixed
+    by the first call, so keep the eval set size and this value stable."""
+    num_logger_train_samples: int = -1
+    """Number of training trajectory (prompt, response, score) tuples to upload to a wandb
+    table on each training step. ``-1`` (default) or ``0`` disables. When positive,
+    up to this many samples are taken from the start of each training step and
+    logged via :class:`TrajectoryLogger`. Column count is fixed
+    by the first call, so keep the training set size and this value stable."""
+    log_example_interval: int = -1
     """Log an example prompt every N training steps, ``0``/``-1`` to disable"""
     logprobs_chunk_size: Optional[int] = 1024
     """Chunk size along the sequence dimension when computing log-probs from logits.
@@ -952,6 +1028,12 @@ class TrainerConfig(BaseConfig):
         # ref model defaults to the policy model
         if self.ref.model.path is None:
             self.ref.model.path = self.policy.model.path
+
+        if self.log_example_interval > 0:
+            print(
+                f"log_example_interval has been renamed, use print_example_interval instead. Setting print_example_interval to {self.log_example_interval}"
+            )
+            self.print_example_interval = self.log_example_interval
 
         if self.policy.model.fake_int4_qat.enabled:
             assert (

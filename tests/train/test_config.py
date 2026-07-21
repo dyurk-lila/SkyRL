@@ -128,6 +128,14 @@ def test_cli_overrides_empty_args():
     assert cfg.trainer.seed == 42
 
 
+def test_fully_async_recomputed_logprobs_compatibility_flag():
+    cfg = SkyRLTrainConfig.from_cli_overrides([])
+    assert not cfg.trainer.fully_async.allow_recomputed_logprobs
+
+    cfg = SkyRLTrainConfig.from_cli_overrides(["trainer.fully_async.allow_recomputed_logprobs=true"])
+    assert cfg.trainer.fully_async.allow_recomputed_logprobs
+
+
 def test_cli_overrides_plus_prefix_rejected():
     with pytest.raises(ValueError, match="The '\\+' prefix"):
         SkyRLTrainConfig.from_cli_overrides(["+new_field=value"])

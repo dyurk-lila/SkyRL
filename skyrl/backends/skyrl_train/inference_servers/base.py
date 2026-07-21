@@ -32,6 +32,9 @@ class InferenceEngineInput(TypedDict):
     session_ids: Optional[List[Hashable]]
     mm_features: Optional[List[MultiModalFeatures]]
     routed_experts_prompt_starts: Optional[List[int]]
+    # Optional prefix-cache salt forwarded to vLLM as the request ``cache_salt`` so cache blocks are
+    # only shared between requests carrying the same salt. See ``GeneratorConfig.use_cache_salt``.
+    cache_salt: Optional[str]
 
 
 class InferenceEngineOutput(TypedDict):

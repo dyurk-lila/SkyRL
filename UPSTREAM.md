@@ -17,7 +17,7 @@ Upstream remote: `https://github.com/NovaSky-AI/SkyRL.git` · sync target: **`up
 
 | upstream SHA | upstream tag (if any) | sync date | `lila-sync-*` tag |
 |---|---|---|---|
-| `f508739f` | — | 2026-06-10 | `lila-sync-f508739f` |
+| `fd79ceec` | — | 2026-07-20 | `lila-sync-fd79ceec` |
 
 > Seed value: the `upstream/main` SHA fork `main` was reset to in the one-time catch-up
 > (2026-06-10). `main` was verified byte-identical to `upstream/main` (`f508739f`) — 0 ahead /
@@ -31,20 +31,20 @@ Upstream remote: `https://github.com/NovaSky-AI/SkyRL.git` · sync target: **`up
 
 | branch | internal PR# | category | public PR# (if pending) | hotspot files touched |
 |---|---|---|---|---|
-| `feat/torch-profiler-driving` | #16 | pending-upstream | _TODO: NovaSky PR# once opened_ | `trainer.py`, `config.py`, worker dispatch, profiler |
 | `vdinh/wandb-tags-tracking` | #14 | pending-upstream | _TODO: NovaSky PR#_ | `config.py`, `sft_config.py`, `tracking.py` |
 | `feat/sync-weights-subtimers` | #15 | keep-fork-only | — | `broadcast_strategy.py`, `fully_async_trainer.py`, worker dispatch |
 | `vdinh/fix-max-training-steps-and-hang` | #5 | keep-fork-only | — | `config.py`, `trainer.py` |
 | `tito_example` | #6 | keep-fork-only | — | examples only |
 | `achaloo/mfu` | #4 | evaluate | — | `trainer.py`, `flops_tracker.py` (true MFU %, distinct from upstream's tokens/sec) |
-| `log_val_samples` | #7 | evaluate | — | `evaluate.py`, `tracking.py`, `trajectory_logging.py` |
 | `optimize-sft-tokenization` | #9 | evaluate | — | `sft_trainer.py`, `sft_config.py` |
+
+Profiler driving (#16) and validation-sample logging (#7) were removed from the carry list after
+their upstream implementations landed by `fd79ceec`.
 
 > **`evaluate` = author decision pending.** These were *not* cleanly superseded by upstream
 > (verified 2026-06-10): #4 adds a true MFU-% tracker (`flops_tracker.py`), distinct from
-> upstream's `tokens_per_second_per_gpu` (#1711); #7's would-be twin `c60a1b91` is on an
-> *unmerged* NovaSky branch (`upstream/log_val_samples`), not in `main`; #9 overlaps upstream
-> #1695 in intent but uses a different chunk-worker implementation (~93/377 added lines absent
+> upstream's `tokens_per_second_per_gpu` (#1711); #9 overlaps upstream #1695 in intent but uses a
+> different chunk-worker implementation (~93/377 added lines absent
 > from `main`). Authors decide: rebase onto `develop`, upstream, or drop.
 
 ## 2.5. Live `develop` ↔ `main` delta (AUTO-GENERATED)

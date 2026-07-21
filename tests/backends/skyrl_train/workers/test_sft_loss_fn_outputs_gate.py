@@ -44,6 +44,8 @@ def _make_cpu_policy_worker() -> PolicyWorkerBase:
         sequence_parallel_size=1,
     )
     worker.strategy = MagicMock()
+    worker.mesh_rank = MagicMock()
+    worker.mesh_rank.dp_size = 1
     worker.scheduler = MagicMock()
     worker.scheduler.get_last_lr.return_value = [1e-4]
     worker.optimizer = MagicMock()
