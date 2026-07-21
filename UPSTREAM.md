@@ -57,14 +57,16 @@ their upstream implementations landed by `fd79ceec`.
 -->
 
 <!-- BEGIN AUTO:develop-delta -->
-_Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (66b3d3f0); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
+_Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (8cbfda48); merge-base `7f453704`. **Auto-generated — do not edit by hand.**_
 
-`develop` is **82 commit(s)** ahead of `main`.
+`develop` is **84 commit(s)** ahead of `main`.
 
 ### Commits on `develop` not on `main`
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `8cbfda48` | fix(train): filter fully masked reward groups (#70) | dyurk-lila | 2026-07-21 |
+| `4417c94f` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-07-21 |
 | `66b3d3f0` | chore(sync): merge upstream fd79ceec into develop (#69) | dyurk-lila | 2026-07-21 |
 | `de3d8d61` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-07-20 |
 | `8674de8c` | refactor(generators): assemble incremental routed expert tra | dyurk-lila | 2026-07-20 |
@@ -185,7 +187,7 @@ _Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (66b3d3f0); merge-base `
  .../workflows/tinker_skyrl_train_backend_gpu.yaml  |    7 +-
  NOTICE                                             |   21 +
  README.md                                          |    3 -
- UPSTREAM.md                                        |  600 ++++
+ UPSTREAM.md                                        |  669 ++++
  ci/anyscale_gpu_ci.yaml                            |    6 +-
  ci/anyscale_gpu_ci_h100.yaml                       |    6 +-
  ci/anyscale_gpu_ci_skyrl_train.yaml                |    5 +-
@@ -499,7 +501,7 @@ _Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (66b3d3f0); merge-base `
  skyrl/train/utils/async_batch_collator.py          |   58 +
  skyrl/train/utils/logging_utils.py                 |   84 -
  skyrl/train/utils/tracking.py                      |  210 +-
- skyrl/train/utils/trainer_utils.py                 |   45 +-
+ skyrl/train/utils/trainer_utils.py                 |   52 +-
  skyrl/train/utils/trajectory_logging.py            |  350 ++
  skyrl/train/utils/utils.py                         |  155 +-
  skyrl/train/utils/vllm_metrics_scraper.py          |  223 +-
@@ -614,7 +616,7 @@ _Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (66b3d3f0); merge-base `
  tests/train/test_sft_packing_collate.py            |   70 +-
  tests/train/test_sft_tokenization.py               |   95 +-
  tests/train/test_tracking.py                       |    4 +-
- tests/train/test_trainer_utils.py                  |   12 +
+ tests/train/test_trainer_utils.py                  |   21 +
  tests/train/test_vllm_metrics_scraper.py           |  325 ++
  tests/train/util.py                                |    6 +-
  tests/train/utils/test_logging_config.py           |  120 +
@@ -623,7 +625,7 @@ _Last generated for `origin/main` (fd79ceec) ↔ `HEAD` (66b3d3f0); merge-base `
  upstream-sync/bedrock-ci-setup.md                  |  106 +
  upstream-sync/gen_develop_delta.sh                 |  104 +
  uv.lock                                            | 3778 +++++++++-----------
- 465 files changed, 30138 insertions(+), 13793 deletions(-)
+ 465 files changed, 30220 insertions(+), 13796 deletions(-)
 ```
 <!-- END AUTO:develop-delta -->
 
