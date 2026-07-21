@@ -733,6 +733,15 @@ def test_zero_variance_filter_single_live_trajectory_kept():
     assert zero_variance_filter(rewards, uids, loss_masks=loss_masks) == [0, 1]
 
 
+def test_zero_variance_filter_fully_masked_group_dropped():
+    """A group with no live trajectories cannot provide a training signal."""
+    rewards = [1.0, 0.0]
+    uids = ["a", "a"]
+    loss_masks = [[0, 0], [0, 0]]
+
+    assert zero_variance_filter(rewards, uids, loss_masks=loss_masks) == []
+
+
 def test_validate_generator_output_valid_case():
     """Test validate_generator_output with valid case."""
     input_batch = GeneratorInput(
