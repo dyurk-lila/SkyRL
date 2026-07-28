@@ -3,9 +3,7 @@
 import math
 from typing import Any, Iterable, Mapping, Optional, Tuple
 
-# vLLM floors non-finite logprobs to -9999.0 at every serving boundary (see
-# `clamp_prompt_logprobs` and the disagg serving path), and uses it as the
-# `ChatCompletionLogProb.logprob` default for tokens it reports no logprob for.
+# Matches the floor vLLM applies at its own serving boundaries.
 CLAMPED_LOGPROB = -9999.0
 
 
@@ -13,27 +11,18 @@ def build_logprobs_content(
     token_ids: Iterable[int],
     resp_logprobs: Iterable[Optional[Mapping[int, Any]]],
 ) -> Tuple[list[dict[str, float]], int]:
-    """Build the per-token ``logprobs.content`` wire payload for sampled tokens.
+    """Build ``logprobs.content``, flooring missing and non-finite logprobs.
 
-    vLLM occasionally reports a non-finite logprob for a token it just sampled
-    (``-inf`` from top-k/top-p masking that sampling then selects anyway), and
-    omits the entry entirely for others. Both are floored to ``CLAMPED_LOGPROB``
-    so the response stays JSON-serializable and one bad token cannot fail the
-    whole request.
+    vLLM reports a non-finite logprob for a token it just sampled every few
+    thousand rollouts, and omits the entry entirely for others. ``isfinite``
+    also catches NaN, which vLLM's own ``max(logprob, -9999.0)`` floor misses
+    because ``max`` returns its first argument on a False comparison.
 
-    Note ``math.isfinite`` also catches NaN, which vLLM's own ``max(logprob,
-    -9999.0)`` floor lets through -- ``max`` returns its first argument when the
-    comparison is False. NaN is the more damaging value downstream, since
-    ``reduce_loss`` multiplies by the loss mask and ``0.0 * nan`` is ``nan``.
+    Under ``off_policy_correction.tis_ratio_type="sequence"`` a clamped token
+    pins its whole trajectory at the importance-sampling cap; under ``"token"``
+    the effect stays bounded to that token.
 
-    Caveat: under ``off_policy_correction.tis_ratio_type="sequence"`` the
-    per-token log-ratios are summed before exponentiating, so a single clamped
-    token pins its whole trajectory at the importance-sampling cap. Under
-    ``"token"`` mode the effect is bounded to that one token.
-
-    Returns:
-        The ``content`` list (one entry per token id) and the number of tokens
-        whose logprob had to be clamped.
+    Returns the content list and how many entries were clamped.
     """
     content: list[dict[str, float]] = []
     num_clamped = 0
