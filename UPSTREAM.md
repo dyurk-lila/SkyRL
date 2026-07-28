@@ -57,14 +57,17 @@ their upstream implementations landed by `fd79ceec`.
 -->
 
 <!-- BEGIN AUTO:develop-delta -->
-_Last generated for `origin/main` (de1a58b4) ↔ `HEAD` (8161b29a); merge-base `de1a58b4`. **Auto-generated — do not edit by hand.**_
+_Last generated for `origin/main` (de1a58b4) ↔ `HEAD` (fe575101); merge-base `de1a58b4`. **Auto-generated — do not edit by hand.**_
 
-`develop` is **88 commit(s)** ahead of `main`.
+`develop` is **93 commit(s)** ahead of `main`.
 
 ### Commits on `develop` not on `main`
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `239e2be4` | style: apply black 24.10.0 formatting to routing-replay guar | lila-sync-bot | 2026-07-28 |
+| `538eff10` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-07-28 |
+| `eba569bd` | fix(megatron): reject moe_router_fusion together with routin | lila-sync-bot | 2026-07-28 |
 | `10156585` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-07-21 |
 | `8cbfda48` | fix(train): filter fully masked reward groups (#70) | dyurk-lila | 2026-07-21 |
 | `4417c94f` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-07-21 |
@@ -143,10 +146,12 @@ _Last generated for `origin/main` (de1a58b4) ↔ `HEAD` (8161b29a); merge-base `
 | `186fd6cc` | feat(upstream-sync): auto-regenerate develop↔main delta on m | dyurk-lila | 2026-06-10 |
 | `237a022f` | chore(upstream-sync): install sync tooling on develop (ledge | dyurk-lila | 2026-06-10 |
 
-<details><summary>merge commits (11)</summary>
+<details><summary>merge commits (13)</summary>
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `fe575101` | Merge pull request #72 from fl97inc/dyurk/reject-router-fu.. | dyurk-lila | 2026-07-28 |
+| `dd3c1c24` | Merge branch 'develop' into dyurk/reject-router-fusion-wit.. | lila-sync-bot | 2026-07-28 |
 | `8161b29a` | Merge pull request #71 from fl97inc/sync/develop-2026-07-27  | dyurk-lila | 2026-07-28 |
 | `deb0438b` | chore(sync): merge upstream de1a58b4 into develop            | lila-sync-bot | 2026-07-27 |
 | `2e8aa7ff` | chore(sync): record upstream fd79ceec ancestry (squash-mer.. | lila-sync-bot | 2026-07-27 |
@@ -170,9 +175,9 @@ _Last generated for `origin/main` (de1a58b4) ↔ `HEAD` (8161b29a); merge-base `
  .github/workflows/cpu_skyrl_train.yaml             |   4 +-
  .github/workflows/develop-delta.yaml               |  91 +++
  .github/workflows/gpu_skyrl.yaml                   |  23 +-
- .github/workflows/sync-upstream.yaml               | 654 ++++++++++++++++++++
+ .github/workflows/sync-upstream.yaml               | 654 +++++++++++++++++++++
  NOTICE                                             |  21 +
- UPSTREAM.md                                        | 671 +++++++++++++++++++++
+ UPSTREAM.md                                        | 276 +++++++++
  examples/train/sft/data_mixing_sampler.py          | 118 ++++
  pyproject.toml                                     |   2 +
  .../distributed/megatron/fused_lm_head.py          |  95 +++
@@ -183,7 +188,7 @@ _Last generated for `origin/main` (de1a58b4) ↔ `HEAD` (8161b29a); merge-base `
  .../inference_servers/vllm_server_actor.py         |  21 +-
  skyrl/backends/skyrl_train/training_batch.py       |  17 +-
  skyrl/backends/skyrl_train/utils/ppo_utils.py      |  53 +-
- skyrl/backends/skyrl_train/utils/replay_utils.py   | 333 +++++-----
+ skyrl/backends/skyrl_train/utils/replay_utils.py   | 333 +++++------
  .../workers/megatron/megatron_model_wrapper.py     | 225 +++----
  .../workers/megatron/megatron_worker.py            |  30 +-
  skyrl/backends/skyrl_train/workers/worker.py       | 148 +++--
@@ -200,7 +205,7 @@ _Last generated for `origin/main` (de1a58b4) ↔ `HEAD` (8161b29a); merge-base `
  skyrl/train/sft_trainer.py                         |  53 +-
  skyrl/train/trainer.py                             |  29 +-
  skyrl/train/utils/trainer_utils.py                 |  42 +-
- skyrl/train/utils/utils.py                         |   8 +-
+ skyrl/train/utils/utils.py                         |  17 +-
  skyrl/utils/routed_experts.py                      | 102 ++++
  skyrl/utils/token_metadata.py                      | 253 ++++++++
  .../test_chunked_logprob_backward_streaming.py     | 116 ++++
@@ -212,9 +217,9 @@ _Last generated for `origin/main` (de1a58b4) ↔ `HEAD` (8161b29a); merge-base `
  .../inference_servers/test_routed_experts_wire.py  |  92 +++
  .../skyrl_train/test_token_based_batching_utils.py |  12 +
  tests/backends/skyrl_train/test_train_batch.py     |  16 +-
- .../skyrl_train/utils/test_replay_utils.py         | 229 +++++++
+ .../skyrl_train/utils/test_replay_utils.py         | 229 ++++++++
  .../workers/test_sft_loss_fn_outputs_gate.py       | 228 +++++++
- .../skyrl_train/workers/test_worker_utils.py       |  33 +
+ .../skyrl_train/workers/test_worker_utils.py       |  33 ++
  tests/train/algorithms/test_losses.py              | 101 ++++
  tests/train/algorithms/test_skip_fwd_logprobs.py   |  30 +
  tests/train/dataset/test_preprocess.py             | 130 +++-
@@ -230,7 +235,7 @@ _Last generated for `origin/main` (de1a58b4) ↔ `HEAD` (8161b29a); merge-base `
  upstream-sync/bedrock-ci-setup.md                  | 106 ++++
  upstream-sync/gen_develop_delta.sh                 | 104 ++++
  uv.lock                                            |  10 +
- 66 files changed, 5577 insertions(+), 814 deletions(-)
+ 66 files changed, 5191 insertions(+), 814 deletions(-)
 ```
 <!-- END AUTO:develop-delta -->
 
