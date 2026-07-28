@@ -210,9 +210,7 @@ def validate_megatron_cfg(cfg: SkyRLTrainConfig):
         # silently discarded while R3 still pays its full cost. Refuse the pair rather
         # than train against routing that does not match the rollout.
         if config.megatron_config.moe_enable_routing_replay:
-            assert not config.megatron_config.transformer_config_kwargs.get(
-                "moe_router_fusion"
-            ), (
+            assert not config.megatron_config.transformer_config_kwargs.get("moe_router_fusion"), (
                 f"{worker_type}.megatron_config: moe_enable_routing_replay is incompatible with "
                 "moe_router_fusion=True -- the fused router bypasses replay. Set moe_router_fusion=False."
             )
