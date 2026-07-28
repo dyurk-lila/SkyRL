@@ -57,14 +57,17 @@ their upstream implementations landed by `fd79ceec`.
 -->
 
 <!-- BEGIN AUTO:develop-delta -->
-_Last generated for `origin/main` (de1a58b4) ↔ `HEAD` (fe575101); merge-base `de1a58b4`. **Auto-generated — do not edit by hand.**_
+_Last generated for `origin/main` (de1a58b4) ↔ `HEAD` (fd390ecb); merge-base `de1a58b4`. **Auto-generated — do not edit by hand.**_
 
-`develop` is **93 commit(s)** ahead of `main`.
+`develop` is **97 commit(s)** ahead of `main`.
 
 ### Commits on `develop` not on `main`
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `b71a38af` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-07-28 |
+| `cb4ebb56` | refactor: trim logprob clamp helper and tests | lila-sync-bot | 2026-07-28 |
+| `983ef334` | fix(r3): clamp non-finite sampled logprobs instead of failin | lila-sync-bot | 2026-07-28 |
 | `239e2be4` | style: apply black 24.10.0 formatting to routing-replay guar | lila-sync-bot | 2026-07-28 |
 | `538eff10` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-07-28 |
 | `eba569bd` | fix(megatron): reject moe_router_fusion together with routin | lila-sync-bot | 2026-07-28 |
@@ -146,10 +149,11 @@ _Last generated for `origin/main` (de1a58b4) ↔ `HEAD` (fe575101); merge-base `
 | `186fd6cc` | feat(upstream-sync): auto-regenerate develop↔main delta on m | dyurk-lila | 2026-06-10 |
 | `237a022f` | chore(upstream-sync): install sync tooling on develop (ledge | dyurk-lila | 2026-06-10 |
 
-<details><summary>merge commits (13)</summary>
+<details><summary>merge commits (14)</summary>
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `fd390ecb` | Merge pull request #73 from fl97inc/dyurk/clamp-nonfinite-.. | dyurk-lila | 2026-07-28 |
 | `fe575101` | Merge pull request #72 from fl97inc/dyurk/reject-router-fu.. | dyurk-lila | 2026-07-28 |
 | `dd3c1c24` | Merge branch 'develop' into dyurk/reject-router-fusion-wit.. | lila-sync-bot | 2026-07-28 |
 | `8161b29a` | Merge pull request #71 from fl97inc/sync/develop-2026-07-27  | dyurk-lila | 2026-07-28 |
@@ -177,15 +181,16 @@ _Last generated for `origin/main` (de1a58b4) ↔ `HEAD` (fe575101); merge-base `
  .github/workflows/gpu_skyrl.yaml                   |  23 +-
  .github/workflows/sync-upstream.yaml               | 654 +++++++++++++++++++++
  NOTICE                                             |  21 +
- UPSTREAM.md                                        | 276 +++++++++
+ UPSTREAM.md                                        | 281 +++++++++
  examples/train/sft/data_mixing_sampler.py          | 118 ++++
  pyproject.toml                                     |   2 +
  .../distributed/megatron/fused_lm_head.py          |  95 +++
  .../distributed/megatron/model_utils.py            |  21 +-
  .../backends/skyrl_train/inference_servers/base.py |   5 +-
+ .../skyrl_train/inference_servers/logprobs_wire.py |  35 ++
  .../inference_servers/remote_inference_client.py   | 318 ++++++----
  .../inference_servers/routed_experts_wire.py       |  45 ++
- .../inference_servers/vllm_server_actor.py         |  21 +-
+ .../inference_servers/vllm_server_actor.py         |  32 +-
  skyrl/backends/skyrl_train/training_batch.py       |  17 +-
  skyrl/backends/skyrl_train/utils/ppo_utils.py      |  53 +-
  skyrl/backends/skyrl_train/utils/replay_utils.py   | 333 +++++------
@@ -213,6 +218,7 @@ _Last generated for `origin/main` (de1a58b4) ↔ `HEAD` (fe575101); merge-base `
  .../megatron/test_chunked_logprob_backward.py      |   2 +-
  .../gpu/gpu_ci/megatron/test_router_replay.py      |  19 +-
  .../skyrl_train/gpu/gpu_ci/test_training_step.py   | 123 ++++
+ .../inference_servers/test_logprobs_wire.py        |  51 ++
  .../test_remote_inference_client.py                |  63 +-
  .../inference_servers/test_routed_experts_wire.py  |  92 +++
  .../skyrl_train/test_token_based_batching_utils.py |  12 +
@@ -235,7 +241,7 @@ _Last generated for `origin/main` (de1a58b4) ↔ `HEAD` (fe575101); merge-base `
  upstream-sync/bedrock-ci-setup.md                  | 106 ++++
  upstream-sync/gen_develop_delta.sh                 | 104 ++++
  uv.lock                                            |  10 +
- 66 files changed, 5191 insertions(+), 814 deletions(-)
+ 68 files changed, 5287 insertions(+), 820 deletions(-)
 ```
 <!-- END AUTO:develop-delta -->
 
