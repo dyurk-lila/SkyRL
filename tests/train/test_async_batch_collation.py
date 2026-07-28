@@ -26,7 +26,7 @@ def _build_test_sft_config(num_steps: int, batch_size: int) -> SFTConfig:
     cfg.placement = SFTPlacementConfig(num_nodes=1, num_gpus_per_node=1)
     cfg.dataset_name = "unused-monkeypatched"
     cfg.dataset_split = "train"
-    cfg.eval_dataset_name = None
+    cfg.eval_datasets = None  # no eval path
     cfg.eval_interval = 0
     cfg.eval_before_train = False
     cfg.num_steps = num_steps
@@ -226,7 +226,7 @@ def test_checkpoint_state_excludes_collated_ahead_batch(monkeypatch):
 
     assert checkpoint_states[0] is not None
     resumed = _make_trainer(
-        copy.deepcopy(cfg),
+        cfg,
         DefaultCollator(MagicMock(pad_token_id=0), micro_train_batch_size_per_gpu=1),
     )
     resumed.train_dataloader = resumed.build_train_dataloader(copy.deepcopy(data))
