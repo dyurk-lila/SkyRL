@@ -4,7 +4,6 @@ vLLM Server Actor - Ray actor running a vLLM OpenAI-compatible API server.
 
 import asyncio
 import logging
-import math
 import os
 import time
 from argparse import Namespace
@@ -35,6 +34,10 @@ from skyrl.backends.skyrl_train.inference_servers.common import (
     ServerInfo,
     find_and_reserve_port,
     get_node_ip,
+)
+from skyrl.backends.skyrl_train.inference_servers.logprobs_wire import (
+    CLAMPED_LOGPROB,
+    build_logprobs_content,
 )
 from skyrl.backends.skyrl_train.inference_servers.protocols import ServerActorProtocol
 from skyrl.backends.skyrl_train.inference_servers.routed_experts_wire import (
@@ -427,16 +430,12 @@ class VLLMServerActor(ServerActorProtocol):
 
             logprobs = None
             if resp.logprobs is not None:
-                content = []
-                for tid, lp_dict in zip(token_ids_out, resp.logprobs):
-                    if lp_dict and tid in lp_dict:
-                        logprob = lp_dict[tid].logprob
-                        if not math.isfinite(logprob):
-                            raise ValueError("Out of range float values are not JSON compliant")
-                        content.append({"logprob": logprob})
-                    else:
-                        # -9999.0 is the default in vLLM's ChatCompletionLogProb
-                        content.append({"logprob": -9999.0})
+                content, num_clamped = build_logprobs_content(token_ids_out, resp.logprobs)
+                if num_clamped:
+                    logger.warning(
+                        f"request {request_id}: clamped {num_clamped}/{len(token_ids_out)} missing or "
+                        f"non-finite sampled logprobs to {CLAMPED_LOGPROB}"
+                    )
                 logprobs = {"content": content}
 
             routed_experts = None
