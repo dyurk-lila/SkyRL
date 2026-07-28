@@ -53,6 +53,7 @@ from skyrl.train.config.sft_config import (
     _normalize_dataset_cfg,
     build_skyrl_config_for_sft,
 )
+from skyrl.train.dataset.pretokenized import load_from_pretokenized
 from skyrl.train.generators.utils import (
     get_response_ids_and_loss_mask_from_messages,
 )
@@ -1235,11 +1236,16 @@ class SFTTrainer:
             shutil.rmtree(tokenizer_cache_dir, ignore_errors=True)
 
     def load_dataset(self) -> tuple[list, list[int]]:
-        """Load and tokenize the training dataset(s).
+        """Load the training dataset(s): pretokenized stores or tokenize-on-load.
 
-        Each ``(name, split)`` pair from ``train_datasets``/``train_dataset_splits``
-        is tokenized independently through :meth:`_load_and_tokenize` (preserving
-        per-dataset cache keys), then concatenated in config order.
+        When ``pretokenized_dataset_paths`` is set, each store is loaded through
+        :func:`~skyrl.train.dataset.pretokenized.load_from_pretokenized` (same
+        ``list[dict]`` shape as :meth:`_load_and_tokenize`, no online
+        tokenization) and concatenated in config order. Otherwise each
+        ``(name, split)`` pair from ``train_datasets``/``train_dataset_splits``
+        is tokenized independently through :meth:`_load_and_tokenize`
+        (preserving per-dataset cache keys), then concatenated in config order.
+        Either way, multiple sources are mixed per ``train_dataset_weights``.
 
         Returns:
             ``(tokenized, dataset_lengths)`` where ``dataset_lengths`` holds the
@@ -1248,6 +1254,18 @@ class SFTTrainer:
         """
         tokenized: list = []
         dataset_lengths: list[int] = []
+        if self.sft_cfg.pretokenized_dataset_paths:
+            for path in self.sft_cfg.pretokenized_dataset_paths:
+                # The loader raises on 0 usable rows, so no empty-source check.
+                source = load_from_pretokenized(path, max_length=self.sft_cfg.max_length)
+                tokenized.extend(source)
+                dataset_lengths.append(len(source))
+            if len(dataset_lengths) > 1:
+                per_dataset = ", ".join(
+                    f"{path}={length}" for path, length in zip(self.sft_cfg.pretokenized_dataset_paths, dataset_lengths)
+                )
+                logger.info(f"Concatenated {len(dataset_lengths)} pretokenized datasets: {per_dataset}")
+            return tokenized, dataset_lengths
         for name, split in zip(self.sft_cfg.train_datasets, self.sft_cfg.train_dataset_splits):
             source = self._load_and_tokenize(name, split)
             if len(source) == 0:
@@ -1264,11 +1282,21 @@ class SFTTrainer:
     def load_eval_datasets(self) -> Optional[list[tuple[str, list]]]:
         """Load and tokenize the eval dataset(s), or return ``None`` if not configured.
 
+        When ``eval_pretokenized_dataset_paths`` is set, each store is loaded
+        through :func:`~skyrl.train.dataset.pretokenized.load_from_pretokenized`
+        and named by the corresponding entry of ``eval_dataset_names`` (filled
+        from the path basenames by config normalization when not set
+        explicitly).
+
         Returns:
-            One ``(name, tokenized)`` pair per entry of ``eval_datasets``, where
-            ``name`` comes from ``eval_dataset_names`` and namespaces the eval
-            metrics (``eval/{name}/...``).
+            One ``(name, tokenized)`` pair per eval source, where ``name``
+            namespaces the eval metrics (``eval/{name}/...``).
         """
+        if self.sft_cfg.eval_pretokenized_dataset_paths:
+            return [
+                (name, load_from_pretokenized(path, max_length=self.sft_cfg.max_length))
+                for name, path in zip(self.sft_cfg.eval_dataset_names, self.sft_cfg.eval_pretokenized_dataset_paths)
+            ]
         if not self.sft_cfg.eval_datasets:
             return None
         eval_sets: list[tuple[str, list]] = []
@@ -1369,15 +1397,12 @@ class SFTTrainer:
         if sampler_type == "random":
             if not multi_dataset:
                 return None
-            weights = self.sft_cfg.train_dataset_weights
-            if weights is None:
-                # Config normalization fills this on the standard path; default
-                # to equal mixing for directly-constructed trainers.
-                weights = [1.0 / len(dataset_lengths)] * len(dataset_lengths)
+            # Config normalization (validate_sft_cfg) fills equal weights for
+            # the random sampler on every construction path.
             return DataMixingSampler(
                 tokenized,
                 lengths=dataset_lengths,
-                weights=weights,
+                weights=self.sft_cfg.train_dataset_weights,
                 seed=self.sft_cfg.seed,
             )
         if sampler_type == "sequential":
@@ -1983,7 +2008,7 @@ class SFTTrainer:
 
                 with Timer("step", all_timings):
 
-                    # With async enabled, this is usually only the wait for an
+                    # With async enabled, this is usually just the wait for an
                     # already-running collate. ``None`` marks epoch exhaustion.
                     with Timer("data_loading", all_timings):
                         if async_collator is not None and async_collator.pending_step() == self.global_step:
@@ -2001,8 +2026,9 @@ class SFTTrainer:
                             batch = next(data_iter)
 
                     if async_collator is not None and self.global_step < num_steps:
-                        # The worker advances the live dataloader one batch ahead.
-                        # Preserve the state after the current batch for checkpoints.
+                        # Advancing the iterator in the worker moves the live
+                        # dataloader state one batch ahead. Preserve the state after
+                        # the current batch so checkpoints still resume exactly.
                         self._checkpoint_dataloader_state = self.train_dataloader.state_dict()
                         async_collator.submit(self.global_step + 1)
 
@@ -2100,6 +2126,10 @@ class SFTTrainer:
 
                 self.global_step += 1
         finally:
+            # Always tear down the async collation thread (drains any in-flight
+            # batch and joins the worker) so neither the background thread
+            # nor the dataset reference is leaked, even on exception. No-op
+            # when async collation is disabled.
             if async_collator is not None:
                 async_collator.shutdown()
             self._checkpoint_dataloader_state = None
@@ -2130,6 +2160,10 @@ class SFTTrainer:
                 self.global_step = final_step
                 logger.info(f"Saving final HF model at step {final_step}")
                 self.save_hf_model()
+
+        # Drain any in-flight async checkpoint write before teardown. Unconditional:
+        # a save may have happened outside the periodic path. No-op when nothing is pending.
+        self.dispatch.finalize_pending_saves("policy")
 
         # Final eval pass (skip if the last step already ran eval).
         # NOTE: The last in-loop tracker.log(..., commit=True) at step=num_steps
