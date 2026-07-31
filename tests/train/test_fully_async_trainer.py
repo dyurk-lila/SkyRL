@@ -15,6 +15,7 @@ from skyrl.train.fully_async_trainer import (
     GeneratedOutputGroup,
     _AsyncDataloader,
     _AsyncStalenessManager,
+    _is_cancellation,
 )
 
 
@@ -258,3 +259,57 @@ def test_should_keep_group_token_level_rewards():
         )
         is True
     )
+
+
+# --------------------------------------------------------------------------------------
+# _is_cancellation
+# --------------------------------------------------------------------------------------
+#
+# Regression guard for a bug that killed three 112-GPU runs after several clean steps.
+# A cancelled rollout running in a Ray actor surfaces as `TaskCancelledError`, which
+# derives from Exception (not asyncio.CancelledError) and arrives wrapped in an
+# ExceptionGroup from asyncio.TaskGroup. It therefore reached the generator loop's
+# `except Exception` branch and hit os._exit(1), turning a routine cancellation into a
+# hard process kill that also destroyed the traceback.
+
+
+def test_is_cancellation_plain_asyncio():
+    assert _is_cancellation(asyncio.CancelledError())
+
+
+def test_is_cancellation_ray_task_cancelled():
+    """TaskCancelledError is an Exception, not an asyncio.CancelledError -- the actual bug."""
+    from ray.exceptions import TaskCancelledError
+
+    exc = TaskCancelledError()
+    assert not isinstance(exc, asyncio.CancelledError)  # documents why the old handler missed it
+    assert _is_cancellation(exc)
+
+
+def test_is_cancellation_inside_exception_group():
+    """asyncio.TaskGroup re-raises children as a group; the cancellation is nested."""
+    from ray.exceptions import TaskCancelledError
+
+    assert _is_cancellation(BaseExceptionGroup("tg", [TaskCancelledError()]))
+    assert _is_cancellation(BaseExceptionGroup("tg", [asyncio.CancelledError()]))
+    # Nested groups (group of groups) still resolve.
+    assert _is_cancellation(BaseExceptionGroup("outer", [BaseExceptionGroup("inner", [TaskCancelledError()])]))
+
+
+def test_real_errors_stay_fatal():
+    """A genuine failure must NOT be swallowed as a cancellation."""
+    assert not _is_cancellation(RuntimeError("boom"))
+    assert not _is_cancellation(BaseExceptionGroup("tg", [RuntimeError("boom")]))
+
+
+def test_mixed_group_is_fatal():
+    """A real error bundled alongside a cancellation must remain fatal."""
+    from ray.exceptions import TaskCancelledError
+
+    mixed = BaseExceptionGroup("tg", [TaskCancelledError(), RuntimeError("boom")])
+    assert not _is_cancellation(mixed)
+
+
+def test_empty_group_is_fatal():
+    """Degenerate case: an empty group is not evidence of cancellation."""
+    assert not _is_cancellation(BaseExceptionGroup("tg", [ValueError()]).derive([]))
