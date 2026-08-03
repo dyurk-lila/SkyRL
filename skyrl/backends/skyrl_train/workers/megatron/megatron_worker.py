@@ -1045,12 +1045,6 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             if experience.image_grid_thw is not None:
                 vlm_inputs["image_grid_thw"] = experience.image_grid_thw
 
-            vlm_inputs = {}
-            if experience.pixel_values is not None:
-                vlm_inputs["pixel_values"] = experience.pixel_values
-            if experience.image_grid_thw is not None:
-                vlm_inputs["image_grid_thw"] = experience.image_grid_thw
-
             micro_buffer.append(
                 {
                     "sequences": sequences,
@@ -1170,12 +1164,6 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 0)
             rollout_expert_indices = experience.rollout_expert_indices
-
-            vlm_inputs = {}
-            if experience.pixel_values is not None:
-                vlm_inputs["pixel_values"] = experience.pixel_values
-            if experience.image_grid_thw is not None:
-                vlm_inputs["image_grid_thw"] = experience.image_grid_thw
 
             vlm_inputs = {}
             if experience.pixel_values is not None:
