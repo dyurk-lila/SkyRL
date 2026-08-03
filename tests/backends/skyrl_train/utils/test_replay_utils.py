@@ -145,6 +145,82 @@ def test_setup_replay_installs_indices_and_returns_model_mask(monkeypatch, paral
     assert routed_layer_counts == [1]
 
 
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_replay_indices_are_dtype_independent(monkeypatch, parallel_state, packed, tp_size):
+    """Feeding compact int16 routes must produce bit-identical int32 replay data.
+
+    Guards the removal of the early ``.to(torch.int32)`` in ``_forward_logprobs``:
+    the widening now happens inside ``_split_replay_indices``, after
+    ``index_select`` and the TP slice, so the host-side payload stays int16.
+    """
+    router_replay_module = types.ModuleType("megatron.core.transformer.moe.router_replay")
+
+    class RouterReplay:
+        global_router_replay_instances = [object(), object()]
+        replay_data = None
+
+        @classmethod
+        def set_replay_data(cls, replay_data):
+            cls.replay_data = replay_data
+
+        @classmethod
+        def set_global_router_replay_action(cls, action):
+            pass
+
+    router_replay_module.RouterReplay = RouterReplay
+    router_replay_module.RouterReplayAction = SimpleNamespace(REPLAY_FORWARD="replay_forward")
+    monkeypatch.setitem(sys.modules, "megatron.core.transformer.moe.router_replay", router_replay_module)
+    monkeypatch.setattr(replay_utils, "_get_current_pp_stage_layer_range", lambda model_config: (1, 2))
+    monkeypatch.setattr(
+        replay_utils,
+        "scatter_router_padding_mask_for_model",
+        lambda mask, model, model_config: mask,
+    )
+    monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_world_size", lambda: tp_size, raising=False)
+    monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_rank", lambda: tp_size - 1, raising=False)
+
+    batch, seq_len, num_layers, topk = 2, 8, 4, 2
+    # Expert ids above 2**8 so the compact dtype is int16 rather than uint8.
+    base = torch.arange(batch * seq_len * num_layers * topk, dtype=torch.int32) % 4096 + 256
+    routes_int32 = base.reshape(batch, seq_len, num_layers, topk)
+    routes_int16 = routes_int32.to(torch.int16)
+    assert torch.equal(routes_int16.to(torch.int32), routes_int32), "fixture must be int16-representable"
+
+    attention_mask = torch.ones((batch, seq_len), dtype=torch.long)
+    attention_mask[0, 0] = 0
+    router_padding_mask = torch.zeros((batch, seq_len), dtype=torch.bool)
+    router_padding_mask[1, -1] = True
+
+    def run(routes):
+        layout = build_token_metadata_layout(
+            attention_mask,
+            routes.device,
+            packed=packed,
+            fp8_enabled=False,
+        )
+        replay_utils.setup_per_microbatch_replay_forward(
+            routes,
+            router_padding_mask,
+            attention_mask,
+            model=object(),
+            model_config=SimpleNamespace(fp8=None, sequence_parallel=False),
+            metadata_layout=layout,
+            remove_microbatch_padding=packed,
+        )
+        return [tensor.clone() for tensor in RouterReplay.replay_data]
+
+    from_int16 = run(routes_int16)
+    from_int32 = run(routes_int32)
+
+    assert len(from_int16) == len(from_int32) == 2
+    for narrow, wide in zip(from_int16, from_int32, strict=True):
+        # int32 output dtype is preserved, and the values are bit-identical.
+        assert narrow.dtype == wide.dtype == torch.int32
+        assert narrow.shape == wide.shape
+        assert torch.equal(narrow, wide)
+
+
 @pytest.mark.parametrize(
     ("model_kind", "pre_process", "expected"),
     [
