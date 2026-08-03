@@ -53,7 +53,7 @@ from skyrl.env_vars import SKYRL_RAY_PG_TIMEOUT_IN_S
 from skyrl.train.config import SkyRLTrainConfig
 from skyrl.train.dataset import PromptDataset
 from skyrl.train.dataset.preprocess import (
-    build_dense_sample_support,
+    build_sample_support_replay,
     compute_prompt_boundaries,
     compute_prompt_mini_batch_boundaries,
     convert_prompts_responses_to_batch_tensors,
@@ -913,13 +913,16 @@ class RayPPOTrainer:
                 attention_masks_tensor,
                 [len(indices) for indices in rollout_expert_indices],
             )
-        sample_support_ids = build_dense_sample_support(
+        sampling_params = self.cfg.generator.sampling_params
+        use_sparse_sample_support = sampling_params.top_p < 1.0 or sampling_params.min_p > 0.0
+        sample_support_ids, sample_support_csr_ids, sample_support_csr_offsets = build_sample_support_replay(
             rollout_sample_support,
             response_ids,
             loss_masks,
             sequences_tensor.shape[1],
-            self.cfg.generator.sampling_params.top_k,
+            sampling_params.top_k,
             self.tokenizer.eos_token_id,
+            use_sparse=use_sparse_sample_support,
         )
 
         # sanity check for off_policy_correction
@@ -944,6 +947,8 @@ class RayPPOTrainer:
                 "rollout_expert_indices": rollout_expert_indices_tensor,
                 "router_padding_mask": router_padding_mask,
                 "sample_support_ids": sample_support_ids,
+                "sample_support_csr_ids": sample_support_csr_ids,
+                "sample_support_csr_offsets": sample_support_csr_offsets,
                 "pixel_values": pixel_values,
                 "image_grid_thw": image_grid_thw,
             },
@@ -1341,6 +1346,8 @@ class RayPPOTrainer:
             fwd_keys.append("router_padding_mask")
         if training_input.get("sample_support_ids") is not None:
             fwd_keys.extend(["sample_support_ids", "loss_mask"])
+        if training_input.get("sample_support_csr_ids") is not None:
+            fwd_keys.extend(["sample_support_csr_ids", "sample_support_csr_offsets", "loss_mask"])
         if training_input.get("pixel_values") is not None:
             fwd_keys.append("pixel_values")
         if training_input.get("image_grid_thw") is not None:

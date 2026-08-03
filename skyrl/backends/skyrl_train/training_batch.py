@@ -85,6 +85,9 @@ class TensorList:
     def to(self, device=None, dtype=None, non_blocking=False):
         return TensorList([t.to(device=device, dtype=dtype, non_blocking=non_blocking) for t in self.tensors])
 
+    def pin_memory(self):
+        return TensorList([tensor.pin_memory() for tensor in self.tensors])
+
     def contiguous(self):
         return TensorList([t.contiguous() for t in self.tensors])
 
@@ -486,6 +489,8 @@ class TrainingInput(TypedDict, total=False):
     rollout_expert_indices: Optional[Integer[torch.Tensor, "batch_size seq_len layer_num topk"]]  # MoE router replay
     router_padding_mask: Optional[Bool[torch.Tensor, "batch_size seq_len"]]  # True = no captured route (skip in replay)
     sample_support_ids: Optional[Integer[torch.Tensor, "batch_size seq_len topk"]]  # sampler support, -1 = padding
+    sample_support_csr_ids: Optional[TensorList]
+    sample_support_csr_offsets: Optional[TensorList]
     pixel_values: Optional[TensorList]  # list of `batch_size` [num_patches_i, dim] tensors
     image_grid_thw: Optional[TensorList]  # list of `batch_size` [num_images_i, 3] tensors
 
@@ -493,7 +498,15 @@ class TrainingInput(TypedDict, total=False):
 class TrainingInputBatch(TensorBatch[TrainingInput]):
     """Training input data"""
 
-    pass
+    def _check_consistency(self):
+        super()._check_consistency()
+        dense_ids = dict.get(self, "sample_support_ids")
+        csr_ids = dict.get(self, "sample_support_csr_ids")
+        csr_offsets = dict.get(self, "sample_support_csr_offsets")
+        if (csr_ids is None) != (csr_offsets is None):
+            raise ValueError("sample_support_csr_ids and sample_support_csr_offsets must be provided together")
+        if dense_ids is not None and csr_ids is not None:
+            raise ValueError("dense and CSR sample support are mutually exclusive")
 
 
 class TrainingOutputBatch(TensorBatch[Dict[str, torch.Tensor]]):
@@ -525,7 +538,13 @@ def pad_training_input_batch(unpadded_batch: TrainingInputBatch, pad_size: int) 
             new_tensors[key] = None
             continue
 
-        if isinstance(tensor, TensorList):
+        if key == "sample_support_csr_ids":
+            padding = TensorList([tensor[0].new_empty(0) for _ in range(pad_size)])
+            new_tensors[key] = TensorList.cat([tensor, padding])
+        elif key == "sample_support_csr_offsets":
+            padding = TensorList([tensor[0].new_zeros(1) for _ in range(pad_size)])
+            new_tensors[key] = TensorList.cat([tensor, padding])
+        elif isinstance(tensor, TensorList):
             assert len(tensor) > 0, f"Cannot pad empty TensorList field {key!r}"
             padding = TensorList([tensor[0].clone() for _ in range(pad_size)])
             new_tensors[key] = TensorList.cat([tensor, padding])

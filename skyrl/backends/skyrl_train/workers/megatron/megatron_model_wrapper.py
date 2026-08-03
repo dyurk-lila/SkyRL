@@ -296,6 +296,8 @@ class MegatronModelWrapper:
                     sequences,
                     data.get("loss_mask"),
                     data.get("sample_support_ids"),
+                    data.get("sample_support_csr_ids"),
+                    data.get("sample_support_csr_offsets"),
                     data["num_actions"],
                     packed=packed_seq_params is not None,
                     metadata_layout=metadata_layout,
@@ -381,6 +383,13 @@ class MegatronModelWrapper:
             rollout_expert_indices = batch.pop("rollout_expert_indices", None)
             router_padding_mask = batch.pop("router_padding_mask", None)
             sample_support_ids = batch.get("sample_support_ids")
+            sample_support_csr_ids = batch.get("sample_support_csr_ids")
+            sample_support_csr_offsets = batch.get("sample_support_csr_offsets")
+            if (sample_support_csr_ids is None) != (sample_support_csr_offsets is None):
+                raise ValueError("sample-support CSR ids and offsets must be supplied together")
+            if sample_support_ids is not None and sample_support_csr_ids is not None:
+                raise ValueError("sample-support replay accepts either dense or CSR metadata, not both")
+            has_sample_support = sample_support_ids is not None or sample_support_csr_ids is not None
 
             sequences = batch["sequences"]
             attention_mask = batch["attention_mask"].to(bool)
@@ -389,7 +398,7 @@ class MegatronModelWrapper:
             sub_seq_lengths = [t.tolist() for t in sub_seq_lengths_field] if sub_seq_lengths_field is not None else None
             batch["sub_seq_lengths_list"] = sub_seq_lengths
             if (
-                sample_support_ids is not None
+                has_sample_support
                 and sub_seq_lengths is not None
                 and any(len(row_lengths) > 1 for row_lengths in sub_seq_lengths)
             ):
@@ -430,7 +439,7 @@ class MegatronModelWrapper:
                     new_position_ids = None
 
             metadata_layout = None
-            if rollout_expert_indices is not None or (sample_support_ids is not None and packed_seq_params is not None):
+            if rollout_expert_indices is not None or (has_sample_support and packed_seq_params is not None):
                 metadata_layout = build_token_metadata_layout(
                     attention_mask,
                     attention_mask.device,
@@ -640,6 +649,8 @@ class MegatronModelWrapper:
                     sequences,
                     loss_mask,
                     data.get("sample_support_ids"),
+                    data.get("sample_support_csr_ids"),
+                    data.get("sample_support_csr_offsets"),
                     num_actions,
                     packed=packed_seq_params is not None,
                     metadata_layout=metadata_layout,
@@ -1020,6 +1031,13 @@ class MegatronModelWrapper:
             rollout_expert_indices = batch.pop("rollout_expert_indices", None)
             router_padding_mask = batch.pop("router_padding_mask", None)
             sample_support_ids = batch.get("sample_support_ids")
+            sample_support_csr_ids = batch.get("sample_support_csr_ids")
+            sample_support_csr_offsets = batch.get("sample_support_csr_offsets")
+            if (sample_support_csr_ids is None) != (sample_support_csr_offsets is None):
+                raise ValueError("sample-support CSR ids and offsets must be supplied together")
+            if sample_support_ids is not None and sample_support_csr_ids is not None:
+                raise ValueError("sample-support replay accepts either dense or CSR metadata, not both")
+            has_sample_support = sample_support_ids is not None or sample_support_csr_ids is not None
 
             sequences = batch["sequences"]
             attention_mask = batch["attention_mask"].to(bool)
@@ -1036,7 +1054,7 @@ class MegatronModelWrapper:
             sub_seq_lengths = [t.tolist() for t in sub_seq_lengths_field] if sub_seq_lengths_field is not None else None
             batch["sub_seq_lengths_list"] = sub_seq_lengths
             if (
-                sample_support_ids is not None
+                has_sample_support
                 and sub_seq_lengths is not None
                 and any(len(row_lengths) > 1 for row_lengths in sub_seq_lengths)
             ):
@@ -1090,7 +1108,7 @@ class MegatronModelWrapper:
             is_last_stage = mpu.is_pipeline_last_stage(ignore_virtual=True)
 
             metadata_layout = None
-            if rollout_expert_indices is not None or (sample_support_ids is not None and packed_seq_params is not None):
+            if rollout_expert_indices is not None or (has_sample_support and packed_seq_params is not None):
                 metadata_layout = build_token_metadata_layout(
                     attention_mask,
                     attention_mask.device,

@@ -449,7 +449,10 @@ async def test_agent_loop_uses_incremental_replay_metadata_traces(
         output_ids = [10, 11]
         num_route_rows = len(prompt_tokens) - prompt_start + len(output_ids) - 1
         routes = np.arange(num_route_rows * 4, dtype=np.int32).reshape(num_route_rows, 2, 2) % 8
-        sample_support = [[10, 100 + generation_index], [11, 110 + generation_index]]
+        sample_support = np.asarray(
+            [[10, 100 + generation_index], [11, 110 + generation_index]],
+            dtype=np.int32,
+        )
         generation_index += 1
         return {
             "responses": ["mocked output"],
@@ -477,9 +480,9 @@ async def test_agent_loop_uses_incremental_replay_metadata_traces(
     )
 
     assert prompt_starts == [0, 5]
-    assert output.rollout_sample_support[:2] == [[10, 100], [11, 110]]
-    assert output.rollout_sample_support[-2:] == [[10, 101], [11, 111]]
-    assert all(row == [-1, -1] for row in output.rollout_sample_support[2:-2])
+    np.testing.assert_array_equal(output.rollout_sample_support[:2], [[10, 100], [11, 110]])
+    np.testing.assert_array_equal(output.rollout_sample_support[-2:], [[10, 101], [11, 111]])
+    np.testing.assert_array_equal(output.rollout_sample_support[2:-2], -1)
 
 
 @pytest.mark.asyncio

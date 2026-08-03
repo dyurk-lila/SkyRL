@@ -239,7 +239,10 @@ class TestMergeStepwiseOutput:
             "rollout_logprobs": [[-0.5], [-0.3, -0.4]],
             "trajectory_ids": [tid, tid],
             "rollout_expert_indices": None,
-            "rollout_sample_support": [[[20, 21]], [[40, 42], [41, 43]]],
+            "rollout_sample_support": [
+                np.asarray([[20, 21]], dtype=np.int32),
+                np.asarray([[40, 42], [41, 43]], dtype=np.int32),
+            ],
             "is_last_step": [False, True],
         }
 
@@ -253,7 +256,10 @@ class TestMergeStepwiseOutput:
         assert merged["loss_masks"] == [[1, 0, 1, 1]]
         # logprobs: A1=-0.5, O2=0.0, A2_tok1=-0.3, A2_tok2=-0.4
         assert merged["rollout_logprobs"] == [[-0.5, 0.0, -0.3, -0.4]]
-        assert merged["rollout_sample_support"] == [[[20, 21], [], [40, 42], [41, 43]]]
+        np.testing.assert_array_equal(
+            merged["rollout_sample_support"][0],
+            [[20, 21], [-1, -1], [40, 42], [41, 43]],
+        )
         # rewards: A1=1.0, O2=0.0, A2_tok1=0.0, A2_tok2=5.0
         assert merged["rewards"] == [[1.0, 0.0, 0.0, 5.0]]
         assert merged["stop_reasons"] == ["eos"]

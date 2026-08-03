@@ -44,6 +44,11 @@ from skyrl.train.generators.utils import (
     get_generation_prompt_ids,
     get_rollout_metrics,
 )
+from skyrl.utils.sample_support import (
+    append_empty_sample_support_rows,
+    slice_sample_support_rows,
+    validate_sample_support,
+)
 from skyrl_gym.envs.base_text_env import BaseTextEnvStepOutput
 
 
@@ -59,7 +64,7 @@ class TrajectoryOutput:
     rollout_logprobs: Optional[List[float]]
     env_metrics: Dict[str, Any]
     rollout_expert_indices: Optional[RoutedExpertIndices] = None
-    rollout_sample_support: Optional[List[List[int]]] = None
+    rollout_sample_support: Optional[np.ndarray] = None
     pixel_values: Optional[torch.Tensor] = None
     image_grid_thw: Optional[torch.Tensor] = None
     # End-to-end wall-clock time (seconds) to generate this trajectory. Optional: agent loops may
@@ -109,15 +114,13 @@ class TurnOutput:
     def get_turn_rollout_sample_support(self) -> Optional[np.ndarray]:
         if self.rollout_sample_support is None:
             return None
-        padding_count = int(self.added_eos) + len(self.obs_ids)
-        if not padding_count:
-            return self.rollout_sample_support
-        padding = np.full(
-            (padding_count, self.rollout_sample_support.shape[1]),
-            -1,
-            dtype=self.rollout_sample_support.dtype,
-        )
-        return np.concatenate((self.rollout_sample_support, padding), axis=0)
+        sample_support = validate_sample_support(self.rollout_sample_support)
+        generated_token_count = len(self.output_ids) - int(self.added_eos)
+        if sample_support.shape[0] != generated_token_count:
+            raise ValueError(
+                f"Sample support has {sample_support.shape[0]} rows for {generated_token_count} generated tokens"
+            )
+        return append_empty_sample_support_rows(sample_support, int(self.added_eos) + len(self.obs_ids))
 
     def get_turn_loss_mask(self) -> List[int]:
         """
@@ -462,13 +465,16 @@ class SkyRLGymGenerator(GeneratorInterface):
                     )
                 sample_support_rows = None
                 if capture_sample_support:
-                    sample_support_rows = np.asarray(
-                        engine_output["rollout_sample_support"][0],
-                        dtype=np.int32,
-                        order="C",
-                    ).reshape(-1, sample_support_width)
+                    returned_sample_support = engine_output["rollout_sample_support"]
+                    if returned_sample_support is None or len(returned_sample_support) != 1:
+                        raise RuntimeError("Sample-support generation must return one array per request")
+                    sample_support_rows = validate_sample_support(returned_sample_support[0])
                     if self.custom_chat_template is not None:
                         raise ValueError("Sample-support bookkeeping is not supported with custom chat template")
+                    if sample_support_rows.shape[1] != sample_support_width:
+                        raise ValueError(
+                            f"Sample support has width {sample_support_rows.shape[1]}, expected {sample_support_width}"
+                        )
                     if sample_support_rows.shape[0] != len(output_ids):
                         raise ValueError(
                             f"Sample support has {sample_support_rows.shape[0]} rows for {len(output_ids)} tokens"
@@ -543,9 +549,7 @@ class SkyRLGymGenerator(GeneratorInterface):
                         rollout_logprobs=turn_response_logprobs,
                         stop_reason=stop_reason,
                         env_metrics=env.get_metrics() if agent_loop_state.done else {},
-                        rollout_sample_support=(
-                            turn_sample_support.tolist() if turn_sample_support is not None else None
-                        ),
+                        rollout_sample_support=turn_sample_support,
                     )
                     agent_loop_output.step_outputs.append(per_step_output)
 
@@ -640,7 +644,7 @@ class SkyRLGymGenerator(GeneratorInterface):
                     raise ValueError(
                         f"Sample-support trace has {sample_support_rows.shape[0]} rows for {len(response_ids)} tokens"
                     )
-                rollout_sample_support_out = sample_support_rows[: len(response_ids)].tolist()
+                rollout_sample_support_out = slice_sample_support_rows(sample_support_rows, len(response_ids))
 
             if self.generator_cfg.step_wise_trajectories:
                 for per_step_output, (reward, resp_end_idx) in zip(agent_loop_output.step_outputs, per_step_rewards):
@@ -836,9 +840,10 @@ class SkyRLGymGenerator(GeneratorInterface):
         env_metrics = []
         truncated_logprobs: Optional[List[List[float]]] = [] if logprobs is not None else None
         truncated_indices: Optional[List[RoutedExpertIndices]] = [] if raw_rollout_expert_indices is not None else None
-        truncated_sample_support: Optional[List[List[List[int]]]] = (
-            [] if raw_rollout_sample_support is not None else None
-        )
+        truncated_sample_support: Optional[List[np.ndarray]] = [] if raw_rollout_sample_support is not None else None
+
+        if raw_rollout_sample_support is not None and len(raw_rollout_sample_support) != len(responses):
+            raise RuntimeError("Sample-support generation must return one array per response")
 
         for i, (output, response, env, env_class) in enumerate(zip(outputs, responses, envs, env_classes)):
             # step on environment and compute reward
@@ -858,7 +863,12 @@ class SkyRLGymGenerator(GeneratorInterface):
                 prompt_len = len(prompt_token_ids[i])
                 truncated_indices.append(sample_indices[: prompt_len + len(response)])
             if raw_rollout_sample_support is not None:
-                truncated_sample_support.append(raw_rollout_sample_support[i][: len(response)])
+                sample_support = validate_sample_support(raw_rollout_sample_support[i])
+                if sample_support.shape[0] != len(responses[i]):
+                    raise ValueError(
+                        f"Sample support has {sample_support.shape[0]} rows for {len(responses[i])} generated tokens"
+                    )
+                truncated_sample_support.append(slice_sample_support_rows(sample_support, len(response)))
 
             # Get environment-specific metrics
             env_metrics.append(env.get_metrics())
@@ -1026,9 +1036,10 @@ class SkyRLGymGenerator(GeneratorInterface):
             ]
         else:
             sample_support_values = [output.rollout_sample_support for output in all_outputs]
-        rollout_sample_support = (
-            sample_support_values if any(value is not None for value in sample_support_values) else None
-        )
+        has_sample_support = [value is not None for value in sample_support_values]
+        if any(has_sample_support) and not all(has_sample_support):
+            raise RuntimeError("Sample-support capture must be consistent across generated trajectories")
+        rollout_sample_support = sample_support_values if all(has_sample_support) else None
 
         rollout_metrics = get_rollout_metrics(
             responses,

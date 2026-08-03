@@ -79,6 +79,14 @@ class Experience:
     # packed row); ``None`` when packing is off.
     sub_seq_lengths: Optional[TensorList] = None
     sample_support_ids: Optional[Integer[torch.Tensor, "batch seq_len topk"]] = None
+    sample_support_csr_ids: Optional[TensorList] = None
+    sample_support_csr_offsets: Optional[TensorList] = None
+
+    def __post_init__(self) -> None:
+        if (self.sample_support_csr_ids is None) != (self.sample_support_csr_offsets is None):
+            raise ValueError("sample_support_csr_ids and sample_support_csr_offsets must be provided together")
+        if self.sample_support_ids is not None and self.sample_support_csr_ids is not None:
+            raise ValueError("dense and CSR sample support are mutually exclusive")
 
     @torch.no_grad()
     def to_device(self, device: torch.device) -> None:
@@ -105,6 +113,10 @@ class Experience:
             self.rollout_expert_indices = to(self.rollout_expert_indices, device)
         if self.sample_support_ids is not None:
             self.sample_support_ids = to(self.sample_support_ids, device)
+        if self.sample_support_csr_ids is not None:
+            self.sample_support_csr_ids = self.sample_support_csr_ids.to(device)
+        if self.sample_support_csr_offsets is not None:
+            self.sample_support_csr_offsets = self.sample_support_csr_offsets.to(device)
         if self.router_padding_mask is not None:
             self.router_padding_mask = to(self.router_padding_mask, device)
         if self.pixel_values is not None:
@@ -138,6 +150,10 @@ class Experience:
             self.rollout_expert_indices = self.rollout_expert_indices.pin_memory()
         if self.sample_support_ids is not None:
             self.sample_support_ids = self.sample_support_ids.pin_memory()
+        if self.sample_support_csr_ids is not None:
+            self.sample_support_csr_ids = self.sample_support_csr_ids.pin_memory()
+        if self.sample_support_csr_offsets is not None:
+            self.sample_support_csr_offsets = self.sample_support_csr_offsets.pin_memory()
         if self.router_padding_mask is not None:
             self.router_padding_mask = self.router_padding_mask.pin_memory()
         return self
@@ -170,6 +186,9 @@ class BufferItem:
     attention_mask: Optional[Integer[torch.LongTensor, "seq_len"]]  # noqa: F821
     loss_mask: Optional[Integer[torch.LongTensor, "response_len"]]  # noqa: F821
     response_mask: Optional[Integer[torch.Tensor, "response_len"]]  # noqa: F821
+    sample_support_ids: Optional[Integer[torch.Tensor, "seq_len topk"]]
+    sample_support_csr_ids: Optional[Integer[torch.Tensor, "members"]]  # noqa: F821
+    sample_support_csr_offsets: Optional[Integer[torch.Tensor, "response_len_plus_one"]]  # noqa: F821
     num_actions: int
     info: Optional[dict]
 
@@ -198,6 +217,9 @@ def split_experience_batch(experience: Experience) -> List[BufferItem]:
         "attention_mask",
         "loss_mask",
         "response_mask",
+        "sample_support_ids",
+        "sample_support_csr_ids",
+        "sample_support_csr_offsets",
         "num_actions",
     )
     if len(experience.sequences.shape) == 1:
@@ -266,12 +288,22 @@ def make_experience_batch(items: List[BufferItem]) -> Experience:
         "attention_mask",
         "loss_mask",
         "response_mask",
+        "sample_support_ids",
+        "sample_support_csr_ids",
+        "sample_support_csr_offsets",
         "num_actions",
     )
     for key in keys:
         vals = [getattr(item, key) for item in items]
         # NOTE (sumanthrh): Assumes list of Tensors
-        batch_data = vals if vals[0] is not None else None
+        if vals[0] is None:
+            batch_data = None
+        elif key in {"sample_support_csr_ids", "sample_support_csr_offsets"}:
+            batch_data = TensorList(vals)
+        elif key == "sample_support_ids":
+            batch_data = torch.stack(vals)
+        else:
+            batch_data = vals
         kwargs[key] = batch_data
 
     kwargs["info"] = {}

@@ -10,7 +10,7 @@ import torch
 from jaxtyping import Float, Integer
 from pytest import approx
 
-from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
+from skyrl.backends.skyrl_train.training_batch import TensorList, TrainingInputBatch
 from skyrl.backends.skyrl_train.workers.worker import CriticWorkerBase, PolicyWorkerBase
 from skyrl.backends.skyrl_train.workers.worker_utils import BatchIterator
 from skyrl.train.config import SkyRLTrainConfig
@@ -73,7 +73,11 @@ def _get_test_data(trainer: RayPPOTrainer):
     ret_sequences: Float[torch.Tensor, "batch_size total_seq_len"] = torch.randint(0, 1000, (batch_size, total_seq_len))
     ret_attention_masks: Float[torch.Tensor, "batch_size total_seq_len"] = torch.ones((batch_size, total_seq_len))
     ret_loss_masks: Integer[torch.Tensor, "batch_size total_seq_len"] = torch.stack(
-        [torch.tensor([1, 1, 0, 0, 0], dtype=torch.int32), torch.tensor([1, 1, 1, 0, 0], dtype=torch.int32)], dim=0
+        [
+            torch.tensor([1, 1, 0, 0, 0], dtype=torch.int32),
+            torch.tensor([1, 1, 1, 0, 0], dtype=torch.int32),
+        ],
+        dim=0,
     )
     base_log_probs: Float[torch.Tensor, "batch_size total_seq_len"] = torch.log(
         torch.tensor([[0.1, 0.2, 0.3, 0.2, 0.2], [0.25, 0.25, 0.25, 0.15, 0.10]])
@@ -82,11 +86,19 @@ def _get_test_data(trainer: RayPPOTrainer):
         torch.tensor([[0.1, 0.3, 0.2, 0.2, 0.2], [0.3, 0.3, 0.2, 0.1, 0.1]])
     )
     response_masks: Integer[torch.Tensor, "batch_size total_seq_len"] = torch.stack(
-        [torch.tensor([1, 1, 1, 0, 0], dtype=torch.int32), torch.tensor([1, 1, 1, 1, 1], dtype=torch.int32)], dim=0
+        [
+            torch.tensor([1, 1, 1, 0, 0], dtype=torch.int32),
+            torch.tensor([1, 1, 1, 1, 1], dtype=torch.int32),
+        ],
+        dim=0,
     )
     actual_response_lengths: Float[torch.Tensor, "batch_size"] = response_masks.sum(dim=-1).to(float)
     rewards_all: Float[torch.Tensor, "batch_size total_seq_len"] = torch.stack(
-        [torch.tensor([0.0, 1.0, 0.0, 0.0, 0.0]), torch.tensor([0.0, 0.0, 1.0, 0.0, 0.0])], dim=0
+        [
+            torch.tensor([0.0, 1.0, 0.0, 0.0, 0.0]),
+            torch.tensor([0.0, 0.0, 1.0, 0.0, 0.0]),
+        ],
+        dim=0,
     )
     values: Float[torch.Tensor, "batch_size action_len"] = torch.randn(batch_size, action_len)
     uids: np.ndarray[str] = np.array(["0", "0"])
@@ -145,6 +157,49 @@ def test_fwd_logprobs_preserves_sample_support_and_loss_mask(dummy_config):
     assert torch.equal(seen["loss_mask"], batch["loss_mask"])
 
 
+def test_fwd_logprobs_preserves_csr_sample_support_and_loss_mask(dummy_config):
+    dummy_config.trainer.critic.model.path = None
+    trainer = object.__new__(RayPPOTrainer)
+    trainer.cfg = dummy_config
+    trainer.ref_model = None
+    trainer.dispatch = MagicMock()
+    trainer.all_metrics = {}
+    trainer._skip_policy_forward = MagicMock(return_value=False)
+    seen = {}
+
+    def execute_forward_pass(model, batch, **kwargs):
+        seen.update(batch)
+        return torch.zeros((2, 3))
+
+    trainer._execute_forward_pass = execute_forward_pass
+    batch = TrainingInputBatch(
+        {
+            "sequences": torch.ones((2, 4), dtype=torch.long),
+            "attention_mask": torch.ones((2, 4), dtype=torch.long),
+            "loss_mask": torch.ones((2, 3)),
+            "sample_support_csr_ids": TensorList(
+                [
+                    torch.tensor([1, 2], dtype=torch.int32),
+                    torch.tensor([3], dtype=torch.int32),
+                ]
+            ),
+            "sample_support_csr_offsets": TensorList(
+                [
+                    torch.tensor([0, 2], dtype=torch.int32),
+                    torch.tensor([0, 1], dtype=torch.int32),
+                ]
+            ),
+        }
+    )
+    batch.metadata = {"response_length": 3}
+
+    trainer.fwd_logprobs_values_reward(batch)
+
+    assert seen["sample_support_csr_ids"] == batch["sample_support_csr_ids"]
+    assert seen["sample_support_csr_offsets"] == batch["sample_support_csr_offsets"]
+    assert torch.equal(seen["loss_mask"], batch["loss_mask"])
+
+
 def test_calculate_kl_create_experience_batched(dummy_config):
     trainer = RayPPOTrainer(
         cfg=dummy_config,
@@ -163,7 +218,10 @@ def test_calculate_kl_create_experience_batched(dummy_config):
     assert metrics["avg_kl"] == approx(0.1249, abs=1e-4)
 
 
-@patch("skyrl.backends.skyrl_train.utils.ppo_utils.compute_advantages_and_returns", new_callable=MagicMock)
+@patch(
+    "skyrl.backends.skyrl_train.utils.ppo_utils.compute_advantages_and_returns",
+    new_callable=MagicMock,
+)
 def test_calc_advantages_and_returns(mock_compute_adv_and_ret, dummy_config):
     trainer = RayPPOTrainer(
         cfg=dummy_config,
@@ -195,7 +253,8 @@ def test_calc_advantages_and_returns(mock_compute_adv_and_ret, dummy_config):
     assert "avg_response_length" in metrics
     assert "avg_advantages_abs" in metrics
     assert metrics["avg_advantages"] == approx(
-        torch.masked_select(mock_advantages, data["response_mask"].bool()).mean().item(), rel=1e-5
+        torch.masked_select(mock_advantages, data["response_mask"].bool()).mean().item(),
+        rel=1e-5,
     )
 
 
@@ -468,7 +527,10 @@ def test_validate_batch_sizes():
     # Test Case 8: Error case - train_batch_size not divisible by (policy_mini_batch_size * policy_dp_size)
     cfg = create_test_config(train_batch_size=100, policy_mini_batch_size=16, policy_num_gpus_per_node=4)
     # Should fail because train_batch_size is not evenly divisible by policy batch requirements
-    with pytest.raises(AssertionError, match="train_batch_size .* should be divisible by policy_mini_batch_size"):
+    with pytest.raises(
+        AssertionError,
+        match="train_batch_size .* should be divisible by policy_mini_batch_size",
+    ):
         validate_batch_sizes(cfg)
 
     # Test Case 9: Error case - train_batch_size not divisible by (critic_mini_batch_size * critic_dp_size)
@@ -480,12 +542,18 @@ def test_validate_batch_sizes():
         critic_model_path="test",
     )
     # Should fail because train_batch_size is not evenly divisible by critic batch requirements
-    with pytest.raises(AssertionError, match="train_batch_size .* should be divisible by critic_mini_batch_size"):
+    with pytest.raises(
+        AssertionError,
+        match="train_batch_size .* should be divisible by critic_mini_batch_size",
+    ):
         validate_batch_sizes(cfg)
 
     # Test Case 10: Error case - policy_mini_batch_size_per_gpu not divisible by micro_train_batch_size_per_gpu
     cfg = create_test_config(
-        policy_mini_batch_size=8, n_samples_per_prompt=1, policy_num_gpus_per_node=1, micro_train_batch_size_per_gpu=3
+        policy_mini_batch_size=8,
+        n_samples_per_prompt=1,
+        policy_num_gpus_per_node=1,
+        micro_train_batch_size_per_gpu=3,
     )
     # Should fail because policy mini batch per GPU is not evenly divisible by micro batch size
     with pytest.raises(
@@ -543,7 +611,8 @@ def test_validate_batch_sizes():
         n_samples_per_prompt=1,
     )
     with pytest.raises(
-        AssertionError, match="policy_train_batch_size_per_gpu .* should be divisible by policy_mini_batch_size_per_gpu"
+        AssertionError,
+        match="policy_train_batch_size_per_gpu .* should be divisible by policy_mini_batch_size_per_gpu",
     ):
         validate_batch_sizes(cfg)
 
@@ -559,7 +628,8 @@ def test_validate_batch_sizes():
         critic_model_path="test",
     )
     with pytest.raises(
-        AssertionError, match="critic_train_batch_size_per_gpu .* should be divisible by critic_mini_batch_size_per_gpu"
+        AssertionError,
+        match="critic_train_batch_size_per_gpu .* should be divisible by critic_mini_batch_size_per_gpu",
     ):
         validate_batch_sizes(cfg)
 
@@ -613,7 +683,7 @@ def test_forward_backward_batch_calculations():
         # Mock dependencies
         worker.strategy = MagicMock()
         worker.strategy.is_rank_0.return_value = False  # Disable progress bars
-        worker.strategy.all_reduce.side_effect = lambda d, op, group=None: d  # Return input dict unchanged
+        worker.strategy.all_reduce.side_effect = lambda d, op, group=None: (d)  # Return input dict unchanged
 
         # Mock device_mesh for DP group access
         worker.device_mesh = MagicMock()
@@ -634,14 +704,21 @@ def test_forward_backward_batch_calculations():
         experience, microbatch_weight, loss_fn=None, loss_fn_config=None, return_per_token_outputs=True
     ):
         policy_forward_backward_micro_calls.append(experience)
-        return {"policy_loss": 0.5, "ppo_clip_ratio": 0.1, "policy_entropy": 2.0, "response_length": response_length}
+        return {
+            "policy_loss": 0.5,
+            "ppo_clip_ratio": 0.1,
+            "policy_entropy": 2.0,
+            "response_length": response_length,
+        }
 
     policy_worker._forward_backward_micro = mock_policy_forward_backward_micro
     policy_worker.record_memory = False
 
     # Calculate expected values
     dataloader = BatchIterator(
-        dummy_databatch, sample_batch_size=cfg.trainer.micro_train_batch_size_per_gpu, drop_last=False
+        dummy_databatch,
+        sample_batch_size=cfg.trainer.micro_train_batch_size_per_gpu,
+        drop_last=False,
     )
     expected_micro_batches = len(dataloader)  # Should be 6
 

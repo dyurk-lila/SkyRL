@@ -553,6 +553,8 @@ EXPECTED_TRAINING_INPUT_FIELDS = {
     "rollout_expert_indices",
     "router_padding_mask",
     "sample_support_ids",
+    "sample_support_csr_ids",
+    "sample_support_csr_offsets",
     "pixel_values",
     "image_grid_thw",
 }
@@ -580,6 +582,8 @@ def _make_full_training_batch(batch_size: int = 4, seq_len: int = 5) -> Training
         "rollout_expert_indices": torch.randint(0, 8, (batch_size, seq_len, 2, 3), dtype=torch.long),
         "router_padding_mask": torch.zeros((batch_size, seq_len), dtype=torch.bool),
         "sample_support_ids": torch.randint(0, 100, (batch_size, seq_len, 4), dtype=torch.int32),
+        "sample_support_csr_ids": None,
+        "sample_support_csr_offsets": None,
         "pixel_values": TensorList([torch.randn(i + 1, 3) for i in range(batch_size)]),  # batch_size * (i + 1) * 3
         "image_grid_thw": TensorList([torch.tensor([[1, 2, 3]]) for _ in range(batch_size)]),  # batch_size * 1 * 3
     }
@@ -631,6 +635,9 @@ def test_pad_batch_all_fields():
     # --- Tensor fields ---
     for key in EXPECTED_TRAINING_INPUT_FIELDS:
         value = padded[key]
+        if key in {"sample_support_csr_ids", "sample_support_csr_offsets"}:
+            assert value is None
+            continue
         assert value is not None, f"Field {key!r} became None after padding"
         assert len(value) == batch_size + pad_size, f"Field {key!r} has wrong batch dim"
 
@@ -653,6 +660,8 @@ def test_pad_batch_all_fields():
         "rollout_expert_indices",
         "router_padding_mask",
         "sample_support_ids",
+        "sample_support_csr_ids",
+        "sample_support_csr_offsets",
         "pixel_values",
         "image_grid_thw",
     }
@@ -688,6 +697,57 @@ def test_pad_batch_zero_pad_size_returns_same_batch():
     batch = _make_full_training_batch(batch_size=3, seq_len=5)
     padded = pad_training_input_batch(batch, pad_size=0)
     assert padded is batch
+
+
+def test_csr_sample_support_is_padded_with_empty_rows():
+    batch = TrainingInputBatch(
+        {
+            "sequences": torch.ones((2, 4), dtype=torch.long),
+            "sample_support_csr_ids": TensorList(
+                [
+                    torch.tensor([1, 2], dtype=torch.int32),
+                    torch.tensor([3], dtype=torch.int32),
+                ]
+            ),
+            "sample_support_csr_offsets": TensorList(
+                [
+                    torch.tensor([0, 2], dtype=torch.int32),
+                    torch.tensor([0, 1], dtype=torch.int32),
+                ]
+            ),
+        }
+    )
+    padded = pad_training_input_batch(batch, pad_size=2)
+
+    assert [tensor.tolist() for tensor in padded["sample_support_csr_ids"].tensors] == [
+        [1, 2],
+        [3],
+        [],
+        [],
+    ]
+    assert [tensor.tolist() for tensor in padded["sample_support_csr_offsets"].tensors] == [
+        [0, 2],
+        [0, 1],
+        [0],
+        [0],
+    ]
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"sample_support_csr_ids": TensorList([torch.tensor([1], dtype=torch.int32)])},
+        {"sample_support_csr_offsets": TensorList([torch.tensor([0, 1], dtype=torch.int32)])},
+        {
+            "sample_support_ids": torch.ones((1, 2, 2), dtype=torch.int32),
+            "sample_support_csr_ids": TensorList([torch.tensor([1], dtype=torch.int32)]),
+            "sample_support_csr_offsets": TensorList([torch.tensor([0, 1], dtype=torch.int32)]),
+        },
+    ],
+)
+def test_sample_support_representation_invariants(fields):
+    with pytest.raises(ValueError):
+        TrainingInputBatch({"sequences": torch.ones((1, 2), dtype=torch.long), **fields})
 
 
 def test_pad_batch_rejects_non_cpu_device():

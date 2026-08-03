@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from jaxtyping import Bool, Float, Integer
 
+from skyrl.backends.skyrl_train.training_batch import TensorList
 from skyrl.backends.skyrl_train.utils.replay_utils import make_replay_padding_indices_np
 from skyrl.backends.skyrl_train.utils.routed_experts import (
     RoutedExpertIndices,
@@ -283,30 +284,44 @@ def convert_prompts_responses_to_batch_tensors(
     )
 
 
-def build_dense_sample_support(
-    rollout_sample_support: Optional[List[List[List[int]]]],
+def build_sample_support_replay(
+    rollout_sample_support: Optional[List[np.ndarray]],
     response_ids: List[List[int]],
     loss_masks: List[List[int]],
     sequence_length: int,
     top_k: int,
     eos_token_id: int,
-) -> Optional[Integer[torch.Tensor, "batch seq_len topk"]]:
-    """Validate and left-pad per-token sampler support for replay."""
+    use_sparse: bool,
+) -> tuple[
+    Optional[Integer[torch.Tensor, "batch seq_len topk"]],
+    Optional[TensorList],
+    Optional[TensorList],
+]:
+    """Validate sampler support and build its dense or CSR training form."""
     if rollout_sample_support is None:
-        return None
+        return None, None, None
     if len(rollout_sample_support) != len(response_ids):
         raise ValueError("rollout_sample_support must have one entry per trajectory")
     if len(loss_masks) != len(response_ids):
         raise ValueError("loss_masks must have one entry per trajectory")
 
-    support = torch.full((len(response_ids), sequence_length, top_k), -1, dtype=torch.int32)
-    int32_max = int(np.iinfo(np.int32).max)
+    dense_support = None
+    if not use_sparse:
+        dense_support = torch.full((len(response_ids), sequence_length, top_k), -1, dtype=torch.int32)
+    csr_ids = []
+    csr_offsets = []
     for sample_index, (sample_rows, sampled_tokens, sample_loss_mask) in enumerate(
         zip(rollout_sample_support, response_ids, loss_masks, strict=True)
     ):
-        if len(sample_rows) != len(sampled_tokens):
+        if not isinstance(sample_rows, np.ndarray):
+            raise TypeError("rollout_sample_support entries must be NumPy arrays")
+        if sample_rows.dtype != np.int32:
+            raise TypeError("rollout_sample_support entries must use int32")
+        if sample_rows.ndim != 2 or sample_rows.shape[1] != top_k:
+            raise ValueError("rollout_sample_support rows must match generator.sampling_params.top_k")
+        if sample_rows.shape[0] != len(sampled_tokens):
             raise ValueError(
-                f"rollout_sample_support[{sample_index}] has {len(sample_rows)} rows for "
+                f"rollout_sample_support[{sample_index}] has {sample_rows.shape[0]} rows for "
                 f"{len(sampled_tokens)} response tokens"
             )
         if len(sample_loss_mask) != len(sampled_tokens):
@@ -315,41 +330,45 @@ def build_dense_sample_support(
                 f"{len(sampled_tokens)} response tokens"
             )
 
-        sample_support = torch.full((len(sample_rows), top_k), -1, dtype=torch.int64)
-        for token_index, row in enumerate(sample_rows):
-            if row:
-                if len(row) != top_k:
-                    raise ValueError("rollout_sample_support rows must match generator.sampling_params.top_k")
-                sample_support[token_index] = torch.as_tensor(row, dtype=torch.int64)
-
-        valid = sample_support >= 0
-        if torch.any((sample_support < -1) | (sample_support > int32_max)):
-            raise ValueError("rollout_sample_support vocab ids must fit non-negative int32")
-        if torch.any(valid & ((~valid).cumsum(dim=1) > 0)):
+        valid = sample_rows >= 0
+        if np.any(sample_rows < -1):
+            raise ValueError("rollout_sample_support IDs must be -1 or non-negative")
+        if np.any(valid & (np.cumsum(~valid, axis=1) > 0)):
             raise ValueError("rollout_sample_support padding must use trailing -1 values")
 
-        sampled = torch.as_tensor(sampled_tokens, dtype=torch.int64).unsqueeze(1)
-        loss_bearing = torch.as_tensor(sample_loss_mask, dtype=torch.bool)
-        has_support = valid.any(dim=1)
+        sampled = np.asarray(sampled_tokens, dtype=np.int64)
+        loss_bearing = np.asarray(sample_loss_mask, dtype=np.bool_)
+        has_support = valid.any(axis=1)
         unsupported_loss = loss_bearing & ~has_support
-        if torch.count_nonzero(unsupported_loss) > 1:
+        if np.count_nonzero(unsupported_loss) > 1:
             raise ValueError(f"rollout_sample_support[{sample_index}] has more than one loss-bearing unsupported token")
-        unsupported_non_eos = unsupported_loss & (sampled.squeeze(1) != eos_token_id)
-        if torch.any(unsupported_non_eos):
-            token_index = int(torch.where(unsupported_non_eos)[0][0])
+        unsupported_non_eos = unsupported_loss & (sampled != eos_token_id)
+        if np.any(unsupported_non_eos):
+            token_index = int(np.flatnonzero(unsupported_non_eos)[0])
             raise ValueError(
                 f"rollout_sample_support[{sample_index}][{token_index}] is empty for a loss-bearing non-EOS token"
             )
-        missing = loss_bearing & has_support & ~torch.any(sample_support == sampled, dim=1)
-        if torch.any(missing):
-            missing_token = sampled_tokens[int(torch.where(missing)[0][0])]
+        missing = loss_bearing & has_support & ~np.any(sample_rows == sampled[:, None], axis=1)
+        if np.any(missing):
+            missing_token = sampled_tokens[int(np.flatnonzero(missing)[0])]
             raise ValueError(f"sampled token {missing_token} is missing from rollout_sample_support")
 
-        start = sequence_length - len(sampled_tokens)
-        if start < 0:
-            raise ValueError("response tokens exceed the sample-support sequence width")
-        support[sample_index, start:] = sample_support.to(torch.int32)
-    return support
+        if use_sparse:
+            row_sizes = valid.sum(axis=1, dtype=np.int32)
+            offsets = np.empty(sample_rows.shape[0] + 1, dtype=np.int32)
+            offsets[0] = 0
+            np.cumsum(row_sizes, out=offsets[1:])
+            csr_ids.append(torch.from_numpy(np.ascontiguousarray(sample_rows[valid])))
+            csr_offsets.append(torch.from_numpy(offsets))
+        else:
+            start = sequence_length - len(sampled_tokens)
+            if start < 0:
+                raise ValueError("response tokens exceed the sample-support sequence width")
+            dense_support[sample_index, start:] = torch.from_numpy(sample_rows)
+
+    if use_sparse:
+        return None, TensorList(csr_ids), TensorList(csr_offsets)
+    return dense_support, None, None
 
 
 def compute_prompt_boundaries(uids: List[str]) -> List[Tuple[int, int]]:

@@ -40,6 +40,7 @@ from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import
     SKYRL_LORA_ADAPTER_NAME,
 )
 from skyrl.backends.skyrl_train.training_batch import (
+    TensorList,
     TrainingInputBatch,
     TrainingOutputBatch,
 )
@@ -671,6 +672,14 @@ class MegatronWorker:
                     "sample_support_ids": (
                         micro.get("sample_support_ids") if self.cfg.algorithm.enable_sample_support_replay else None
                     ),
+                    "sample_support_csr_ids": (
+                        micro.get("sample_support_csr_ids") if self.cfg.algorithm.enable_sample_support_replay else None
+                    ),
+                    "sample_support_csr_offsets": (
+                        micro.get("sample_support_csr_offsets")
+                        if self.cfg.algorithm.enable_sample_support_replay
+                        else None
+                    ),
                     "loss_mask": micro.get("loss_mask"),
                     "sub_seq_lengths": micro.get("sub_seq_lengths"),
                     **vlm_inputs,
@@ -807,6 +816,15 @@ class MegatronWorker:
                 else:
                     pad_tensor = torch.zeros((pad_count, *value.shape[1:]), dtype=value.dtype, device=device)
                 padded[key] = torch.cat([value, pad_tensor], dim=0)
+            elif isinstance(value, TensorList):
+                if key == "sample_support_csr_ids":
+                    padding = TensorList([value[0].new_empty(0) for _ in range(pad_count)])
+                elif key == "sample_support_csr_offsets":
+                    padding = TensorList([value[0].new_zeros(1) for _ in range(pad_count)])
+                else:
+                    padded[key] = value
+                    continue
+                padded[key] = TensorList.cat([value, padding])
             else:
                 padded[key] = value
 
@@ -1071,6 +1089,14 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                     "sample_support_ids": (
                         experience.sample_support_ids if self.cfg.algorithm.enable_sample_support_replay else None
                     ),
+                    "sample_support_csr_ids": (
+                        experience.sample_support_csr_ids if self.cfg.algorithm.enable_sample_support_replay else None
+                    ),
+                    "sample_support_csr_offsets": (
+                        experience.sample_support_csr_offsets
+                        if self.cfg.algorithm.enable_sample_support_replay
+                        else None
+                    ),
                     "sub_seq_lengths": experience.sub_seq_lengths,
                     **vlm_inputs,
                 }
@@ -1199,6 +1225,14 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                     "router_padding_mask": experience.router_padding_mask if self.enable_router_replay else None,
                     "sample_support_ids": (
                         experience.sample_support_ids if self.cfg.algorithm.enable_sample_support_replay else None
+                    ),
+                    "sample_support_csr_ids": (
+                        experience.sample_support_csr_ids if self.cfg.algorithm.enable_sample_support_replay else None
+                    ),
+                    "sample_support_csr_offsets": (
+                        experience.sample_support_csr_offsets
+                        if self.cfg.algorithm.enable_sample_support_replay
+                        else None
                     ),
                     # used with global sequence packing (None when token-based batching is active)
                     "sub_seq_lengths": experience.sub_seq_lengths,

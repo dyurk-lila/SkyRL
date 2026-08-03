@@ -213,6 +213,27 @@ class TestTokenBasedBatchIterator:
         assert torch.all(padding["router_padding_mask"])
         assert torch.all(padding["sample_support_ids"] == -1)
 
+    def test_padding_microbatch_uses_empty_csr_support(self):
+        batch = self._make_batch([4, 4], num_actions=2)
+        batch["sample_support_csr_ids"] = TensorList(
+            [
+                torch.tensor([1, 2], dtype=torch.int32),
+                torch.tensor([3], dtype=torch.int32),
+            ]
+        )
+        batch["sample_support_csr_offsets"] = TensorList(
+            [
+                torch.tensor([0, 2], dtype=torch.int32),
+                torch.tensor([0, 1], dtype=torch.int32),
+            ]
+        )
+        iterator = TokenBasedBatchIterator(batch, max_tokens_per_microbatch=8)
+
+        padding = iterator._create_padding_microbatch()
+
+        assert padding["sample_support_csr_ids"][0].tolist() == []
+        assert padding["sample_support_csr_offsets"][0].tolist() == [0]
+
     def test_multimodal_tensorlist_microbatching(self):
         """Token-based microbatching must gather TensorList fields (multi-modal pixel_values /
         image_grid_thw) via the same index gather used for regular tensors."""

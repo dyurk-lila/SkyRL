@@ -5,7 +5,11 @@ import torch
 import torch.distributed as dist
 
 from skyrl.backends.skyrl_train.distributed.strategy import DistributedStrategy
-from skyrl.backends.skyrl_train.training_batch import TensorBatch, TrainingInputBatch
+from skyrl.backends.skyrl_train.training_batch import (
+    TensorBatch,
+    TensorList,
+    TrainingInputBatch,
+)
 from skyrl.backends.skyrl_train.utils.replay_utils import make_replay_padding_indices
 from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
 from skyrl.train.dataset.bin_packing import make_seq_packer
@@ -164,6 +168,8 @@ class BaseBatchIterator:
             rollout_logprobs=batch.get("rollout_logprobs"),
             rollout_expert_indices=batch.get("rollout_expert_indices"),
             sample_support_ids=batch.get("sample_support_ids"),
+            sample_support_csr_ids=batch.get("sample_support_csr_ids"),
+            sample_support_csr_offsets=batch.get("sample_support_csr_offsets"),
             router_padding_mask=batch.get("router_padding_mask"),
             # additional info
             # can be used to log metrics etc for micro-batches in the worker
@@ -343,6 +349,11 @@ class TokenBasedBatchIterator(BaseBatchIterator):
                 dtype=ref_tensor.dtype,
                 device=device,
             )
+        if self.data.get("sample_support_csr_ids") is not None:
+            csr_ids = self.data["sample_support_csr_ids"]
+            csr_offsets = self.data["sample_support_csr_offsets"]
+            data["sample_support_csr_ids"] = TensorList([csr_ids[0].new_empty(0)])
+            data["sample_support_csr_offsets"] = TensorList([csr_offsets[0].new_zeros(1)])
         data.metadata = {}
         if self.data.metadata:
             data.metadata.update(self.data.metadata)

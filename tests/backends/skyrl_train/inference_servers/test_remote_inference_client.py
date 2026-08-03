@@ -529,7 +529,9 @@ class TestDataPlane:
 
         assert captured["url"].endswith("/skyrl/v1/generate")
         assert captured["json"]["return_sample_support"] is True
-        assert result.sample_support == [[7, 8]]
+        assert result.sample_support is not None
+        assert result.sample_support.dtype == np.int32
+        np.testing.assert_array_equal(result.sample_support, [[7, 8]])
 
     @pytest.mark.asyncio
     async def test_generate_rejects_list_routed_experts(self, monkeypatch):

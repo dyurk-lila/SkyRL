@@ -733,9 +733,14 @@ def validate_generator_output(num_prompts: int, generator_output: GeneratorOutpu
                 f"for sample {i} got {len(response_ids)} and {len(generator_output['rollout_logprobs'][i])}"
             )
         if generator_output.get("rollout_sample_support") is not None:
-            assert len(response_ids) == len(generator_output["rollout_sample_support"][i]), (
+            sample_support = generator_output["rollout_sample_support"][i]
+            assert isinstance(sample_support, np.ndarray), "Rollout sample support must be a NumPy array"
+            assert sample_support.ndim == 2, "Rollout sample support must have shape [tokens, top_k]"
+            assert sample_support.dtype == np.int32, "Rollout sample support must use int32 vocab IDs"
+            assert sample_support.flags.c_contiguous, "Rollout sample support must be contiguous"
+            assert len(response_ids) == sample_support.shape[0], (
                 "Response ids and rollout sample support must have the same length, "
-                f"for sample {i} got {len(response_ids)} and {len(generator_output['rollout_sample_support'][i])}"
+                f"for sample {i} got {len(response_ids)} and {sample_support.shape[0]}"
             )
 
     # loss masks should be non-zero for at least one element for trainer

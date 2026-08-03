@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, TypedDict, Union
 
+import numpy as np
 import torch
 
 from skyrl.backends.skyrl_train.inference_servers.base import ConversationType
@@ -52,7 +53,7 @@ class GeneratorOutput(TypedDict):
     # record its split.
     trajectory_time_splits: Optional[Dict[str, List[float]]]
     rollout_expert_indices: Optional[List[RoutedExpertIndices]]
-    rollout_sample_support: Optional[List[List[List[int]]]]
+    rollout_sample_support: Optional[List[np.ndarray]]
     # Applicable only for step-wise training
     is_last_step: Optional[List[bool]]
     # Per-row env metrics (one dict per row in the flattened batch). Used by

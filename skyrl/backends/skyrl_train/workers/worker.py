@@ -926,6 +926,8 @@ class PolicyWorkerBase(Worker):
                 pixel_values=experience.pixel_values,
                 image_grid_thw=experience.image_grid_thw,
                 sample_support_ids=experience.sample_support_ids if sample_support_replay else None,
+                sample_support_csr_ids=experience.sample_support_csr_ids if sample_support_replay else None,
+                sample_support_csr_offsets=experience.sample_support_csr_offsets if sample_support_replay else None,
                 loss_mask=loss_mask if sample_support_replay else None,
                 enable_sample_support_replay=sample_support_replay,
             )
@@ -1210,6 +1212,8 @@ class PolicyWorkerBase(Worker):
                 pixel_values=experience.pixel_values,
                 image_grid_thw=experience.image_grid_thw,
                 sample_support_ids=experience.sample_support_ids if sample_support_replay else None,
+                sample_support_csr_ids=experience.sample_support_csr_ids if sample_support_replay else None,
+                sample_support_csr_offsets=experience.sample_support_csr_offsets if sample_support_replay else None,
                 loss_mask=loss_mask if sample_support_replay else None,
                 enable_sample_support_replay=sample_support_replay,
             )
@@ -1285,7 +1289,11 @@ class PolicyWorkerBase(Worker):
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
                 # Policy ratios require recomputed logprobs to use the same support normalization.
-                sample_support_ids=micro_batch["sample_support_ids"] if sample_support_replay else None,
+                sample_support_ids=micro_batch.get("sample_support_ids") if sample_support_replay else None,
+                sample_support_csr_ids=micro_batch.get("sample_support_csr_ids") if sample_support_replay else None,
+                sample_support_csr_offsets=(
+                    micro_batch.get("sample_support_csr_offsets") if sample_support_replay else None
+                ),
                 loss_mask=micro_batch["loss_mask"] if sample_support_replay else None,
                 enable_sample_support_replay=sample_support_replay,
             )
@@ -1591,7 +1599,11 @@ class RefWorkerBase(Worker):
                 temperature=self.cfg.algorithm.temperature if sample_support_replay else 1.0,
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
-                sample_support_ids=micro_batch["sample_support_ids"] if sample_support_replay else None,
+                sample_support_ids=micro_batch.get("sample_support_ids") if sample_support_replay else None,
+                sample_support_csr_ids=micro_batch.get("sample_support_csr_ids") if sample_support_replay else None,
+                sample_support_csr_offsets=(
+                    micro_batch.get("sample_support_csr_offsets") if sample_support_replay else None
+                ),
                 loss_mask=micro_batch["loss_mask"] if sample_support_replay else None,
                 enable_sample_support_replay=sample_support_replay,
             )

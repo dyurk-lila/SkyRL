@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, Hashable, List, Optional, Tuple, TypedDict
 
+import numpy as np
+
 from skyrl.backends.skyrl_train.utils.routed_experts import RoutedExpertIndices
 
 if TYPE_CHECKING:
@@ -51,7 +53,7 @@ class InferenceEngineOutput(TypedDict):
     response_logprobs: Optional[List[List[float]]]
     prompt_logprobs: Optional[List[List[float]]]  # per-prompt-token logprobs under the current model
     rollout_expert_indices: Optional[List[RoutedExpertIndices]]
-    rollout_sample_support: Optional[List[List[List[int]]]]
+    rollout_sample_support: Optional[List[np.ndarray]]
 
 
 class InferenceEngineInterface(ABC):

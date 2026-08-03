@@ -28,7 +28,9 @@ from skyrl.backends.skyrl_train.distributed.ulysses.utils import (
 )
 from skyrl.backends.skyrl_train.training_batch import TensorList
 from skyrl.backends.skyrl_train.utils.sample_support_replay import (
+    aligned_sample_support_csr_scores,
     aligned_sample_support_scores,
+    build_sample_support_row_ids,
 )
 from skyrl.backends.skyrl_train.utils.torch_utils import (
     chunked_entropy_from_logits,
@@ -254,20 +256,32 @@ class HFModelWrapper(nn.Module):
         image_grid_thw: Optional[TensorList] = None,
         mm_token_type_ids: Optional[torch.Tensor] = None,
         sample_support_ids: Optional[torch.Tensor] = None,
+        sample_support_csr_ids: Optional[TensorList] = None,
+        sample_support_csr_offsets: Optional[TensorList] = None,
         loss_mask: Optional[torch.Tensor] = None,
         enable_sample_support_replay: bool = False,
     ) -> torch.Tensor:
         """Returns action log probs"""
         has_image_inputs = pixel_values is not None or image_grid_thw is not None
-        if enable_sample_support_replay and sample_support_ids is None:
-            raise ValueError("sample-support replay is enabled but the microbatch has no recorded support")
         if enable_sample_support_replay and loss_mask is None:
             raise ValueError("sample-support replay is enabled but the microbatch has no loss mask")
+        if (sample_support_csr_ids is None) != (sample_support_csr_offsets is None):
+            raise ValueError("sample-support CSR ids and offsets must be supplied together")
+        dense_support = sample_support_ids is not None
+        sparse_support = sample_support_csr_ids is not None
+        if enable_sample_support_replay and not dense_support and not sparse_support:
+            raise ValueError("sample-support replay is enabled but the microbatch has no recorded support")
+        if enable_sample_support_replay and dense_support and sparse_support:
+            raise ValueError("sample-support replay requires exactly one dense or CSR representation")
         support_ids_fwd = sample_support_ids if enable_sample_support_replay else None
+        support_row_ids_fwd = (
+            build_sample_support_row_ids(sample_support_csr_offsets, sequences.shape[1], sequences.device)
+            if enable_sample_support_replay and sparse_support
+            else None
+        )
+        support_metadata_fwd = support_row_ids_fwd if sparse_support else support_ids_fwd
         target_loss_mask_fwd = None
         support_trajectory_ids_fwd = None
-        support_entropy = None
-        support_entropy_mask = None
         if enable_sample_support_replay:
             # The loss mask is response-only. Place it in the full token layout so it
             # follows support IDs through the same unpadding, target shift, and SP slice.
@@ -308,8 +322,8 @@ class HFModelWrapper(nn.Module):
                 position_ids_fwd, _, _, _, _ = unpad_input(position_ids.unsqueeze(-1), attention_mask)
                 # (nnz, 1) -> (1, nnz)
                 position_ids_fwd = position_ids_fwd.transpose(0, 1)
-                if support_ids_fwd is not None:
-                    support_ids_fwd = support_ids_fwd.flatten(0, 1).index_select(0, nnz_indices).unsqueeze(0)
+                if support_metadata_fwd is not None:
+                    support_metadata_fwd = support_metadata_fwd.flatten(0, 1).index_select(0, nnz_indices).unsqueeze(0)
                     target_loss_mask_fwd = target_loss_mask_fwd.flatten().index_select(0, nnz_indices).unsqueeze(0)
                     support_trajectory_ids_fwd = (
                         support_trajectory_ids_fwd.flatten().index_select(0, nnz_indices).unsqueeze(0)
@@ -317,7 +331,9 @@ class HFModelWrapper(nn.Module):
                 attention_mask_fwd = None  # no attention mask with FA 2
 
         sequences_rolled = torch.roll(sequences_fwd, shifts=-1, dims=1)
-        support_ids_rolled = torch.roll(support_ids_fwd, shifts=-1, dims=1) if support_ids_fwd is not None else None
+        support_metadata_rolled = (
+            torch.roll(support_metadata_fwd, shifts=-1, dims=1) if support_metadata_fwd is not None else None
+        )
         target_loss_mask_rolled = (
             torch.roll(target_loss_mask_fwd, shifts=-1, dims=1) if target_loss_mask_fwd is not None else None
         )
@@ -338,9 +354,9 @@ class HFModelWrapper(nn.Module):
             sequences_rolled, _, _, _ = ulysses_pad_and_slice_inputs(
                 sequences_rolled, None, None, self.sequence_parallel_size
             )
-            if support_ids_rolled is not None:
-                support_ids_rolled, _, _, _ = ulysses_pad_and_slice_inputs(
-                    support_ids_rolled,
+            if support_metadata_rolled is not None:
+                support_metadata_rolled, _, _, _ = ulysses_pad_and_slice_inputs(
+                    support_metadata_rolled,
                     None,
                     None,
                     self.sequence_parallel_size,
@@ -391,26 +407,48 @@ class HFModelWrapper(nn.Module):
         logits_BSV = output["logits"]
         logits_BSV.div_(temperature)
 
+        support_entropy = None
+        support_entropy_mask = None
         if enable_sample_support_replay:
             assert (
-                support_ids_rolled is not None
+                support_metadata_rolled is not None
                 and target_loss_mask_rolled is not None
                 and support_trajectory_ids_rolled is not None
             )
-            support_scores = aligned_sample_support_scores(
-                logits_BSV,
-                sequences_rolled,
-                support_ids_rolled,
-                target_loss_mask_rolled,
-                vocab_start_index=0,
-                vocab_end_index=logits_BSV.shape[-1],
-                tp_group=None,
-                inference_only=not torch.is_grad_enabled(),
-                compute_entropy=compute_entropy,
-                entropy_requires_grad=compute_entropy and entropy_requires_grad,
-                trajectory_ids=support_trajectory_ids_rolled,
-                num_trajectories=sequences.shape[0],
-            )
+            if sparse_support:
+                assert sample_support_csr_ids is not None and sample_support_csr_offsets is not None
+                support_scores = aligned_sample_support_csr_scores(
+                    logits_BSV,
+                    sequences_rolled,
+                    support_metadata_rolled,
+                    sample_support_csr_ids,
+                    sample_support_csr_offsets,
+                    sequences.shape[1],
+                    target_loss_mask_rolled,
+                    vocab_start_index=0,
+                    vocab_end_index=logits_BSV.shape[-1],
+                    tp_group=None,
+                    inference_only=not torch.is_grad_enabled(),
+                    compute_entropy=compute_entropy,
+                    entropy_requires_grad=compute_entropy and entropy_requires_grad,
+                    trajectory_ids=support_trajectory_ids_rolled,
+                    num_trajectories=sequences.shape[0],
+                )
+            else:
+                support_scores = aligned_sample_support_scores(
+                    logits_BSV,
+                    sequences_rolled,
+                    support_metadata_rolled,
+                    target_loss_mask_rolled,
+                    vocab_start_index=0,
+                    vocab_end_index=logits_BSV.shape[-1],
+                    tp_group=None,
+                    inference_only=not torch.is_grad_enabled(),
+                    compute_entropy=compute_entropy,
+                    entropy_requires_grad=compute_entropy and entropy_requires_grad,
+                    trajectory_ids=support_trajectory_ids_rolled,
+                    num_trajectories=sequences.shape[0],
+                )
             log_probs = support_scores.logprobs
             support_entropy = support_scores.entropy
             support_entropy_mask = support_scores.valid_mask
@@ -452,13 +490,12 @@ class HFModelWrapper(nn.Module):
                 output["entropy"] = support_entropy
                 output["entropy_mask"] = support_entropy_mask
             else:
-                # For sample packing: entropy is calculated on unpacked data, so no attention mask needed
-                # For non-sample packing: pass the attention mask to exclude padding tokens
-                entropy_mask = None if self.remove_microbatch_padding else attention_mask_fwd
+                # Packed data is unpacked after entropy; otherwise exclude padding.
+                entropy_attention_mask = None if self.remove_microbatch_padding else attention_mask_fwd
                 entropy_BS = self.chunked_entropy_from_logits_fn(
                     logits_BSV,
                     requires_grad=entropy_requires_grad,
-                    attention_mask=entropy_mask,
+                    attention_mask=entropy_attention_mask,
                     chunk_size=self.logprobs_chunk_size,
                 )
 
@@ -466,11 +503,14 @@ class HFModelWrapper(nn.Module):
                     dim = entropy_BS.ndim - 1
                     entropy_BS = gather_outputs_and_unpad(
                         entropy_BS, gather_dim=dim, unpad_dim=dim, padding_size=pad_size
-                    )
+                    )  # shape can be (1, nnz) - with packing or (B,S) - without packing
                 if self.remove_microbatch_padding:
                     entropy_BS = pad_input(
                         entropy_BS.transpose(0, 1), indices=nnz_indices, batch=batch_size, seqlen=seqlen
-                    ).squeeze(-1)
+                    ).squeeze(
+                        -1
+                    )  # (1, nnz) -> (B, S)
+
                 output["entropy"] = entropy_BS
 
         if isinstance(num_actions, list):

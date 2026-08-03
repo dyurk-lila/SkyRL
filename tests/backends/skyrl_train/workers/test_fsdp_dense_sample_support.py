@@ -7,6 +7,8 @@ import pytest
 import torch
 from torch import nn
 
+from skyrl.backends.skyrl_train.training_batch import TensorList
+
 
 @pytest.fixture
 def model_wrapper(monkeypatch):
@@ -268,7 +270,8 @@ def test_fsdp_packed_microbatch_matches_dense_reference(model_wrapper):
     torch.testing.assert_close(actual_grad, reference_logits.grad)
 
 
-def test_fsdp_packed_microbatch_supports_one_synthetic_eos_per_trajectory(model_wrapper):
+@pytest.mark.parametrize("use_sparse", [False, True])
+def test_fsdp_packed_microbatch_supports_one_synthetic_eos_per_trajectory(model_wrapper, use_sparse):
     sequences = torch.tensor([[1, 2, 3, 4], [0, 5, 6, 7]])
     attention_mask = torch.tensor([[1, 1, 1, 1], [0, 1, 1, 1]])
     support = torch.full((2, 4, 2), -1, dtype=torch.int32)
@@ -282,13 +285,30 @@ def test_fsdp_packed_microbatch_supports_one_synthetic_eos_per_trajectory(model_
         remove_microbatch_padding=True,
     )
 
+    support_kwargs = {"sample_support_ids": support}
+    if use_sparse:
+        support_kwargs = {
+            "sample_support_csr_ids": TensorList(
+                [
+                    torch.tensor([3, 8], dtype=torch.int32),
+                    torch.tensor([6, 1], dtype=torch.int32),
+                ]
+            ),
+            "sample_support_csr_offsets": TensorList(
+                [
+                    torch.tensor([0, 2, 2], dtype=torch.int32),
+                    torch.tensor([0, 2, 2], dtype=torch.int32),
+                ]
+            ),
+        }
+
     actual = wrapper(
         sequences,
         num_actions=2,
         attention_mask=attention_mask,
-        sample_support_ids=support,
         loss_mask=torch.ones((2, 2), dtype=torch.bool),
         enable_sample_support_replay=True,
+        **support_kwargs,
     )
     actual.sum().backward()
     actual_grad = model.logits.grad.clone()

@@ -7,8 +7,12 @@ import torch
 from skyrl.backends.skyrl_train.distributed.megatron.token_metadata import (
     TokenMetadataLayout,
 )
+from skyrl.backends.skyrl_train.training_batch import TensorList
+from skyrl.backends.skyrl_train.utils import sample_support_replay
 from skyrl.backends.skyrl_train.utils.sample_support_replay import (
-    aligned_sample_support_scores,
+    aligned_sample_support_csr_scores,
+    compute_sample_support_scores,
+    sample_support_csr_scores,
     sample_support_scores,
     synthetic_eos_logprobs,
 )
@@ -47,6 +51,23 @@ def _reference_entropy(logits, support_ids):
     return torch.stack(outputs).reshape(support_ids.shape[:-1])
 
 
+def _csr_from_dense(support_ids: torch.Tensor) -> tuple[TensorList, TensorList]:
+    ids = []
+    offsets = []
+    for sample_support in support_ids:
+        valid = sample_support >= 0
+        ids.append(sample_support[valid].to(torch.int32))
+        offsets.append(
+            torch.cat(
+                (
+                    torch.zeros(1, dtype=torch.int32),
+                    valid.sum(dim=1, dtype=torch.int32).cumsum(dim=0, dtype=torch.int32),
+                )
+            )
+        )
+    return TensorList(ids), TensorList(offsets)
+
+
 def test_support_logprobs_match_reference_values_and_gradients():
     logits = torch.randn(2, 3, 11, dtype=torch.float64, requires_grad=True)
     sampled_ids = torch.tensor([[2, 5, 1], [8, 3, 7]])
@@ -80,7 +101,55 @@ def test_support_logprobs_match_reference_values_and_gradients():
     torch.testing.assert_close(actual_grad, reference_logits.grad)
 
 
-def test_support_entropy_matches_reference_values_and_gradients():
+def test_sparse_support_matches_dense_values_and_gradients():
+    dense_logits = torch.randn(2, 3, 11, dtype=torch.float64, requires_grad=True)
+    sampled_ids = torch.tensor([[2, 5, 1], [8, 3, 7]])
+    support_ids = torch.tensor(
+        [
+            [[2, 4, 6, -1], [5, -1, -1, -1], [-1, -1, -1, -1]],
+            [[8, 0, 9, 4], [3, 2, -1, -1], [7, 1, 5, -1]],
+        ],
+        dtype=torch.int32,
+    )
+    csr_ids, csr_offsets = _csr_from_dense(support_ids)
+    support_row_ids = torch.arange(6).reshape(2, 3)
+
+    dense = sample_support_scores(
+        dense_logits,
+        sampled_ids,
+        support_ids,
+        vocab_start_index=0,
+        vocab_end_index=dense_logits.shape[-1],
+        tp_group=None,
+        compute_entropy=False,
+        entropy_requires_grad=False,
+    )
+    dense.logprobs.sum().backward()
+    dense_grad = dense_logits.grad.clone()
+
+    sparse_logits = dense_logits.detach().clone().requires_grad_(True)
+    sparse = sample_support_csr_scores(
+        sparse_logits,
+        sampled_ids,
+        support_row_ids,
+        csr_ids,
+        csr_offsets,
+        support_grid_width=3,
+        vocab_start_index=0,
+        vocab_end_index=sparse_logits.shape[-1],
+        tp_group=None,
+        compute_entropy=False,
+        entropy_requires_grad=False,
+    )
+    sparse.logprobs.sum().backward()
+
+    assert torch.equal(sparse.valid_mask, dense.valid_mask)
+    torch.testing.assert_close(sparse.logprobs, dense.logprobs)
+    torch.testing.assert_close(sparse_logits.grad, dense_grad)
+
+
+@pytest.mark.parametrize("use_sparse", [False, True])
+def test_support_entropy_matches_reference_values_and_gradients(use_sparse):
     logits = torch.randn(2, 3, 11, dtype=torch.float64, requires_grad=True)
     sampled_ids = torch.tensor([[2, 5, 1], [8, 3, 7]])
     support_ids = torch.tensor(
@@ -91,16 +160,33 @@ def test_support_entropy_matches_reference_values_and_gradients():
         dtype=torch.int32,
     )
 
-    scores = sample_support_scores(
-        logits,
-        sampled_ids,
-        support_ids,
-        vocab_start_index=0,
-        vocab_end_index=logits.shape[-1],
-        tp_group=None,
-        compute_entropy=True,
-        entropy_requires_grad=True,
-    )
+    if use_sparse:
+        csr_ids, csr_offsets = _csr_from_dense(support_ids)
+        scores = sample_support_csr_scores(
+            logits,
+            sampled_ids,
+            torch.arange(6).reshape(2, 3),
+            csr_ids,
+            csr_offsets,
+            support_grid_width=3,
+            vocab_start_index=0,
+            vocab_end_index=logits.shape[-1],
+            tp_group=None,
+            compute_entropy=True,
+            entropy_requires_grad=True,
+        )
+    else:
+        scores = sample_support_scores(
+            logits,
+            sampled_ids,
+            support_ids,
+            vocab_start_index=0,
+            vocab_end_index=logits.shape[-1],
+            tp_group=None,
+            compute_entropy=True,
+            entropy_requires_grad=True,
+        )
+
     expected_logprobs = _reference(logits, sampled_ids, support_ids)
     expected_entropy = _reference_entropy(logits, support_ids)
     assert scores.entropy is not None
@@ -146,30 +232,6 @@ def test_entropy_gradients_require_entropy_computation():
             compute_entropy=False,
             entropy_requires_grad=True,
         )
-
-
-def test_support_entropy_excludes_synthetic_eos():
-    logits = torch.tensor([[[1.0, 0.0, 2.0, -1.0, 0.5], [0.0, 1.0, -1.0, 2.0, 0.5]]])
-    sampled_ids = torch.tensor([[2, 4]])
-    support = torch.tensor([[[2, 1], [-1, -1]]], dtype=torch.int32)
-
-    scores = aligned_sample_support_scores(
-        logits,
-        sampled_ids,
-        support,
-        loss_mask=torch.ones((1, 2), dtype=torch.bool),
-        vocab_start_index=0,
-        vocab_end_index=logits.shape[-1],
-        tp_group=None,
-        inference_only=False,
-        compute_entropy=True,
-        entropy_requires_grad=False,
-    )
-
-    assert scores.entropy is not None
-    assert torch.isfinite(scores.logprobs).all()
-    torch.testing.assert_close(scores.entropy, _reference_entropy(logits, support))
-    assert scores.valid_mask.tolist() == [[True, False]]
 
 
 def test_fused_selected_projection_matches_explicit_logits_with_pair_chunking():
@@ -220,6 +282,320 @@ def test_fused_selected_projection_matches_explicit_logits_with_pair_chunking():
     torch.testing.assert_close(fused.logprobs, explicit.logprobs, check_dtype=False)
     torch.testing.assert_close(fused_hidden_grad, explicit_hidden.grad, rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(fused_weight_grad, explicit_weight.grad, rtol=1e-5, atol=1e-6)
+
+
+def test_sparse_fused_projection_and_entropy_match_dense_with_pair_chunking():
+    temperature = 0.7
+    dense_hidden = torch.randn(2, 3, 5, dtype=torch.float64, requires_grad=True)
+    dense_weight = torch.randn(9, 5, dtype=torch.float64, requires_grad=True)
+    sampled_ids = torch.tensor([[1, 4, 7], [2, 5, 8]])
+    support_ids = torch.tensor(
+        [
+            [[1, 0, 3], [4, 6, -1], [7, -1, -1]],
+            [[2, 1, 8], [5, 4, -1], [8, 0, 6]],
+        ],
+        dtype=torch.int32,
+    )
+    csr_ids, csr_offsets = _csr_from_dense(support_ids)
+
+    dense = sample_support_scores(
+        dense_hidden,
+        sampled_ids,
+        support_ids,
+        vocab_start_index=0,
+        vocab_end_index=dense_weight.shape[0],
+        tp_group=None,
+        lm_head_weight=dense_weight,
+        temperature=temperature,
+        chunk_size=4,
+        compute_entropy=True,
+        entropy_requires_grad=True,
+    )
+    assert dense.entropy is not None
+    (dense.logprobs + dense.entropy).sum().backward()
+
+    sparse_hidden = dense_hidden.detach().clone().requires_grad_(True)
+    sparse_weight = dense_weight.detach().clone().requires_grad_(True)
+    sparse = sample_support_csr_scores(
+        sparse_hidden,
+        sampled_ids,
+        torch.arange(6).reshape(2, 3),
+        csr_ids,
+        csr_offsets,
+        support_grid_width=3,
+        vocab_start_index=0,
+        vocab_end_index=sparse_weight.shape[0],
+        tp_group=None,
+        lm_head_weight=sparse_weight,
+        temperature=temperature,
+        chunk_size=4,
+        compute_entropy=True,
+        entropy_requires_grad=True,
+    )
+    assert sparse.entropy is not None
+    (sparse.logprobs + sparse.entropy).sum().backward()
+
+    torch.testing.assert_close(sparse.logprobs, dense.logprobs, check_dtype=False)
+    torch.testing.assert_close(sparse.entropy, dense.entropy, check_dtype=False)
+    torch.testing.assert_close(sparse_hidden.grad, dense_hidden.grad, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(sparse_weight.grad, dense_weight.grad, rtol=1e-5, atol=1e-6)
+
+
+def test_sparse_fused_projection_skips_singletons_and_reuses_sampled_scores(monkeypatch):
+    hidden = torch.randn(1, 3, 5, dtype=torch.float64, requires_grad=True)
+    weight = torch.randn(9, 5, dtype=torch.float64, requires_grad=True)
+    sampled_ids = torch.tensor([[1, 4, 7]])
+    support_ids = torch.tensor(
+        [[[1, -1, -1], [4, 6, -1], [7, 0, 8]]],
+        dtype=torch.int32,
+    )
+    csr_ids, csr_offsets = _csr_from_dense(support_ids)
+    projected_pair_counts = []
+    project_candidate_pairs = sample_support_replay._project_candidate_pairs
+
+    def record_projected_pairs(*args, **kwargs):
+        projected_pair_counts.append(args[2].numel())
+        return project_candidate_pairs(*args, **kwargs)
+
+    monkeypatch.setattr(sample_support_replay, "_project_candidate_pairs", record_projected_pairs)
+    scores = sample_support_csr_scores(
+        hidden,
+        sampled_ids,
+        torch.arange(3).reshape(1, 3),
+        csr_ids,
+        csr_offsets,
+        support_grid_width=3,
+        vocab_start_index=0,
+        vocab_end_index=weight.shape[0],
+        tp_group=None,
+        lm_head_weight=weight,
+        temperature=0.7,
+        chunk_size=4,
+        compute_entropy=False,
+        entropy_requires_grad=False,
+    )
+    explicit_logits = (hidden @ weight.T) / 0.7
+    expected = _reference(explicit_logits, sampled_ids, support_ids)
+
+    assert scores.valid_mask.all()
+    assert projected_pair_counts == [5]
+    torch.testing.assert_close(scores.logprobs, expected, check_dtype=False)
+
+
+def test_sparse_fused_singleton_only_batch_retains_zero_gradient_buffers():
+    hidden = torch.randn(1, 3, 5, dtype=torch.float64, requires_grad=True)
+    weight = torch.randn(9, 5, dtype=torch.float64, requires_grad=True)
+    sampled_ids = torch.tensor([[1, 4, 7]])
+    support_ids = sampled_ids.unsqueeze(-1).to(torch.int32)
+    csr_ids, csr_offsets = _csr_from_dense(support_ids)
+
+    scores = sample_support_csr_scores(
+        hidden,
+        sampled_ids,
+        torch.arange(3).reshape(1, 3),
+        csr_ids,
+        csr_offsets,
+        support_grid_width=3,
+        vocab_start_index=0,
+        vocab_end_index=weight.shape[0],
+        tp_group=None,
+        lm_head_weight=weight,
+        temperature=0.7,
+        chunk_size=4,
+        compute_entropy=True,
+        entropy_requires_grad=True,
+    )
+    assert scores.entropy is not None
+    (scores.logprobs + scores.entropy).sum().backward()
+
+    assert scores.valid_mask.all()
+    assert torch.count_nonzero(scores.logprobs) == 0
+    assert torch.count_nonzero(scores.entropy) == 0
+    assert hidden.grad is not None and torch.count_nonzero(hidden.grad) == 0
+    assert weight.grad is not None and torch.count_nonzero(weight.grad) == 0
+
+
+def test_sparse_empty_loss_row_uses_full_vocab_logprob_for_synthetic_eos():
+    logits = torch.tensor([[[1.0, 0.0, 2.0, -1.0, 0.5], [0.0, 1.0, -1.0, 2.0, 0.5]]])
+    sampled_ids = torch.tensor([[2, 4]])
+    dense_support = torch.tensor([[[2, 1], [-1, -1]]], dtype=torch.int32)
+    csr_ids, csr_offsets = _csr_from_dense(dense_support)
+
+    actual = aligned_sample_support_csr_scores(
+        logits,
+        sampled_ids,
+        torch.tensor([[0, 1]]),
+        csr_ids,
+        csr_offsets,
+        support_grid_width=2,
+        loss_mask=torch.ones((1, 2), dtype=torch.bool),
+        vocab_start_index=0,
+        vocab_end_index=logits.shape[-1],
+        tp_group=None,
+        inference_only=False,
+        compute_entropy=False,
+        entropy_requires_grad=False,
+    ).logprobs
+    expected = torch.stack(
+        (
+            logits[0, 0, 2] - torch.logsumexp(logits[0, 0, [2, 1]], dim=0),
+            torch.log_softmax(logits[0, 1], dim=-1)[4],
+        )
+    ).unsqueeze(0)
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_support_entropy_excludes_synthetic_eos():
+    logits = torch.tensor([[[1.0, 0.0, 2.0, -1.0, 0.5], [0.0, 1.0, -1.0, 2.0, 0.5]]])
+    sampled_ids = torch.tensor([[2, 4]])
+    dense_support = torch.tensor([[[2, 1], [-1, -1]]], dtype=torch.int32)
+    csr_ids, csr_offsets = _csr_from_dense(dense_support)
+
+    scores = aligned_sample_support_csr_scores(
+        logits,
+        sampled_ids,
+        torch.tensor([[0, 1]]),
+        csr_ids,
+        csr_offsets,
+        support_grid_width=2,
+        loss_mask=torch.ones((1, 2), dtype=torch.bool),
+        vocab_start_index=0,
+        vocab_end_index=logits.shape[-1],
+        tp_group=None,
+        inference_only=False,
+        compute_entropy=True,
+        entropy_requires_grad=False,
+    )
+
+    expected_entropy = _reference_entropy(logits, dense_support)
+    assert scores.entropy is not None
+    assert torch.isfinite(scores.logprobs).all()
+    torch.testing.assert_close(scores.entropy, expected_entropy)
+    assert scores.valid_mask.tolist() == [[True, False]]
+
+
+def test_packed_microbatch_dense_and_sparse_replay_match(monkeypatch):
+    megatron = types.ModuleType("megatron")
+    core = types.ModuleType("megatron.core")
+    parallel_state = types.ModuleType("megatron.core.parallel_state")
+    megatron.core = core
+    core.parallel_state = parallel_state
+    monkeypatch.setitem(sys.modules, "megatron", megatron)
+    monkeypatch.setitem(sys.modules, "megatron.core", core)
+    monkeypatch.setitem(sys.modules, "megatron.core.parallel_state", parallel_state)
+
+    sequences = torch.tensor([[0, 10, 11, 12], [0, 0, 20, 21]])
+    attention_mask = sequences != 0
+    layout = TokenMetadataLayout(
+        attention_mask=attention_mask,
+        sequence_lengths=[3, 2],
+        aligned_sequence_length=8,
+        padded_sequence_lengths=[4, 4],
+        cu_seqlens_padded=torch.tensor([0, 4, 8], dtype=torch.int32),
+    )
+    dense_support = torch.tensor(
+        [
+            [[-1, -1], [-1, -1], [11, 1], [12, 2]],
+            [[-1, -1], [-1, -1], [20, 3], [21, 4]],
+        ],
+        dtype=torch.int32,
+    )
+    csr_ids, csr_offsets = _csr_from_dense(dense_support[:, -2:])
+    logits = torch.randn(1, 8, 32, dtype=torch.float64)
+    loss_mask = torch.ones((2, 2), dtype=torch.bool)
+
+    dense = compute_sample_support_scores(
+        logits,
+        sequences,
+        loss_mask,
+        dense_support,
+        None,
+        None,
+        num_actions=2,
+        packed=True,
+        metadata_layout=layout,
+        vocab_start_index=0,
+        vocab_end_index=logits.shape[-1],
+        tp_group=None,
+        inference_only=True,
+        lm_head_weight=None,
+        temperature=1.0,
+        chunk_size=None,
+        fused_backend="torch",
+        compute_entropy=False,
+        entropy_requires_grad=False,
+    )
+    sparse = compute_sample_support_scores(
+        logits,
+        sequences,
+        loss_mask,
+        None,
+        csr_ids,
+        csr_offsets,
+        num_actions=2,
+        packed=True,
+        metadata_layout=layout,
+        vocab_start_index=0,
+        vocab_end_index=logits.shape[-1],
+        tp_group=None,
+        inference_only=True,
+        lm_head_weight=None,
+        temperature=1.0,
+        chunk_size=None,
+        fused_backend="torch",
+        compute_entropy=False,
+        entropy_requires_grad=False,
+    )
+
+    torch.testing.assert_close(sparse.logprobs, dense.logprobs)
+
+    dense_scores = compute_sample_support_scores(
+        logits,
+        sequences,
+        loss_mask,
+        dense_support,
+        None,
+        None,
+        num_actions=2,
+        packed=True,
+        metadata_layout=layout,
+        vocab_start_index=0,
+        vocab_end_index=logits.shape[-1],
+        tp_group=None,
+        inference_only=True,
+        lm_head_weight=None,
+        temperature=1.0,
+        chunk_size=None,
+        fused_backend="torch",
+        compute_entropy=True,
+        entropy_requires_grad=False,
+    )
+    sparse_scores = compute_sample_support_scores(
+        logits,
+        sequences,
+        loss_mask,
+        None,
+        csr_ids,
+        csr_offsets,
+        num_actions=2,
+        packed=True,
+        metadata_layout=layout,
+        vocab_start_index=0,
+        vocab_end_index=logits.shape[-1],
+        tp_group=None,
+        inference_only=True,
+        lm_head_weight=None,
+        temperature=1.0,
+        chunk_size=None,
+        fused_backend="torch",
+        compute_entropy=True,
+        entropy_requires_grad=False,
+    )
+    assert dense_scores.entropy is not None and sparse_scores.entropy is not None
+    torch.testing.assert_close(sparse_scores.logprobs, dense_scores.logprobs)
+    torch.testing.assert_close(sparse_scores.entropy, dense_scores.entropy)
+    torch.testing.assert_close(sparse_scores.valid_mask, dense_scores.valid_mask)
 
 
 def test_support_ids_must_be_int32():

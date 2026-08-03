@@ -64,6 +64,7 @@ from typing import (
 )
 
 import aiohttp
+import numpy as np
 import orjson
 
 from skyrl.backends.skyrl_train.inference_servers.base import (
@@ -180,7 +181,7 @@ class RemoteGenerateResult:
     response_logprobs: Optional[List[float]]
     stop_reason: str
     routed_experts: Optional[RoutedExpertIndices]
-    sample_support: Optional[List[List[int]]]
+    sample_support: Optional[np.ndarray]
 
 
 @dataclass
@@ -302,9 +303,7 @@ class RemoteGenerateClient:
                 raise ValueError("/skyrl/v1/generate must return packed routed_experts")
             routed_experts = decode_packed_routed_experts(packed_routed_experts)
 
-        sample_support = (
-            decode_sample_support_set(choice["rollout_sample_support"]).tolist() if return_sample_support else None
-        )
+        sample_support = decode_sample_support_set(choice["rollout_sample_support"]) if return_sample_support else None
 
         return RemoteGenerateResult(
             raw_response=response,
