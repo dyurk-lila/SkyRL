@@ -57,14 +57,18 @@ their upstream implementations landed by `fd79ceec`.
 -->
 
 <!-- BEGIN AUTO:develop-delta -->
-_Last generated for `origin/main` (de1a58b4) ↔ `HEAD` (fd390ecb); merge-base `de1a58b4`. **Auto-generated — do not edit by hand.**_
+_Last generated for `origin/main` (134224d2) ↔ `HEAD` (db88bc0e); merge-base `de1a58b4`. **Auto-generated — do not edit by hand.**_
 
-`develop` is **97 commit(s)** ahead of `main`.
+`develop` is **102 commit(s)** ahead of `main`.
 
 ### Commits on `develop` not on `main`
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `168188a0` | revert unwanted changes | lila-sync-bot | 2026-08-03 |
+| `ace824cf` | fix(fully-async): a cancelled rollout must not os._exit(1) t | lila-sync-bot | 2026-07-31 |
+| `277a61c7` | perf(megatron): drop redundant CPU int32 upcast of replay in | lila-sync-bot | 2026-07-30 |
+| `a37f46b9` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-07-28 |
 | `b71a38af` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-07-28 |
 | `cb4ebb56` | refactor: trim logprob clamp helper and tests | lila-sync-bot | 2026-07-28 |
 | `983ef334` | fix(r3): clamp non-finite sampled logprobs instead of failin | lila-sync-bot | 2026-07-28 |
@@ -149,10 +153,11 @@ _Last generated for `origin/main` (de1a58b4) ↔ `HEAD` (fd390ecb); merge-base `
 | `186fd6cc` | feat(upstream-sync): auto-regenerate develop↔main delta on m | dyurk-lila | 2026-06-10 |
 | `237a022f` | chore(upstream-sync): install sync tooling on develop (ledge | dyurk-lila | 2026-06-10 |
 
-<details><summary>merge commits (14)</summary>
+<details><summary>merge commits (15)</summary>
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `db88bc0e` | Merge pull request #74 from fl97inc/dyurk/task-cancelled-n.. | dyurk-lila | 2026-08-03 |
 | `fd390ecb` | Merge pull request #73 from fl97inc/dyurk/clamp-nonfinite-.. | dyurk-lila | 2026-07-28 |
 | `fe575101` | Merge pull request #72 from fl97inc/dyurk/reject-router-fu.. | dyurk-lila | 2026-07-28 |
 | `dd3c1c24` | Merge branch 'develop' into dyurk/reject-router-fusion-wit.. | lila-sync-bot | 2026-07-28 |
@@ -181,7 +186,7 @@ _Last generated for `origin/main` (de1a58b4) ↔ `HEAD` (fd390ecb); merge-base `
  .github/workflows/gpu_skyrl.yaml                   |  23 +-
  .github/workflows/sync-upstream.yaml               | 654 +++++++++++++++++++++
  NOTICE                                             |  21 +
- UPSTREAM.md                                        | 281 +++++++++
+ UPSTREAM.md                                        | 287 +++++++++
  examples/train/sft/data_mixing_sampler.py          | 118 ++++
  pyproject.toml                                     |   2 +
  .../distributed/megatron/fused_lm_head.py          |  95 +++
@@ -195,7 +200,7 @@ _Last generated for `origin/main` (de1a58b4) ↔ `HEAD` (fd390ecb); merge-base `
  skyrl/backends/skyrl_train/utils/ppo_utils.py      |  53 +-
  skyrl/backends/skyrl_train/utils/replay_utils.py   | 333 +++++------
  .../workers/megatron/megatron_model_wrapper.py     | 225 +++----
- .../workers/megatron/megatron_worker.py            |  30 +-
+ .../workers/megatron/megatron_worker.py            |  34 +-
  skyrl/backends/skyrl_train/workers/worker.py       | 148 +++--
  skyrl/backends/skyrl_train/workers/worker_utils.py |  26 +-
  skyrl/train/config/config.py                       |  28 +-
@@ -241,7 +246,7 @@ _Last generated for `origin/main` (de1a58b4) ↔ `HEAD` (fd390ecb); merge-base `
  upstream-sync/bedrock-ci-setup.md                  | 106 ++++
  upstream-sync/gen_develop_delta.sh                 | 104 ++++
  uv.lock                                            |  10 +
- 68 files changed, 5287 insertions(+), 820 deletions(-)
+ 68 files changed, 5295 insertions(+), 822 deletions(-)
 ```
 <!-- END AUTO:develop-delta -->
 
