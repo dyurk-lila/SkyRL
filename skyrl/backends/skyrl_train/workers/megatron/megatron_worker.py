@@ -654,9 +654,9 @@ class MegatronWorker:
             attention_mask = micro["attention_mask"]
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 0)
+            # Keep the compact rollout dtype (uint8/int16) while micro-batches stage on the
+            # host: _split_replay_indices widens to int32 after index_select + the TP slice.
             rollout_expert_indices = micro.get("rollout_expert_indices")
-            if rollout_expert_indices is not None:
-                rollout_expert_indices = rollout_expert_indices.to(torch.int32)
 
             vlm_inputs = {}
             if micro.get("pixel_values") is not None:
