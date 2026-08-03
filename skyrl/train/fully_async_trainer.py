@@ -49,39 +49,6 @@ from skyrl.train.utils.trainer_utils import (
 )
 
 
-def _is_cancellation(exc: BaseException) -> bool:
-    """True if ``exc`` represents *only* cancellation, however it is wrapped.
-
-    A cancelled rollout can reach the generator loop in three shapes:
-
-    * ``asyncio.CancelledError`` -- cancelled in-process.
-    * ``ray.exceptions.TaskCancelledError`` -- cancelled inside a Ray actor. This derives from
-      ``Exception``, not ``asyncio.CancelledError``, so it is not caught by the obvious handler.
-      Ray may also deliver it wrapped in ``RayTaskError``, whose ``cause`` carries the original.
-    * an ``ExceptionGroup`` containing either of the above, because ``asyncio.TaskGroup``
-      re-raises its children as a group.
-
-    Returns False if the exception (or any leaf of the group) is a genuine error, so a real
-    failure bundled alongside a cancellation is still treated as fatal.
-    """
-    if isinstance(exc, BaseExceptionGroup):
-        # Cancellation only if EVERY leaf is a cancellation; one real error makes it fatal.
-        return bool(exc.exceptions) and all(_is_cancellation(e) for e in exc.exceptions)
-    if isinstance(exc, asyncio.CancelledError):
-        return True
-    try:
-        from ray.exceptions import RayTaskError, TaskCancelledError
-    except ImportError:
-        return False
-    if isinstance(exc, TaskCancelledError):
-        return True
-    # RayTaskError wraps the remote exception; `cause` holds the original when deserializable.
-    if isinstance(exc, RayTaskError):
-        cause = getattr(exc, "cause", None)
-        return isinstance(cause, (TaskCancelledError, asyncio.CancelledError))
-    return False
-
-
 @dataclass
 class GeneratedOutputGroup:
     """
@@ -968,24 +935,17 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     raise AssertionError("Generation buffer should never be full given staleness control.")
                 await self._staleness_manager.on_rollout_accepted()
                 slot_acquired = False
-        except BaseException as e:
-            # A cancellation is expected on epoch end / shutdown, and is NOT a failure: release any
-            # held slot so staleness accounting stays consistent, then exit cleanly.
-            #
-            # `asyncio.CancelledError` is not the only shape a cancellation arrives in. When the
-            # cancelled work ran in a Ray actor, the driver sees `ray.exceptions.TaskCancelledError`,
-            # which derives from `Exception` (via RayError) and NOT from `asyncio.CancelledError` --
-            # so it used to fall through to the `except Exception` branch below and kill the process.
-            # It also arrives wrapped: an `asyncio.TaskGroup` in the generator re-raises its children
-            # as a bare `ExceptionGroup`, so the cancellation can be nested one or more levels deep.
-            if _is_cancellation(e):
-                if "slot_acquired" in locals() and slot_acquired:
-                    try:
-                        await self._staleness_manager.on_rollout_rejected()
-                    except Exception:
-                        pass
-                logger.info(f"Generator worker cancelled ({type(e).__name__}); exiting cleanly.")
-                return
+        except asyncio.CancelledError:
+            # Expected on epoch end / shutdown: release any held slot so staleness accounting stays
+            # consistent, then exit cleanly. (Previously os._exit(1) here, which crashed the process and
+            # masked the real traceback when the cancel was triggered by a training-loop error.)
+            if "slot_acquired" in locals() and slot_acquired:
+                try:
+                    await self._staleness_manager.on_rollout_rejected()
+                except Exception:
+                    pass
+            return
+        except Exception as e:
             logger.error(f"Generator worker errored out with exception: {e}")
             logger.error(f"Traceback: \n{traceback.format_exc()}")
             sys.stderr.flush()  # flush before os._exit, which otherwise drops buffered output
