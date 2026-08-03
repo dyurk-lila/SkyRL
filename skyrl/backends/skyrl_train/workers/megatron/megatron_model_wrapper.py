@@ -993,26 +993,6 @@ class MegatronModelWrapper:
                 if self.is_vlm:
                     new_position_ids = None
 
-            metadata_layout = None
-            if rollout_expert_indices is not None:
-                metadata_layout = build_token_metadata_layout(
-                    attention_mask,
-                    attention_mask.device,
-                    packed=packed_seq_params is not None,
-                    fp8_enabled=fp8_enabled,
-                )
-
-            model_replay_kwargs = {}
-            if rollout_expert_indices is not None:
-                model_replay_kwargs = setup_per_microbatch_replay_forward(
-                    rollout_expert_indices,
-                    router_padding_mask,
-                    attention_mask,
-                    model=model,
-                    model_config=model_config,
-                    metadata_layout=metadata_layout,
-                    remove_microbatch_padding=self.remove_microbatch_padding,
-                )
             is_last_stage = mpu.is_pipeline_last_stage(ignore_virtual=True)
 
             metadata_layout = None
@@ -1024,6 +1004,12 @@ class MegatronModelWrapper:
                     fp8_enabled=fp8_enabled,
                 )
 
+            # Exactly one forward setup per microbatch: each call appends this
+            # microbatch's routes to the FIFO that activation-checkpoint
+            # recomputation drains once during backward. A second call would
+            # leave a stale entry, so backward replays the previous
+            # microbatch's routes and Megatron's all-to-all split sizes stop
+            # matching as soon as sequence lengths differ.
             model_replay_kwargs = {}
             if rollout_expert_indices is not None:
                 model_replay_kwargs = setup_per_microbatch_replay_forward(
