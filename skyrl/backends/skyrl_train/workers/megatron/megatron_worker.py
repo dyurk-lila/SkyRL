@@ -44,6 +44,7 @@ from skyrl.backends.skyrl_train.training_batch import (
     TrainingOutputBatch,
 )
 from skyrl.backends.skyrl_train.utils.profiler import build_profiler_from_policy_cfg
+from skyrl.backends.skyrl_train.utils.replay_utils import make_replay_padding_indices
 from skyrl.backends.skyrl_train.weight_sync import (
     LoraLoadRequest,
     WeightChunk,
@@ -73,7 +74,6 @@ from skyrl.backends.skyrl_train.workers.worker_utils import (
 from skyrl.env_vars import SKYRL_WORKER_NCCL_TIMEOUT_IN_S
 from skyrl.train.config.config import MegatronDDPConfig, get_config_as_dict
 from skyrl.train.utils.utils import str_to_torch_dtype, update_model_config
-from skyrl.utils.routed_experts import make_replay_padding_indices
 from skyrl.utils.tok import get_tokenizer
 
 if TYPE_CHECKING:
@@ -627,8 +627,6 @@ class MegatronWorker:
         Returns:
             CPU tensor of shape ``[batch_size, response_length]`` in original sample order.
         """
-        from skyrl.backends.skyrl_train.utils.replay_utils import clear_router_replay
-
         self._drop_pixel_values_on_non_first_pp_stage(data)
 
         use_token_batching = self.cfg.max_tokens_per_microbatch > 0
@@ -709,7 +707,6 @@ class MegatronWorker:
             output = TrainingOutputBatch({"output": log_probs})
             output.metadata = data.metadata
 
-        clear_router_replay()
         return output["output"]
 
     def _reorder_megatron_forward_output(
@@ -1001,6 +998,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         data: TrainingInputBatch,
         loss_fn: Optional[str] = None,
         loss_fn_config: Optional[Dict[str, Any]] = None,
+        return_per_token_outputs: bool = True,
     ) -> WorkerOutput:
         """Forward pass.
 
@@ -1011,9 +1009,11 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
           pipeline schedule with ``forward_only=True`` (no backward) and returns a
           :class:`WorkerOutput` with per-sample ``loss_fn_outputs`` plus scalar
           ``metrics`` (including ``"loss"``).
-        """
-        from skyrl.backends.skyrl_train.utils.replay_utils import clear_router_replay
 
+        ``return_per_token_outputs=False`` skips building per-token
+        ``loss_fn_outputs`` on the loss path for callers that read only
+        ``metrics``; it has no effect on the inference path.
+        """
         if loss_fn is None:
             # Megatron inference forward path: emit per-sample logprobs. Token-based
             # micro-batching (when `max_tokens_per_microbatch > 0`) is handled inside
@@ -1088,6 +1088,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 loss_fn=loss_fn,
                 loss_fn_config=loss_fn_config,
                 forward_only=True,
+                return_per_token_outputs=return_per_token_outputs,
             )
 
         if self.empty_cuda_cache:
@@ -1106,7 +1107,6 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         group = mpu.get_data_parallel_group(with_context_parallel=False)
         status = all_reduce_metrics(status, self.strategy, group=group, sum_loss_metrics=True)
 
-        clear_router_replay()
         return WorkerOutput(loss_fn_outputs=all_loss_fn_outputs, metrics=status)
 
     def forward_backward(
@@ -1114,6 +1114,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         data: TrainingInputBatch,
         loss_fn: Optional[str] = None,
         loss_fn_config: Optional[Dict[str, Any]] = None,
+        return_per_token_outputs: bool = True,
     ) -> WorkerOutput:
         """
         Perform forward and backward passes for a batch, handling micro-batching internally.
@@ -1127,13 +1128,13 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             loss_fn: Optional loss function name (e.g., "cross_entropy", "ppo").
                      If provided, overrides the config's policy_loss_type.
             loss_fn_config: Optional config overrides for the loss function.
+            return_per_token_outputs: When False, skip building per-token
+                ``loss_fn_outputs`` when callers read only ``metrics``.
 
         Returns:
             :class:`WorkerOutput` with per-sample ``loss_fn_outputs`` and scalar
             ``metrics`` (all-reduced across DP).
         """
-        from skyrl.backends.skyrl_train.utils.replay_utils import clear_router_replay
-
         self.model.train()
         for chunk in self.actor_module:
             # if use distributed optimizer, zero grad buffer will be handled by optimizer
@@ -1254,6 +1255,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             temperature=self.cfg.algorithm.temperature,
             loss_fn=loss_fn,
             loss_fn_config=loss_fn_config,
+            return_per_token_outputs=return_per_token_outputs,
         )
 
         if self.empty_cuda_cache:
@@ -1308,8 +1310,6 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             if moe_metrics:
                 for k, v in moe_metrics.items():
                     status[k] = v
-
-        clear_router_replay()
 
         return WorkerOutput(loss_fn_outputs=all_loss_fn_outputs, metrics=status)
 
@@ -1454,13 +1454,14 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         use_prefix_cache = inference_engine_cfg.enable_prefix_caching
         generator_dtype = str_to_torch_dtype(inference_engine_cfg.model_dtype)
         cache_reset_task = None
-
+        sender_handles_prefix_cache_reset = self._weight_transfer_sender.handles_prefix_cache_reset
         # Clear prefix cache for synchronous training or for async training if `clear_kv_cache_on_weight_sync` is set
-        if (
-            use_prefix_cache
-            and torch.distributed.get_rank() == 0
-            and (not self.cfg.fully_async.enabled or self.cfg.fully_async.clear_kv_cache_on_weight_sync)
-        ):
+        reset_prefix_cache: bool = use_prefix_cache and (
+            not self.cfg.fully_async.enabled or self.cfg.fully_async.clear_kv_cache_on_weight_sync
+        )
+        send_chunks_kwargs = {"reset_prefix_cache": reset_prefix_cache}
+
+        if reset_prefix_cache and torch.distributed.get_rank() == 0 and not sender_handles_prefix_cache_reset:
             # clear prefix cache
             cache_reset_task = inference_engine_client.reset_prefix_cache(reset_running_requests=True)
 
@@ -1483,6 +1484,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 await self._weight_transfer_sender.send_chunks(
                     self.weight_extractor.extract_weights(generator_dtype),
                     weight_metadata=weight_metadata,
+                    **send_chunks_kwargs,
                 )
 
         if cache_reset_task is not None:
