@@ -211,6 +211,7 @@ class WorkerDispatch:
         loss_fn: Optional[str] = None,
         loss_fn_config: Optional[Dict[str, Any]] = None,
         model_id: Optional[str] = None,
+        **worker_kwargs,
     ) -> WorkerOutput:
         """Run forward pass. Only loads model (not optimizer).
 
@@ -231,11 +232,14 @@ class WorkerDispatch:
             loss_fn_config: Optional config overrides for the loss function.
             model_id: Optional Tinker model_id; when set, the corresponding LoRA adapter
                      is swapped in before the forward.
+            worker_kwargs: Extra worker-type-specific keyword arguments passed
+                     through to the worker's ``forward`` (e.g.
+                     ``return_per_token_outputs=False`` for the policy worker).
         """
         self._ensure_on_gpu(model, need_optimizer=False, need_model=True)
         self.ensure_active_adapter(model, model_id)
 
-        kwargs = {}
+        kwargs = dict(worker_kwargs)
         if loss_fn is not None:
             kwargs["loss_fn"] = loss_fn
         if loss_fn_config is not None:
@@ -253,6 +257,7 @@ class WorkerDispatch:
         loss_fn: Optional[str] = None,
         loss_fn_config: Optional[Dict[str, Any]] = None,
         model_id: Optional[str] = None,
+        **worker_kwargs,
     ) -> WorkerOutput:
         """Run a forward pass using pre-staged per-DP chunks.
 
@@ -269,6 +274,8 @@ class WorkerDispatch:
                      loss + per-sample outputs without backward (no_grad).
             loss_fn_config: Optional config overrides for the loss function.
             model_id: Optional Tinker model_id; selects the LoRA adapter before the forward.
+            worker_kwargs: Extra worker-type-specific keyword arguments passed
+                     through to the worker's ``forward``.
 
         Returns:
             :class:`WorkerOutput` aggregated across DP ranks.
@@ -276,7 +283,7 @@ class WorkerDispatch:
         self._ensure_on_gpu(model, need_optimizer=False, need_model=True)
         self.ensure_active_adapter(model, model_id)
 
-        kwargs = {}
+        kwargs = dict(worker_kwargs)
         if loss_fn is not None:
             kwargs["loss_fn"] = loss_fn
         if loss_fn_config is not None:
@@ -321,6 +328,7 @@ class WorkerDispatch:
         loss_fn: Optional[str] = None,
         loss_fn_config: Optional[Dict[str, Any]] = None,
         model_id: Optional[str] = None,
+        **worker_kwargs,
     ) -> WorkerOutput:
         """Run forward/backward pass. Needs model + optimizer.
 
@@ -334,6 +342,9 @@ class WorkerDispatch:
                            (e.g., {"eps_clip_low": 0.1} for the regular PPO loss)
             model_id: Optional Tinker model_id; when set, the corresponding
                      LoRA adapter is swapped in before the forward/backward.
+            worker_kwargs: Extra worker-type-specific keyword arguments passed
+                     through to the worker's ``forward_backward`` (e.g.
+                     ``return_per_token_outputs=False`` for the policy worker).
 
         Returns:
             :class:`WorkerOutput` with per-sample ``loss_fn_outputs`` aggregated
@@ -343,7 +354,7 @@ class WorkerDispatch:
         self.ensure_active_adapter(model, model_id)
 
         # Only pass kwargs that are not None (critic worker doesn't accept loss_fn)
-        kwargs = {}
+        kwargs = dict(worker_kwargs)
         if loss_fn is not None:
             kwargs["loss_fn"] = loss_fn
         if loss_fn_config is not None:
@@ -363,6 +374,7 @@ class WorkerDispatch:
         loss_fn: Optional[str] = None,
         loss_fn_config: Optional[Dict[str, Any]] = None,
         model_id: Optional[str] = None,
+        **worker_kwargs,
     ) -> WorkerOutput:
         """
         Run forward/backward pass using pre-staged per-DP chunks.
@@ -373,6 +385,8 @@ class WorkerDispatch:
         Args:
             model: Model name ("policy" or "critic")
             chunk_refs: Pre-staged ObjectRefs, one per DP rank (from ``stage_data``)
+            worker_kwargs: Extra worker-type-specific keyword arguments passed
+                     through to the worker's ``forward_backward``.
 
         Returns:
             :class:`WorkerOutput` with per-sample ``loss_fn_outputs`` aggregated
@@ -382,7 +396,7 @@ class WorkerDispatch:
         self.ensure_active_adapter(model, model_id)
 
         # Only pass kwargs that are not None (critic worker doesn't accept loss_fn)
-        kwargs = {}
+        kwargs = dict(worker_kwargs)
         if loss_fn is not None:
             kwargs["loss_fn"] = loss_fn
         if loss_fn_config is not None:
@@ -679,12 +693,18 @@ class WorkerDispatch:
             else:
                 # Non-colocated single tenant: pause generation to prevent in-flight requests from
                 # reading partially-updated weights during the NCCL broadcast.
-                await self._inference_engine_client.pause_generation()
-                try:
+                if self.cfg.generator.inference_engine.weight_sync_backend == "delta":
+                    # Delta disk sync performs publish/fetch before pausing and
+                    # pauses internally only around the final reload.
                     self._broadcast_to_inference_engines(self._inference_engine_client, model_id=model_id)
                     self._finish_weight_sync()
-                finally:
-                    await self._inference_engine_client.resume_generation()
+                else:
+                    await self._inference_engine_client.pause_generation()
+                    try:
+                        self._broadcast_to_inference_engines(self._inference_engine_client, model_id=model_id)
+                        self._finish_weight_sync()
+                    finally:
+                        await self._inference_engine_client.resume_generation()
 
         # Advance the policy version so prefix-cache salting isolates blocks from the previous weights
         # (see `GeneratorConfig.use_cache_salt`).

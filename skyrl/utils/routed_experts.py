@@ -2,9 +2,10 @@ from collections.abc import Sequence
 from typing import TypeAlias
 
 import numpy as np
-import torch
 
-from skyrl.utils.token_metadata import TokenMetadataTrace
+from skyrl.backends.skyrl_train.distributed.megatron.token_metadata import (
+    TokenMetadataTrace,
+)
 
 RoutedExpertIndices: TypeAlias = np.ndarray
 ROUTED_EXPERT_DTYPES = frozenset({np.dtype(np.uint8), np.dtype(np.int16), np.dtype(np.int32)})
@@ -87,16 +88,3 @@ def compact_routed_expert_indices(routed_experts: RoutedExpertIndices) -> Routed
     if not compact.flags.writeable:
         compact = compact.copy(order="C")
     return compact
-
-
-def make_replay_padding_indices(
-    shape: tuple[int, ...],
-    *,
-    dtype: torch.dtype,
-    device: torch.device | str | int | None = None,
-) -> torch.Tensor:
-    """Return dummy routes with ``topk`` distinct experts in every row."""
-    if not shape or shape[-1] < 1:
-        raise ValueError(f"Replay route padding requires a positive topk dimension, got {shape}")
-    padding_row = torch.arange(shape[-1], dtype=dtype, device=device)
-    return padding_row.expand(shape).clone()

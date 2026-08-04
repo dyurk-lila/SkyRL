@@ -53,7 +53,6 @@ from skyrl.backends.skyrl_train.workers.worker_utils import (
     all_reduce_metrics,
     compute_minibatch_rollout_logprob_diff_metrics,
     get_microbatch_iterator,
-    pop_return_per_token_outputs,
     reduce_metrics,
 )
 from skyrl.env_vars import (
@@ -323,7 +322,7 @@ class Worker(DistributedTorchRayActor):
         """Return the model module(s) to be offloaded/backloaded. Megatron offloads `self.actor_module`. FSDP workers use `self.model` directly."""
         return self.model
 
-    def offload_to_cpu(self, offload_optimizer=True, offload_model=True):
+    def offload_to_cpu(self, offload_optimizer: bool = True, offload_model: bool = True):
         """Offload all worker state to CPU.
 
         After this function runs, only temporary reserved memory and torch's pre-loaded cuda kernels (~ GB) will remain.
@@ -340,7 +339,7 @@ class Worker(DistributedTorchRayActor):
             offload_model=offload_model,
         )
 
-    def backload_to_gpu(self, backload_optimizer=True, backload_model=True):
+    def backload_to_gpu(self, backload_optimizer: bool = True, backload_model: bool = True):
         """Backload worker state to GPU.
 
         Args:
@@ -426,7 +425,9 @@ class Worker(DistributedTorchRayActor):
 
         # Create init info on all ranks (it's deterministic from cfg or fetched world_size)
         init_info = self._transfer_strategy_cls.create_init_info(
-            inference_engine_cfg, inference_world_size=inference_world_size
+            inference_engine_cfg,
+            inference_world_size=inference_world_size,
+            base_model_path=self.cfg.policy.model.path,
         )
 
         # Create sender on all ranks
@@ -713,12 +714,14 @@ class PPORayActorGroup:
             raise RuntimeError("Cannot determine data-parallel size before actor group initialization.")
         return self._last_dp_size
 
-    def offload_to_cpu(self, nonblocking=False, offload_optimizer=True, offload_model=True):
+    def offload_to_cpu(self, nonblocking: bool = False, offload_optimizer: bool = True, offload_model: bool = True):
         """Offload all worker state to CPU.
 
         Args:
             nonblocking: Whether this operation is synchronous or asynchronous.
-            If `nonblocking=True`, then the function returns a list of object refs.
+                If `nonblocking=True`, then the function returns a list of object refs.
+            offload_optimizer: Whether to offload optimizer state.
+            offload_model: Whether to offload model parameters.
         """
         refs = [
             actor.offload_to_cpu.remote(offload_optimizer=offload_optimizer, offload_model=offload_model)
@@ -728,12 +731,14 @@ class PPORayActorGroup:
             return refs
         return ray.get(refs)
 
-    def backload_to_gpu(self, nonblocking=False, backload_optimizer=True, backload_model=True):
+    def backload_to_gpu(self, nonblocking: bool = False, backload_optimizer: bool = True, backload_model: bool = True):
         """Backload worker state to GPU
 
         Args:
             nonblocking: Whether this operation is synchronous or asynchronous.
-            If `nonblocking=True`, then the function returns a list of ObjectRefs.
+                If `nonblocking=True`, then the function returns a list of ObjectRefs.
+            backload_optimizer: Whether to backload optimizer state.
+            backload_model: Whether to backload model parameters.
         """
         refs = [
             actor.backload_to_gpu.remote(backload_optimizer=backload_optimizer, backload_model=backload_model)
@@ -743,7 +748,7 @@ class PPORayActorGroup:
             return refs
         return ray.get(refs)
 
-    def async_run_ray_method(self, dispatch_type: str, method_name: str, *args, **kwargs) -> List[ObjectRef]:
+    def async_run_ray_method(self, dispatch_type: str, method_name: str, *args: Any, **kwargs: Any) -> List[ObjectRef]:
         """Run a method on all actors using specified dispatch type asynchronously.
 
         Args:
@@ -780,6 +785,7 @@ class PolicyWorkerBase(Worker):
         data: TrainingInputBatch,
         loss_fn: Optional[str] = None,
         loss_fn_config: Optional[Dict[str, Any]] = None,
+        return_per_token_outputs: bool = True,
     ) -> WorkerOutput:
         """
         Perform forward and backward passes for a batch, handling micro-batching internally.
@@ -793,6 +799,9 @@ class PolicyWorkerBase(Worker):
                      If provided, overrides the config's policy_loss_type.
             loss_fn_config: Optional config overrides for the loss function
                            (e.g., {"clip_low_threshold": 0.9} for PPO)
+            return_per_token_outputs: When False, skip building per-token
+                ``loss_fn_outputs`` (logprobs / elementwise NLL) for callers that
+                consume only scalar ``metrics`` (e.g. the SFT trainer).
 
         Returns:
             :class:`WorkerOutput` with per-sample ``loss_fn_outputs`` and scalar
@@ -810,7 +819,11 @@ class PolicyWorkerBase(Worker):
             experience = BaseBatchIterator.batch_to_experience(microbatch)
             microbatch_weight = len(microbatch) / len(data)
             metrics = self._forward_backward_micro(
-                experience, microbatch_weight, loss_fn=loss_fn, loss_fn_config=loss_fn_config
+                experience,
+                microbatch_weight,
+                loss_fn=loss_fn,
+                loss_fn_config=loss_fn_config,
+                return_per_token_outputs=return_per_token_outputs,
             )
 
             # Extract loss_fn_outputs before reduce_metrics (it's not a scalar metric)
@@ -844,6 +857,7 @@ class PolicyWorkerBase(Worker):
         microbatch_weight: float,
         loss_fn: Optional[str] = None,
         loss_fn_config: Optional[Dict[str, Any]] = None,
+        return_per_token_outputs: bool = True,
     ) -> Dict[str, float]:
         """
         Perform forward and backward pass for one micro batch.
@@ -855,8 +869,8 @@ class PolicyWorkerBase(Worker):
                 Public Tinker aliases such as ``ppo`` should be normalized by the backend
                 before reaching the worker.
             loss_fn_config: Optional config overrides for the resolved train loss function.
-                May include reserved key ``return_per_token_outputs`` to skip
-                per-token ``loss_fn_outputs`` when callers read only ``metrics``.
+            return_per_token_outputs: When False, skip building per-token
+                ``loss_fn_outputs`` when callers read only ``metrics``.
 
         Returns:
             Metrics dict for the worker's local micro batch
@@ -885,9 +899,6 @@ class PolicyWorkerBase(Worker):
         else:
             # Fall back to config default
             current_loss_fn = self.policy_loss_fn
-
-        # Consume the reserved gate before merging AlgorithmConfig overrides.
-        loss_fn_config, return_per_token_outputs = pop_return_per_token_outputs(loss_fn_config)
 
         # Build config for loss function, applying any overrides
         loss_config = self.cfg.algorithm
@@ -944,7 +955,11 @@ class PolicyWorkerBase(Worker):
                     if loss_mask is not None:
                         elementwise_loss = elementwise_loss * loss_mask
 
-                # Trim each sample with one CPU transfer per tensor.
+                # Build per-sequence loss_fn_outputs (matches Tinker's ForwardBackwardOutput
+                # structure). Trim to actual response length per sample (Tinker expects
+                # variable-length arrays that align with the input weights, not padded to
+                # batch max). Compute valid_lens vectorized on GPU, then move tensors to CPU
+                # exactly once before iterating in Python — avoids ~3N GPU->CPU syncs.
                 batch_size = action_log_probs.shape[0]
                 seq_len = action_log_probs.shape[1]
                 if action_mask is not None:
@@ -1073,6 +1088,7 @@ class PolicyWorkerBase(Worker):
         data: TrainingInputBatch,
         loss_fn: Optional[str] = None,
         loss_fn_config: Optional[Dict[str, Any]] = None,
+        return_per_token_outputs: bool = True,
     ) -> WorkerOutput:
         """Run forward pass.
 
@@ -1085,6 +1101,10 @@ class PolicyWorkerBase(Worker):
           and returns a :class:`WorkerOutput` with per-sample ``loss_fn_outputs`` plus
           ``metrics`` (e.g. ``"loss"``).  Metrics are all-reduced across the DP group
           to mirror :meth:`forward_backward`.
+
+        ``return_per_token_outputs=False`` skips building the per-token
+        ``loss_fn_outputs`` on the loss path for callers that read only
+        ``metrics`` (e.g. SFT eval); it has no effect on the inference path.
         """
         if loss_fn is None:
             # Inference forward path: run in micro batches and emit per-sample logprobs.
@@ -1109,7 +1129,12 @@ class PolicyWorkerBase(Worker):
         all_loss_fn_outputs: List[Dict[str, Any]] = []
 
         for micro_batch in BatchIterator(data, micro_batch_size, drop_last=False):
-            metrics = self._forward_micro_with_loss(micro_batch, loss_fn=loss_fn, loss_fn_config=loss_fn_config)
+            metrics = self._forward_micro_with_loss(
+                micro_batch,
+                loss_fn=loss_fn,
+                loss_fn_config=loss_fn_config,
+                return_per_token_outputs=return_per_token_outputs,
+            )
             if "loss_fn_outputs" in metrics:
                 all_loss_fn_outputs.extend(metrics.pop("loss_fn_outputs"))
             for k, v in metrics.items():
@@ -1126,6 +1151,7 @@ class PolicyWorkerBase(Worker):
         experience: Experience,
         loss_fn: str,
         loss_fn_config: Optional[Dict[str, Any]] = None,
+        return_per_token_outputs: bool = True,
     ) -> Dict[str, Any]:
         """Forward-only counterpart of :meth:`_forward_backward_micro`'s SFT branch.
 
@@ -1137,8 +1163,8 @@ class PolicyWorkerBase(Worker):
             experience: Experience object for one micro batch.
             loss_fn: Eval loss function name (e.g., "cross_entropy").
             loss_fn_config: Optional config overrides for the resolved loss function.
-                May include reserved key ``return_per_token_outputs`` to skip
-                per-token ``loss_fn_outputs`` when callers read only ``metrics``.
+            return_per_token_outputs: When False, skip building per-token
+                ``loss_fn_outputs`` when callers read only ``metrics``.
         """
         self.model.eval()
         experience.to_device(torch.cuda.current_device())
@@ -1153,9 +1179,6 @@ class PolicyWorkerBase(Worker):
         rollout_action_logprobs = experience.rollout_logprobs
 
         current_loss_fn = PolicyLossRegistry.get(loss_fn)
-
-        # Consume the reserved gate before merging AlgorithmConfig overrides.
-        loss_fn_config, return_per_token_outputs = pop_return_per_token_outputs(loss_fn_config)
 
         # Build config for loss function, applying any overrides
         loss_config = self.cfg.algorithm
@@ -1192,7 +1215,9 @@ class PolicyWorkerBase(Worker):
                 if loss_mask is not None:
                     elementwise_loss = elementwise_loss * loss_mask
 
-                # Trim each sample with one CPU transfer per tensor.
+                # Compute valid_lens vectorized on GPU, then move tensors to CPU
+                # exactly once before iterating in Python. Avoids ~3N GPU->CPU syncs
+                # per micro-batch (item()/cpu()/tolist() inside the per-sample loop).
                 batch_size = action_log_probs.shape[0]
                 seq_len = action_log_probs.shape[1]
                 if action_mask is not None:

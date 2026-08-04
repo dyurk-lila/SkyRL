@@ -33,6 +33,9 @@ from skyrl.backends.skyrl_train.distributed.megatron.model_utils import (
     vocab_parallel_entropy_packed_sequences,
 )
 from skyrl.backends.skyrl_train.distributed.megatron.packing_utils import is_fp8_enabled
+from skyrl.backends.skyrl_train.distributed.megatron.token_metadata import (
+    build_token_metadata_layout,
+)
 from skyrl.backends.skyrl_train.mtp.adapter import project_mtp_hidden_to_logits
 from skyrl.backends.skyrl_train.mtp.hidden_capture import maybe_capture_mtp_hidden
 from skyrl.backends.skyrl_train.mtp.soft_ce import (
@@ -55,10 +58,8 @@ from skyrl.backends.skyrl_train.utils.replay_utils import (
 from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
 from skyrl.backends.skyrl_train.workers.worker_utils import (
     compute_minibatch_rollout_logprob_diff_metrics,
-    pop_return_per_token_outputs,
 )
 from skyrl.train.config import TrainerConfig
-from skyrl.utils.token_metadata import build_token_metadata_layout
 
 
 def _build_packed_targets(
@@ -469,6 +470,7 @@ class MegatronModelWrapper:
         loss_fn: Optional[str] = None,
         loss_fn_config: Optional[Dict[str, Any]] = None,
         forward_only: bool = False,
+        return_per_token_outputs: bool = True,
     ) -> List[dict]:
         """
         Run forward-backward over a full mini-batch consisting of multiple micro-batches.
@@ -484,11 +486,11 @@ class MegatronModelWrapper:
             loss_fn: Optional loss function name (e.g., "cross_entropy", "ppo").
                      If provided, overrides the config's policy_loss_type.
             loss_fn_config: Optional config overrides for the loss function.
-                May include reserved key ``return_per_token_outputs`` to skip
-                per-token ``loss_fn_outputs`` when callers read only ``metrics``.
             forward_only: If True, run the forward pass without backward (no gradients).
                           Useful for evaluation / loss-only inference paths (e.g., SFT
                           ``forward(loss_fn=...)`` codepath).
+            return_per_token_outputs: When False, skip building per-token
+                ``loss_fn_outputs`` when callers read only ``metrics``.
 
         Returns:
             List[dict]: one metrics dict per micro-batch in order.
@@ -528,9 +530,6 @@ class MegatronModelWrapper:
             current_loss_fn = PolicyLossRegistry.get(loss_fn)
         else:
             current_loss_fn = self.policy_loss_fn
-
-        # Consume the reserved gate before merging AlgorithmConfig overrides.
-        loss_fn_config, return_per_token_outputs = pop_return_per_token_outputs(loss_fn_config)
 
         # Build config for loss function, applying any overrides
         loss_config = self.cfg.algorithm
@@ -741,7 +740,10 @@ class MegatronModelWrapper:
                         if loss_mask is not None:
                             elementwise_loss = elementwise_loss * loss_mask
 
-                    # Trim each sample with one CPU transfer per tensor.
+                    # Build per-sequence loss_fn_outputs.
+                    # Compute valid_lens vectorized on GPU, then move tensors to CPU
+                    # exactly once before iterating in Python — avoids ~3N GPU->CPU
+                    # syncs per micro-batch (item()/cpu()/tolist() inside the loop).
                     batch_size = action_log_probs.shape[0]
                     seq_len = action_log_probs.shape[1]
                     if action_mask is not None:
@@ -991,6 +993,8 @@ class MegatronModelWrapper:
                 if self.is_vlm:
                     new_position_ids = None
 
+            is_last_stage = mpu.is_pipeline_last_stage(ignore_virtual=True)
+
             metadata_layout = None
             if rollout_expert_indices is not None:
                 metadata_layout = build_token_metadata_layout(
@@ -1000,6 +1004,12 @@ class MegatronModelWrapper:
                     fp8_enabled=fp8_enabled,
                 )
 
+            # Exactly one forward setup per microbatch: each call appends this
+            # microbatch's routes to the FIFO that activation-checkpoint
+            # recomputation drains once during backward. A second call would
+            # leave a stale entry, so backward replays the previous
+            # microbatch's routes and Megatron's all-to-all split sizes stop
+            # matching as soon as sequence lengths differ.
             model_replay_kwargs = {}
             if rollout_expert_indices is not None:
                 model_replay_kwargs = setup_per_microbatch_replay_forward(
@@ -1011,7 +1021,6 @@ class MegatronModelWrapper:
                     metadata_layout=metadata_layout,
                     remove_microbatch_padding=self.remove_microbatch_padding,
                 )
-            is_last_stage = mpu.is_pipeline_last_stage(ignore_virtual=True)
 
             # Recover [batch, seq_len, ...] from Megatron's internal (left-removed) layout. Only used
             # on the non-packed path: with sample packing (remove_microbatch_padding) the logits stay

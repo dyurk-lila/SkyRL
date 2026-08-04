@@ -5,6 +5,7 @@ skip, config-pop, and RL-ungated behavior. GPU parity lives in
 ``tests/backends/skyrl_train/gpu/gpu_ci/test_training_step.py``.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -12,7 +13,6 @@ import torch
 
 from skyrl.backends.skyrl_train.utils.ppo_utils import PolicyLossRegistry
 from skyrl.backends.skyrl_train.workers.worker import PolicyWorkerBase
-from skyrl.backends.skyrl_train.workers.worker_utils import RETURN_PER_TOKEN_OUTPUTS_KEY
 from skyrl.train.config import SkyRLTrainConfig
 from skyrl.train.dataset.replay_buffer import Experience
 
@@ -44,11 +44,11 @@ def _make_cpu_policy_worker() -> PolicyWorkerBase:
         sequence_parallel_size=1,
     )
     worker.strategy = MagicMock()
-    worker.mesh_rank = MagicMock()
-    worker.mesh_rank.dp_size = 1
     worker.scheduler = MagicMock()
     worker.scheduler.get_last_lr.return_value = [1e-4]
     worker.optimizer = MagicMock()
+    # Both loss branches scale by dp_size; real workers get this from init_model().
+    worker.mesh_rank = SimpleNamespace(dp_size=1)
     return worker
 
 
@@ -78,7 +78,7 @@ def _make_experience() -> Experience:
     )
 
 
-def _run_forward_backward_micro(loss_fn_config):
+def _run_forward_backward_micro(return_per_token_outputs=True, loss_fn_config=None):
     """Drive the train cross_entropy build on CPU."""
     worker = _make_cpu_policy_worker()
     action_log_probs = torch.full((BATCH_SIZE, NUM_ACTIONS), -0.5)
@@ -90,10 +90,11 @@ def _run_forward_backward_micro(loss_fn_config):
             microbatch_weight=1.0,
             loss_fn="cross_entropy",
             loss_fn_config=loss_fn_config,
+            return_per_token_outputs=return_per_token_outputs,
         )
 
 
-def _run_forward_micro_with_loss(loss_fn_config):
+def _run_forward_micro_with_loss(return_per_token_outputs=True, loss_fn_config=None):
     """Drive the eval cross_entropy build on CPU."""
     worker = _make_cpu_policy_worker()
     action_log_probs = torch.full((BATCH_SIZE, NUM_ACTIONS), -0.5)
@@ -104,18 +105,17 @@ def _run_forward_micro_with_loss(loss_fn_config):
             experience,
             loss_fn="cross_entropy",
             loss_fn_config=loss_fn_config,
+            return_per_token_outputs=return_per_token_outputs,
         )
 
 
-def _run_forward_backward_micro_rl(loss_fn_config):
+def _run_forward_backward_micro_rl(return_per_token_outputs=True):
     """Drive the PPO path, which must ignore the SFT-only gate."""
     worker = _make_cpu_policy_worker()
     worker.cfg.algorithm.policy_loss_type = "regular"
     # Disable extra PPO terms so this test isolates loss_fn_outputs.
     worker.cfg.algorithm.use_kl_loss = False
     worker.cfg.algorithm.use_entropy_loss = False
-    worker.mesh_rank = MagicMock()
-    worker.mesh_rank.dp_size = 1
 
     action_log_probs = torch.full((BATCH_SIZE, NUM_ACTIONS), -0.5)
     model = MagicMock()
@@ -131,7 +131,7 @@ def _run_forward_backward_micro_rl(loss_fn_config):
             experience,
             microbatch_weight=1.0,
             loss_fn="regular",
-            loss_fn_config=loss_fn_config,
+            return_per_token_outputs=return_per_token_outputs,
         )
 
 
@@ -146,7 +146,7 @@ class TestForwardBackwardMicroGate:
             assert len(out["elementwise_loss"]) == NUM_ACTIONS
 
     def test_explicit_true_keeps_per_token_outputs(self):
-        status = _run_forward_backward_micro(loss_fn_config={RETURN_PER_TOKEN_OUTPUTS_KEY: True})
+        status = _run_forward_backward_micro(return_per_token_outputs=True)
         outputs = status["loss_fn_outputs"]
         assert len(outputs) == BATCH_SIZE
         for out in outputs:
@@ -155,7 +155,7 @@ class TestForwardBackwardMicroGate:
 
     def test_false_skips_per_token_outputs(self):
         """False: one empty dict per sequence."""
-        status = _run_forward_backward_micro(loss_fn_config={RETURN_PER_TOKEN_OUTPUTS_KEY: False})
+        status = _run_forward_backward_micro(return_per_token_outputs=False)
         outputs = status["loss_fn_outputs"]
         assert len(outputs) == BATCH_SIZE
         for out in outputs:
@@ -163,23 +163,18 @@ class TestForwardBackwardMicroGate:
 
     def test_loss_and_metrics_identical_across_flag(self):
         """Skipping per-token outputs must not perturb consumed metrics."""
-        kept = _run_forward_backward_micro(loss_fn_config={RETURN_PER_TOKEN_OUTPUTS_KEY: True})
-        skipped = _run_forward_backward_micro(loss_fn_config={RETURN_PER_TOKEN_OUTPUTS_KEY: False})
+        kept = _run_forward_backward_micro(return_per_token_outputs=True)
+        skipped = _run_forward_backward_micro(return_per_token_outputs=False)
         assert kept["loss"] == skipped["loss"]
         assert kept["response_length"] == skipped["response_length"]
         assert kept["lr"] == skipped["lr"]
 
-    def test_flag_popped_before_algorithm_config_merge(self):
-        """The reserved flag is removed before AlgorithmConfig validation."""
-        # A real override key confirms legitimate config merge still runs.
-        status = _run_forward_backward_micro(loss_fn_config={RETURN_PER_TOKEN_OUTPUTS_KEY: False, "eps_clip_low": 0.1})
+    def test_gate_composes_with_loss_fn_config_override(self):
+        """The gate is independent of loss_fn_config; overrides still merge."""
+        # A real override key confirms legitimate config merge still runs while
+        # the explicit gate suppresses per-token outputs.
+        status = _run_forward_backward_micro(return_per_token_outputs=False, loss_fn_config={"eps_clip_low": 0.1})
         assert status["loss_fn_outputs"] == [{} for _ in range(BATCH_SIZE)]
-
-    def test_caller_loss_fn_config_not_mutated(self):
-        """Popping the flag must not mutate the caller-provided dict."""
-        cfg_dict = {RETURN_PER_TOKEN_OUTPUTS_KEY: False}
-        _run_forward_backward_micro(loss_fn_config=cfg_dict)
-        assert cfg_dict == {RETURN_PER_TOKEN_OUTPUTS_KEY: False}
 
 
 class TestForwardMicroWithLossGate:
@@ -192,22 +187,22 @@ class TestForwardMicroWithLossGate:
             assert len(out["elementwise_loss"]) == NUM_ACTIONS
 
     def test_false_skips_per_token_outputs(self):
-        status = _run_forward_micro_with_loss(loss_fn_config={RETURN_PER_TOKEN_OUTPUTS_KEY: False})
+        status = _run_forward_micro_with_loss(return_per_token_outputs=False)
         outputs = status["loss_fn_outputs"]
         assert len(outputs) == BATCH_SIZE
         for out in outputs:
             assert out == {}
 
     def test_loss_identical_across_flag(self):
-        kept = _run_forward_micro_with_loss(loss_fn_config={RETURN_PER_TOKEN_OUTPUTS_KEY: True})
-        skipped = _run_forward_micro_with_loss(loss_fn_config={RETURN_PER_TOKEN_OUTPUTS_KEY: False})
+        kept = _run_forward_micro_with_loss(return_per_token_outputs=True)
+        skipped = _run_forward_micro_with_loss(return_per_token_outputs=False)
         assert kept["loss"] == skipped["loss"]
         assert kept["response_length"] == skipped["response_length"]
 
 
 class TestForwardBackwardMicroRLPathUngated:
     def test_rl_builds_logprobs_with_flag_true(self):
-        status = _run_forward_backward_micro_rl(loss_fn_config={RETURN_PER_TOKEN_OUTPUTS_KEY: True})
+        status = _run_forward_backward_micro_rl(return_per_token_outputs=True)
         outputs = status["loss_fn_outputs"]
         assert len(outputs) == BATCH_SIZE
         for out in outputs:
@@ -215,14 +210,14 @@ class TestForwardBackwardMicroRLPathUngated:
 
     def test_rl_builds_logprobs_even_when_flag_false(self):
         """The SFT-only gate must not empty PPO outputs."""
-        status = _run_forward_backward_micro_rl(loss_fn_config={RETURN_PER_TOKEN_OUTPUTS_KEY: False})
+        status = _run_forward_backward_micro_rl(return_per_token_outputs=False)
         outputs = status["loss_fn_outputs"]
         assert len(outputs) == BATCH_SIZE
         for out in outputs:
             assert len(out["logprobs"]) == NUM_ACTIONS
 
     def test_rl_loss_fn_outputs_identical_across_flag(self):
-        kept = _run_forward_backward_micro_rl(loss_fn_config={RETURN_PER_TOKEN_OUTPUTS_KEY: True})
-        skipped = _run_forward_backward_micro_rl(loss_fn_config={RETURN_PER_TOKEN_OUTPUTS_KEY: False})
+        kept = _run_forward_backward_micro_rl(return_per_token_outputs=True)
+        skipped = _run_forward_backward_micro_rl(return_per_token_outputs=False)
         assert kept["loss_fn_outputs"] == skipped["loss_fn_outputs"]
         assert kept["final_loss"] == skipped["final_loss"]

@@ -274,7 +274,8 @@ class PackedDataCollator:
                 # multiple, plus FP8's 16-token local-rank multiple when active.
                 row_offset += _round_up(s, align_size)
 
-        # Count response-token loss slots before normalization.
+        # Count response-token loss slots before normalization. The vectorized
+        # build makes this exact, so no post-hoc reconciliation is needed.
         total_nonpad = int(loss_mask_np.sum())
 
         sequences = torch.from_numpy(sequences_np)

@@ -17,7 +17,7 @@ Upstream remote: `https://github.com/NovaSky-AI/SkyRL.git` · sync target: **`up
 
 | upstream SHA | upstream tag (if any) | sync date | `lila-sync-*` tag |
 |---|---|---|---|
-| `fd79ceec` | — | 2026-07-20 | `lila-sync-fd79ceec` |
+| `134224d2` | — | 2026-08-03 | `lila-sync-134224d2` |
 
 > Seed value: the `upstream/main` SHA fork `main` was reset to in the one-time catch-up
 > (2026-06-10). `main` was verified byte-identical to `upstream/main` (`f508739f`) — 0 ahead /
@@ -40,6 +40,41 @@ Upstream remote: `https://github.com/NovaSky-AI/SkyRL.git` · sync target: **`up
 
 Profiler driving (#16) and validation-sample logging (#7) were removed from the carry list after
 their upstream implementations landed by `fd79ceec`.
+
+### 2.1 Round-tripped patches (Lila → public → back via `main`)
+
+Patches we upstreamed that have returned through `main`. They come back **textually different**
+(public review churn), so a 3-way merge sees "both sides added similar code" and conflicts even
+though the intent is identical. **Drop these on contact: take `main`'s version wholesale.** They
+caused 24 of the 35 conflict hunks in the `134224d2` sync.
+
+| internal PR# | public PR# | upstream SHA | landed in sync | resolution |
+|---|---|---|---|---|
+| #24 | #1807 | `a68bd5a6` | `134224d2` | took upstream; `loss_fn_config["return_per_token_outputs"]` → explicit `return_per_token_outputs` kwarg, `pop_return_per_token_outputs` deleted |
+| #56 | #1908 | `68326807` | `134224d2` | took upstream, but upstream **relocated** the modules — see §2.2 |
+| — | #1806 | `580dd4f0` | `134224d2` | took upstream |
+| — | #1859 | `dda1cb3c` | `134224d2` | took upstream |
+| — | cispo ratio min/max | (in `134224d2`) | `134224d2` | took upstream — it fixes a real `ratio_min == 0.0` bug our version had |
+
+### 2.2 Path divergence: keep module locations aligned with upstream
+
+When we upstream a patch, public review may move the file. If `develop` keeps the old path, git
+sees an add/add of two *different* paths, silently leaves **both** copies on disk, and any file
+importing both gets a shadowed symbol (second import silently wins) — a real bug that no conflict
+marker reveals.
+
+Reconciled in the `134224d2` sync (canonical = upstream's path):
+
+| symbol / module | old `develop` path | canonical upstream path |
+|---|---|---|
+| `make_replay_padding_indices` | `skyrl/utils/routed_experts.py` | `skyrl/backends/skyrl_train/utils/replay_utils.py` |
+| `TokenMetadataLayout`, `align_token_metadata`, `build_token_metadata_layout`, `TokenMetadataTrace` | `skyrl/utils/token_metadata.py` (deleted) | `skyrl/backends/skyrl_train/distributed/megatron/token_metadata.py` |
+| `attach_mock_sft_deps` | local helper in `test_sft_callbacks.py` | `tests/train/sft/util.py` |
+
+`skyrl/utils/routed_experts.py` stays fork-only for `RoutedExpertTrace`,
+`compact_routed_expert_indices`, `ROUTED_EXPERT_DTYPES`, `RoutedExpertIndices` — upstream has no
+equivalent. **Check after every sync:** `find skyrl tests -name '<moved-file>.py'` should return
+exactly one path, and no file should import the same symbol twice.
 
 > **`evaluate` = author decision pending.** These were *not* cleanly superseded by upstream
 > (verified 2026-06-10): #4 adds a true MFU-% tracker (`flops_tracker.py`), distinct from
