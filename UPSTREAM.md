@@ -92,14 +92,18 @@ exactly one path, and no file should import the same symbol twice.
 -->
 
 <!-- BEGIN AUTO:develop-delta -->
-_Last generated for `origin/main` (134224d2) ↔ `HEAD` (db88bc0e); merge-base `de1a58b4`. **Auto-generated — do not edit by hand.**_
+_Last generated for `origin/main` (134224d2) ↔ `HEAD` (362e79ec); merge-base `134224d2`. **Auto-generated — do not edit by hand.**_
 
-`develop` is **102 commit(s)** ahead of `main`.
+`develop` is **108 commit(s)** ahead of `main`.
 
 ### Commits on `develop` not on `main`
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `5af90e46` | refactor(megatron): drop duplicated vlm_inputs build | lila-sync-bot | 2026-08-03 |
+| `3c36e436` | test(r3): restore the replay-index dtype-independence guard | lila-sync-bot | 2026-08-03 |
+| `5dfb5254` | fix(r3): queue replay routes once per microbatch | lila-sync-bot | 2026-08-03 |
+| `9cecce06` | docs(upstream-sync): regenerate develop↔main delta [skip ci] | lila-sync-bot | 2026-08-03 |
 | `168188a0` | revert unwanted changes | lila-sync-bot | 2026-08-03 |
 | `ace824cf` | fix(fully-async): a cancelled rollout must not os._exit(1) t | lila-sync-bot | 2026-07-31 |
 | `277a61c7` | perf(megatron): drop redundant CPU int32 upcast of replay in | lila-sync-bot | 2026-07-30 |
@@ -188,10 +192,12 @@ _Last generated for `origin/main` (134224d2) ↔ `HEAD` (db88bc0e); merge-base `
 | `186fd6cc` | feat(upstream-sync): auto-regenerate develop↔main delta on m | dyurk-lila | 2026-06-10 |
 | `237a022f` | chore(upstream-sync): install sync tooling on develop (ledge | dyurk-lila | 2026-06-10 |
 
-<details><summary>merge commits (15)</summary>
+<details><summary>merge commits (17)</summary>
 
 | commit | subject | author | date |
 |---|---|---|---|
+| `362e79ec` | Merge pull request #75 from fl97inc/sync/develop-2026-08-03  | lila-ci-bot[bot] | 2026-08-04 |
+| `6e77262c` | chore(sync): resolve upstream 134224d2 conflicts             | lila-sync-bot | 2026-08-03 |
 | `db88bc0e` | Merge pull request #74 from fl97inc/dyurk/task-cancelled-n.. | dyurk-lila | 2026-08-03 |
 | `fd390ecb` | Merge pull request #73 from fl97inc/dyurk/clamp-nonfinite-.. | dyurk-lila | 2026-07-28 |
 | `fe575101` | Merge pull request #72 from fl97inc/dyurk/reject-router-fu.. | dyurk-lila | 2026-07-28 |
@@ -219,69 +225,50 @@ _Last generated for `origin/main` (134224d2) ↔ `HEAD` (db88bc0e); merge-base `
  .github/workflows/cpu_skyrl_train.yaml             |   4 +-
  .github/workflows/develop-delta.yaml               |  91 +++
  .github/workflows/gpu_skyrl.yaml                   |  23 +-
- .github/workflows/sync-upstream.yaml               | 654 +++++++++++++++++++++
+ .github/workflows/sync-upstream.yaml               | 671 +++++++++++++++++++++
  NOTICE                                             |  21 +
- UPSTREAM.md                                        | 287 +++++++++
+ UPSTREAM.md                                        | 327 ++++++++++
  examples/train/sft/data_mixing_sampler.py          | 118 ++++
  pyproject.toml                                     |   2 +
  .../distributed/megatron/fused_lm_head.py          |  95 +++
- .../distributed/megatron/model_utils.py            |  21 +-
+ .../distributed/megatron/token_metadata.py         |  49 ++
  .../backends/skyrl_train/inference_servers/base.py |   5 +-
  .../skyrl_train/inference_servers/logprobs_wire.py |  35 ++
  .../inference_servers/remote_inference_client.py   | 318 ++++++----
  .../inference_servers/routed_experts_wire.py       |  45 ++
  .../inference_servers/vllm_server_actor.py         |  32 +-
- skyrl/backends/skyrl_train/training_batch.py       |  17 +-
- skyrl/backends/skyrl_train/utils/ppo_utils.py      |  53 +-
- skyrl/backends/skyrl_train/utils/replay_utils.py   | 333 +++++------
- .../workers/megatron/megatron_model_wrapper.py     | 225 +++----
- .../workers/megatron/megatron_worker.py            |  34 +-
- skyrl/backends/skyrl_train/workers/worker.py       | 148 +++--
- skyrl/backends/skyrl_train/workers/worker_utils.py |  26 +-
- skyrl/train/config/config.py                       |  28 +-
- skyrl/train/dataset/collators.py                   |  80 ++-
- skyrl/train/dataset/preprocess.py                  | 214 +++++--
- skyrl/train/dataset/replay_buffer.py               |   7 +-
+ skyrl/backends/skyrl_train/utils/replay_utils.py   |  75 +--
+ .../workers/megatron/megatron_model_wrapper.py     |  49 +-
+ .../workers/megatron/megatron_worker.py            |   8 +-
+ skyrl/train/config/config.py                       |  16 +-
+ skyrl/train/dataset/preprocess.py                  |  62 +-
  skyrl/train/evaluate.py                            |   4 +-
  skyrl/train/fully_async_trainer.py                 |   8 +-
  skyrl/train/generators/base.py                     |   3 +-
- skyrl/train/generators/skyrl_gym_generator.py      |  88 +--
- skyrl/train/generators/utils.py                    |  17 +-
- skyrl/train/sft_trainer.py                         |  53 +-
- skyrl/train/trainer.py                             |  29 +-
- skyrl/train/utils/trainer_utils.py                 |  42 +-
- skyrl/train/utils/utils.py                         |  17 +-
- skyrl/utils/routed_experts.py                      | 102 ++++
- skyrl/utils/token_metadata.py                      | 253 ++++++++
- .../test_chunked_logprob_backward_streaming.py     | 116 ++++
+ skyrl/train/generators/skyrl_gym_generator.py      |  65 +-
+ skyrl/train/sft_trainer.py                         |   9 +-
+ skyrl/train/trainer.py                             |   4 +-
+ skyrl/train/utils/trainer_utils.py                 |   7 +-
+ skyrl/train/utils/utils.py                         |   8 +-
+ skyrl/utils/routed_experts.py                      |  90 +++
  .../skyrl_train/distributed/test_fused_lm_head.py  | 228 +++++++
- .../megatron/test_chunked_logprob_backward.py      |   2 +-
- .../gpu/gpu_ci/megatron/test_router_replay.py      |  19 +-
- .../skyrl_train/gpu/gpu_ci/test_training_step.py   | 123 ++++
+ .../gpu/gpu_ci/megatron/test_router_replay.py      | 155 +++++
  .../inference_servers/test_logprobs_wire.py        |  51 ++
  .../test_remote_inference_client.py                |  63 +-
  .../inference_servers/test_routed_experts_wire.py  |  92 +++
- .../skyrl_train/test_token_based_batching_utils.py |  12 +
- tests/backends/skyrl_train/test_train_batch.py     |  16 +-
- .../skyrl_train/utils/test_replay_utils.py         | 229 ++++++++
- .../workers/test_sft_loss_fn_outputs_gate.py       | 228 +++++++
- .../skyrl_train/workers/test_worker_utils.py       |  33 ++
- tests/train/algorithms/test_losses.py              | 101 ++++
- tests/train/algorithms/test_skip_fwd_logprobs.py   |  30 +
- tests/train/dataset/test_preprocess.py             | 130 +++-
+ .../skyrl_train/utils/test_replay_utils.py         | 105 +++-
+ tests/train/dataset/test_preprocess.py             | 102 +++-
  tests/train/generators/test_datatypes.py           |   1 -
  .../generators/test_generator_output_utils.py      |   2 +-
- tests/train/generators/test_skyrl_gym_generator.py |  76 ++-
- .../test_collation_vectorization_equivalence.py    | 376 ++++++++++++
+ tests/train/generators/test_skyrl_gym_generator.py |  63 +-
  tests/train/test_config.py                         |   8 +
- tests/train/test_sft_callbacks.py                  |  94 ++-
- tests/train/test_trainer_utils.py                  |  21 +
+ tests/train/test_trainer_utils.py                  |  20 +-
  tests/train/utils/test_logging_config.py           | 120 ++++
- tests/utils/test_token_metadata.py                 | 151 +++++
+ tests/utils/test_token_metadata.py                 |  67 ++
  upstream-sync/bedrock-ci-setup.md                  | 106 ++++
  upstream-sync/gen_develop_delta.sh                 | 104 ++++
  uv.lock                                            |  10 +
- 68 files changed, 5295 insertions(+), 822 deletions(-)
+ 49 files changed, 3234 insertions(+), 350 deletions(-)
 ```
 <!-- END AUTO:develop-delta -->
 
