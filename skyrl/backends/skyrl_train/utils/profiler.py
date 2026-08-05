@@ -3,6 +3,7 @@ import os
 import torch
 import torch.distributed
 from loguru import logger
+from torch.autograd import DeviceType
 
 # Config string -> torch.profiler activity.
 _ACTIVITY_MAP = {
@@ -82,8 +83,14 @@ class Profiler:
             logger.info(f"[Profiler] rank {self.rank}: exported chrome trace under {self.save_path}")
 
         try:
-            # Microseconds, self time.
-            self._last_pairs = [(str(e.key), float(e.self_device_time_total)) for e in prof.key_averages()]
+            # Microseconds, self time. Device rows only: CPU-op and user-annotation
+            # rows (ProfilerStep*, Optimizer.step#*) also carry attributed device
+            # time, so including them double-counts the kernels nested under them.
+            self._last_pairs = [
+                (str(e.key), float(e.self_device_time_total))
+                for e in prof.key_averages()
+                if e.device_type == DeviceType.CUDA
+            ]
             self._window_count += 1
         except Exception as e:
             logger.warning(f"[Profiler] rank {self.rank}: kernel-summary capture failed: {e}")
