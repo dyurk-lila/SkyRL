@@ -83,13 +83,15 @@ class Profiler:
             logger.info(f"[Profiler] rank {self.rank}: exported chrome trace under {self.save_path}")
 
         try:
-            # Microseconds, self time. Device rows only: CPU-op and user-annotation
-            # rows (ProfilerStep*, Optimizer.step#*) also carry attributed device
-            # time, so including them double-counts the kernels nested under them.
+            # Microseconds, self time. Device rows only, annotations excluded:
+            # CPU-op rows carry attributed device time, and CPU annotations
+            # (ProfilerStep*, Optimizer.step#*, nccl:*) are additionally projected
+            # onto the device timeline as gpu_user_annotation -- so both kinds
+            # double-count the kernels nested under them.
             self._last_pairs = [
                 (str(e.key), float(e.self_device_time_total))
                 for e in prof.key_averages()
-                if e.device_type == DeviceType.CUDA
+                if e.device_type == DeviceType.CUDA and not e.is_user_annotation
             ]
             self._window_count += 1
         except Exception as e:
