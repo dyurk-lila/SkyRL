@@ -1982,6 +1982,9 @@ class SFTTrainer:
         logger.info(
             f"SFT async batch collation (double-buffering): {'ENABLED' if collate_ahead_enabled else 'disabled'}"
         )
+        # A batch consumed at step N was collated during step N-1, so the
+        # previous step is the window the collate actually had to fit in.
+        prev_step_seconds: Optional[float] = None
 
         if self._torch_profiler_enabled:
             self.dispatch.start_profile("policy")
@@ -1993,9 +1996,11 @@ class SFTTrainer:
 
                     # With async enabled, this is usually just the wait for an
                     # already-running collate. ``None`` marks epoch exhaustion.
+                    collate_seconds: Optional[float] = None
                     with Timer("data_loading", all_timings):
                         if async_collator is not None and async_collator.pending_step() == self.global_step:
                             batch = async_collator.get(self.global_step)
+                            collate_seconds = async_collator.last_compute_seconds
                             self._checkpoint_dataloader_state = None
                         else:
                             batch = next(data_iter, None)
@@ -2005,8 +2010,13 @@ class SFTTrainer:
                         self._current_epoch = current_epoch
                         self._fire("on_epoch_start")
                         data_iter = iter(self.train_dataloader)
+                        # The prefetch only found exhaustion; this batch was
+                        # loaded synchronously and is already in data_loading.
+                        collate_seconds = None
                         with Timer("data_loading", all_timings):
                             batch = next(data_iter)
+                    if collate_seconds is not None:
+                        all_timings["batch_collate"] = collate_seconds
 
                     if async_collator is not None and self.global_step < num_steps:
                         # Advancing the iterator in the worker moves the live
@@ -2042,6 +2052,16 @@ class SFTTrainer:
                     "train/batch_padded_seq_len": batch_padded_seq_len,
                     "train/total_tokens_processed": self._total_tokens_processed,
                 }
+                # Share of the collate window the collate thread was busy.
+                # ``timing/data_loading`` only sees what did *not* fit in that
+                # window, so it reads ~0 until collation is already the
+                # bottleneck; this is the headroom remaining ahead of that.
+                if "batch_collate" in all_timings and prev_step_seconds:
+                    log_dict["train/dataloader_occupancy_pct"] = (
+                        100.0 * all_timings["batch_collate"] / prev_step_seconds
+                    )
+                prev_step_seconds = all_timings["step"]
+
                 log_dict.update({f"timing/{k}": v for k, v in all_timings.items()})
                 if self._ray_gpu_monitor is not None:
                     log_dict.update(self._ray_gpu_monitor.flush())

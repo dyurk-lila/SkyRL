@@ -1,5 +1,6 @@
 """Single-slot async double-buffer for deterministic per-step collation."""
 
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Callable
 
@@ -16,6 +17,17 @@ class AsyncBatchCollator:
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=thread_name_prefix)
         self._future: Future | None = None
         self._pending_step: int | None = None
+        self._last_compute_seconds: float | None = None
+
+    @property
+    def last_compute_seconds(self) -> float | None:
+        """Wall seconds the worker spent on the last completed ``compute``.
+
+        This is the whole cost of producing a batch, most of which overlaps the
+        caller's own work and so never shows up in the caller's wait. ``None``
+        until the first compute finishes.
+        """
+        return self._last_compute_seconds
 
     def submit(self, step: int) -> None:
         """Schedule ``compute(step)``; call ``get`` before submitting again."""
@@ -24,7 +36,16 @@ class AsyncBatchCollator:
             f"call get() before submitting step {step}"
         )
         self._pending_step = step
-        self._future = self._executor.submit(self._compute, step)
+        self._future = self._executor.submit(self._timed_compute, step)
+
+    def _timed_compute(self, step: int) -> Any:
+        # Recorded in a ``finally`` inside the worker, so it is committed before
+        # the future resolves and is current by the time ``get`` returns.
+        start = time.perf_counter()
+        try:
+            return self._compute(step)
+        finally:
+            self._last_compute_seconds = time.perf_counter() - start
 
     def has_pending(self) -> bool:
         return self._future is not None

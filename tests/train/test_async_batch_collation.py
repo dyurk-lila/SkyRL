@@ -6,6 +6,7 @@ single-slot ordering and error-propagation invariants.
 """
 
 import copy
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -299,3 +300,124 @@ def test_async_collator_clear_drains_in_flight():
         assert ac.get(8) == 8
     finally:
         ac.shutdown()
+
+
+# Collate duration: the work behind the wait, which the caller never sees.
+
+
+def test_no_compute_duration_before_the_first_batch():
+    ac = AsyncBatchCollator(lambda step: step)
+    try:
+        assert ac.last_compute_seconds is None
+    finally:
+        ac.shutdown()
+
+
+def test_compute_duration_measures_the_worker_not_the_wait():
+    """The caller may wait ~0 and the compute still took its full time."""
+
+    def _slow(step):
+        time.sleep(0.05)
+        return step
+
+    ac = AsyncBatchCollator(_slow)
+    try:
+        ac.submit(1)
+        time.sleep(0.1)  # stand in for the caller's own work
+        ac.get(1)
+        assert ac.last_compute_seconds >= 0.05
+    finally:
+        ac.shutdown()
+
+
+def test_compute_duration_is_current_by_the_time_get_returns():
+    ac = AsyncBatchCollator(lambda step: time.sleep(0.02) or step)
+    try:
+        ac.submit(1)
+        ac.get(1)
+        assert ac.last_compute_seconds >= 0.02
+    finally:
+        ac.shutdown()
+
+
+def test_compute_duration_tracks_the_most_recent_batch():
+    durations = {1: 0.05, 2: 0.0}
+
+    ac = AsyncBatchCollator(lambda step: time.sleep(durations[step]) or step)
+    try:
+        ac.submit(1)
+        ac.get(1)
+        first = ac.last_compute_seconds
+        ac.submit(2)
+        ac.get(2)
+        assert first >= 0.05
+        assert ac.last_compute_seconds < first
+    finally:
+        ac.shutdown()
+
+
+def test_compute_duration_is_recorded_even_when_the_worker_raises():
+    def _boom(step):
+        time.sleep(0.02)
+        raise RuntimeError("producer failed")
+
+    ac = AsyncBatchCollator(_boom)
+    try:
+        ac.submit(1)
+        with pytest.raises(RuntimeError, match="producer failed"):
+            ac.get(1)
+        assert ac.last_compute_seconds >= 0.02
+    finally:
+        ac.shutdown()
+
+
+# Trainer wiring: what actually reaches the tracker.
+
+
+def _collect_log_payloads(monkeypatch, *, collate_ahead: bool, n_examples: int, batch_size: int, num_steps: int):
+    cfg = _build_test_sft_config(num_steps=num_steps, batch_size=batch_size)
+    cfg.async_batch_collation = collate_ahead
+    trainer = _make_trainer(cfg, DefaultCollator(MagicMock(pad_token_id=0), micro_train_batch_size_per_gpu=1))
+    monkeypatch.setattr(trainer, "load_dataset", lambda: TextDataset(_distinct_tokenized(n_examples)))
+    monkeypatch.setattr(trainer, "load_eval_datasets", lambda: None)
+    monkeypatch.setattr(trainer, "load_checkpoint", lambda: 0)
+    trainer.train()
+    return [call.args[0] for call in trainer.tracker.log.call_args_list if call.args and isinstance(call.args[0], dict)]
+
+
+def test_collate_time_and_occupancy_reach_the_tracker(monkeypatch):
+    """Neither key exists on step 1: nothing was prefetched to measure yet."""
+    payloads = _collect_log_payloads(monkeypatch, collate_ahead=True, n_examples=6, batch_size=2, num_steps=3)
+
+    assert "timing/batch_collate" not in payloads[0]
+    assert "train/dataloader_occupancy_pct" not in payloads[0]
+    assert "timing/batch_collate" in payloads[1]
+    assert "train/dataloader_occupancy_pct" in payloads[1]
+
+
+def test_occupancy_is_collate_over_the_step_it_overlapped(monkeypatch):
+    """The denominator is the previous step, which is the window it ran in."""
+    payloads = _collect_log_payloads(monkeypatch, collate_ahead=True, n_examples=6, batch_size=2, num_steps=3)
+
+    for previous, current in zip(payloads, payloads[1:]):
+        if "train/dataloader_occupancy_pct" not in current:
+            continue
+        expected = 100.0 * current["timing/batch_collate"] / previous["timing/step"]
+        assert abs(current["train/dataloader_occupancy_pct"] - expected) < 1e-6
+
+
+def test_epoch_boundary_steps_report_no_collate_time(monkeypatch):
+    """The prefetch only found exhaustion; that batch was loaded inline."""
+    # 6 examples at batch 2 is 3 steps per epoch, so step 4 crosses a boundary.
+    payloads = _collect_log_payloads(monkeypatch, collate_ahead=True, n_examples=6, batch_size=2, num_steps=5)
+
+    assert "timing/batch_collate" not in payloads[3]
+    assert "timing/batch_collate" in payloads[4]
+
+
+def test_serial_collation_publishes_neither_key(monkeypatch):
+    """Without a background thread, data_loading already is the whole cost."""
+    payloads = _collect_log_payloads(monkeypatch, collate_ahead=False, n_examples=6, batch_size=2, num_steps=3)
+
+    assert all("timing/batch_collate" not in payload for payload in payloads)
+    assert all("train/dataloader_occupancy_pct" not in payload for payload in payloads)
