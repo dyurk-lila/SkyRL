@@ -482,13 +482,13 @@ class WorkerDispatch:
             logger.warning(f"[profiler] dump_profiler_summary dispatch for {model} failed: {e}")
             return None
 
-    def dump_flops_per_token(self, model: str, seq_length: int) -> Optional[float]:
-        """Model FLOPs per token for ``model`` at ``seq_length``, or None.
+    def dump_flops_per_token(self, model: str, seq_length: int) -> Optional[Dict[str, Any]]:
+        """FLOPs/token and device for ``model`` at ``seq_length``, or None.
 
-        Every rank holds the same provider, so the ranks agree and we keep the
-        first non-None answer. Intended to be called once and cached: the value
-        is fixed for a run, and fanning out per step would add a collective to
-        the training loop for a constant.
+        Every rank holds the same provider and the same hardware, so the ranks
+        agree and we keep the first non-None answer. Intended to be called once
+        and cached: the value is fixed for a run, and fanning out per step would
+        add a collective to the training loop to re-derive a constant.
         """
         if model not in self._actor_groups:
             return None
@@ -503,7 +503,7 @@ class WorkerDispatch:
             return None
         for value in results or []:
             if value:
-                return float(value)
+                return value
         return None
 
     def _save_memory_snapshot(self, model: str, tag: str) -> None:

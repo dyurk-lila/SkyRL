@@ -318,8 +318,12 @@ class Worker(DistributedTorchRayActor):
         """Return this rank's last-window kernel summary, or None."""
         return self.profiler.get_kernel_summary() if self.profiler is not None else None
 
-    def dump_flops_per_token(self, seq_length: int) -> Optional[float]:
-        """Return model FLOPs per token at ``seq_length``, or None if unavailable.
+    def dump_flops_per_token(self, seq_length: int) -> Optional[Dict[str, Any]]:
+        """Return ``{flops_per_token, device_name}``, or None if unavailable.
+
+        Both facts are only knowable here, so they travel together: the caller
+        needs the device to pick a peak-FLOPs ceiling, and the head pod cannot
+        read it off a GPU it does not have.
 
         Enables MFU to be reported without the trainer having to know anything
         about the model's architecture. The count comes from Megatron-Bridge's
@@ -358,7 +362,10 @@ class Worker(DistributedTorchRayActor):
                 seqlen_sum=seq_length,
                 seqlen_squared_sum=seq_length * seq_length,
             )
-            return float(total) / float(seq_length)
+            return {
+                "flops_per_token": float(total) / float(seq_length),
+                "device_name": torch.cuda.get_device_name() if torch.cuda.is_available() else "",
+            }
         except Exception as e:
             logger.warning(f"[flops] could not compute FLOPs per token: {e}")
             return None
