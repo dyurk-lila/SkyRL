@@ -482,6 +482,30 @@ class WorkerDispatch:
             logger.warning(f"[profiler] dump_profiler_summary dispatch for {model} failed: {e}")
             return None
 
+    def dump_flops_per_token(self, model: str, seq_length: int) -> Optional[float]:
+        """Model FLOPs per token for ``model`` at ``seq_length``, or None.
+
+        Every rank holds the same provider, so the ranks agree and we keep the
+        first non-None answer. Intended to be called once and cached: the value
+        is fixed for a run, and fanning out per step would add a collective to
+        the training loop for a constant.
+        """
+        if model not in self._actor_groups:
+            return None
+        try:
+            results = ray.get(
+                self._actor_groups[model].async_run_ray_method(
+                    "pass_through", "dump_flops_per_token", seq_length=seq_length
+                )
+            )
+        except Exception as e:
+            logger.warning(f"[flops] dump_flops_per_token dispatch for {model} failed: {e}")
+            return None
+        for value in results or []:
+            if value:
+                return float(value)
+        return None
+
     def _save_memory_snapshot(self, model: str, tag: str) -> None:
         """Save memory snapshot on workers."""
         ray.get(

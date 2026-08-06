@@ -318,6 +318,51 @@ class Worker(DistributedTorchRayActor):
         """Return this rank's last-window kernel summary, or None."""
         return self.profiler.get_kernel_summary() if self.profiler is not None else None
 
+    def dump_flops_per_token(self, seq_length: int) -> Optional[float]:
+        """Return model FLOPs per token at ``seq_length``, or None if unavailable.
+
+        Enables MFU to be reported without the trainer having to know anything
+        about the model's architecture. The count comes from Megatron-Bridge's
+        ``num_floating_point_operations``, which reads the finalized provider --
+        so hybrid stacks are counted per layer type (Mamba, GDN, attention,
+        dense MLP, MoE) rather than assumed uniform. Approximating a Mamba
+        hybrid as a transformer overcounts an A12B model by roughly 6x, which is
+        the whole reason this is answered here and not estimated by the caller.
+
+        The figure is forward+backward *model* FLOPs and excludes recompute, so
+        a consumer's MFU is model-FLOPs utilization, not hardware.
+
+        ``seq_length`` is passed in rather than read off the provider because
+        SkyRL trains with ``variable_seq_lengths`` and never sets a scalar
+        ``seq_length`` on it. The attention term is quadratic in sequence
+        length, so this is the FLOPs/token *at that context length*; on a
+        hybrid, where attention is a minority of layers, it moves little.
+
+        Returns None on non-Megatron workers (no provider) and on any failure:
+        this is telemetry, and no accounting problem should reach the caller.
+        """
+        provider = getattr(self, "provider", None)
+        if provider is None or not seq_length or seq_length <= 0:
+            return None
+        try:
+            from types import SimpleNamespace
+
+            from megatron.bridge.training.utils.flop_utils import num_floating_point_operations
+
+            # num_floating_point_operations reads cfg.model for every path we
+            # can reach; cfg.dataset/cfg.train are touched only under a LoRA
+            # branch this shim cannot enter (no .peft => is_lora is False).
+            total = num_floating_point_operations(
+                SimpleNamespace(model=provider),
+                batch_size=1,
+                seqlen_sum=seq_length,
+                seqlen_squared_sum=seq_length * seq_length,
+            )
+            return float(total) / float(seq_length)
+        except Exception as e:
+            logger.warning(f"[flops] could not compute FLOPs per token: {e}")
+            return None
+
     def _get_module_for_offload(self):
         """Return the model module(s) to be offloaded/backloaded. Megatron offloads `self.actor_module`. FSDP workers use `self.model` directly."""
         return self.model
