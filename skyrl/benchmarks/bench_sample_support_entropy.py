@@ -16,9 +16,7 @@ import torch.distributed as dist
 
 from skyrl.backends.skyrl_train.training_batch import TensorList
 from skyrl.backends.skyrl_train.utils.sample_support_replay import (
-    _project_candidate_pairs,
-    sample_support_csr_logprobs,
-    sample_support_csr_logprobs_and_entropy,
+    sample_support_csr_scores,
 )
 
 
@@ -28,7 +26,7 @@ def _make_support(
     singleton_fraction: float,
     max_support: int,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, TensorList, TensorList, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, TensorList, TensorList, torch.Tensor]:
     generator = torch.Generator(device="cpu").manual_seed(1234)
     row_sizes = torch.ones(num_tokens, dtype=torch.int32)
     num_multi = round(num_tokens * (1.0 - singleton_fraction))
@@ -54,48 +52,48 @@ def _make_support(
     )
     first_member = offsets[:-1].long()
     sampled_ids = ids[first_member].long()
+    dense_ids = torch.full((num_tokens, max_support), -1, dtype=torch.int32)
+    for row, size in enumerate(row_sizes.tolist()):
+        dense_ids[row, :size] = ids[offsets[row] : offsets[row + 1]]
     return (
         sampled_ids.unsqueeze(0).to(device),
         torch.arange(num_tokens, device=device).unsqueeze(0),
+        dense_ids.unsqueeze(0).to(device),
         TensorList([ids.to(device)]),
         TensorList([offsets.to(device)]),
         row_ids_for_members.to(device),
     )
 
 
-def _legacy_assemble(
-    sample_support_ids: TensorList,
-    sample_support_offsets: TensorList,
-    grid_width: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    validity = torch.zeros(len(sample_support_ids.tensors) * grid_width, dtype=torch.bool, device=device)
-    member_rows = []
-    member_vocab = []
-    for sample_index, (ids, offsets) in enumerate(
-        zip(sample_support_ids.tensors, sample_support_offsets.tensors, strict=True)
-    ):
-        num_rows = offsets.numel() - 1
-        canonical_rows = sample_index * grid_width + torch.arange(num_rows, device=device)
-        row_sizes = offsets[1:].long() - offsets[:-1].long()
-        validity[canonical_rows] = row_sizes > 0
-        member_rows.append(torch.repeat_interleave(canonical_rows, row_sizes, output_size=ids.numel()))
-        member_vocab.append(ids.long())
-    empty = torch.empty(0, dtype=torch.long, device=device)
-    return (
-        torch.cat(member_rows) if member_rows else empty,
-        torch.cat(member_vocab) if member_vocab else empty,
-        validity,
-    )
+def _pr61_selected_hidden_projection(
+    hidden: torch.Tensor,
+    token_ids: torch.Tensor,
+    local_mask: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    temperature: float,
+    chunk_size: int | None,
+    invalid_value: float,
+) -> torch.Tensor:
+    """Exact fixed-width candidate projection used by PR 61."""
+    num_rows, width = token_ids.shape
+    row_ids = torch.arange(num_rows, device=hidden.device).unsqueeze(1).expand(-1, width).reshape(-1)
+    flat_token_ids = token_ids.reshape(-1)
+    flat_mask = local_mask.reshape(-1)
+    output = torch.empty(flat_token_ids.shape, dtype=torch.float32, device=hidden.device)
+    pair_chunk_size = flat_token_ids.numel() if chunk_size is None else chunk_size
+    for start in range(0, flat_token_ids.numel(), pair_chunk_size):
+        end = min(start + pair_chunk_size, flat_token_ids.numel())
+        selected_hidden = hidden.index_select(0, row_ids[start:end]).to(lm_head_weight.dtype)
+        selected_weight = lm_head_weight.index_select(0, flat_token_ids[start:end])
+        projected = (selected_hidden * selected_weight).sum(dim=-1) / temperature
+        output[start:end] = torch.where(flat_mask[start:end], projected.to(torch.float32), invalid_value)
+    return output.reshape(num_rows, width)
 
 
-def _legacy_sample_support_csr_logprobs(
+def _pr61_dense_sample_support_logprobs(
     logits_or_hidden: torch.Tensor,
     sampled_ids: torch.Tensor,
-    support_row_ids: torch.Tensor,
-    sample_support_ids: TensorList,
-    sample_support_offsets: TensorList,
-    support_grid_width: int,
+    support_ids: torch.Tensor,
     *,
     vocab_start_index: int,
     vocab_end_index: int,
@@ -104,91 +102,143 @@ def _legacy_sample_support_csr_logprobs(
     temperature: float = 1.0,
     chunk_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """CSR implementation immediately before PR 62's singleton fast path."""
+    """Exact dense replay implementation at PR 61's head."""
     flat_source = logits_or_hidden.reshape(-1, logits_or_hidden.shape[-1])
     flat_sampled = sampled_ids.reshape(-1).long()
-    aligned_rows = support_row_ids.reshape(-1).long()
-    member_rows, member_vocab, canonical_validity = _legacy_assemble(
-        sample_support_ids,
-        sample_support_offsets,
-        support_grid_width,
-        logits_or_hidden.device,
-    )
-    num_canonical_rows = canonical_validity.numel()
-    in_range = (aligned_rows >= 0) & (aligned_rows < num_canonical_rows)
-    sentinel = num_canonical_rows
-    safe_aligned_rows = torch.where(in_range, aligned_rows, sentinel)
-    canonical_to_position = torch.full((num_canonical_rows + 1,), -1, dtype=torch.long, device=logits_or_hidden.device)
-    canonical_to_position.scatter_(
-        0,
-        safe_aligned_rows,
-        torch.arange(aligned_rows.numel(), device=logits_or_hidden.device),
-    )
-    canonical_positions = canonical_to_position[:-1]
-    valid_support = in_range & canonical_validity[safe_aligned_rows.clamp_max(num_canonical_rows - 1)]
+    flat_support = support_ids.reshape(-1, support_ids.shape[-1]).long()
+    valid_members = flat_support >= 0
+    valid_rows = valid_members.any(dim=-1)
+    local_members = valid_members & (flat_support >= vocab_start_index) & (flat_support < vocab_end_index)
+    local_support_ids = (flat_support - vocab_start_index).clamp(0, vocab_end_index - vocab_start_index - 1)
+    local_sample_mask = (flat_sampled >= vocab_start_index) & (flat_sampled < vocab_end_index)
+    local_sample_ids = (flat_sampled - vocab_start_index).clamp(0, vocab_end_index - vocab_start_index - 1)
 
-    member_positions = canonical_positions[member_rows]
-    local_member_mask = (member_positions >= 0) & (member_vocab >= vocab_start_index) & (member_vocab < vocab_end_index)
-    local_member_positions = member_positions.clamp_min(0)
-    local_member_ids = (member_vocab - vocab_start_index).clamp(0, vocab_end_index - vocab_start_index - 1)
     compute_dtype = (
         torch.float32 if logits_or_hidden.dtype in (torch.float16, torch.bfloat16) else logits_or_hidden.dtype
     )
     if lm_head_weight is None:
-        local_member_values = flat_source[local_member_positions, local_member_ids].to(compute_dtype)
+        local_values = flat_source.gather(1, local_support_ids).to(compute_dtype)
+        local_values = torch.where(local_members, local_values, float("-inf"))
+        local_sampled = flat_source.gather(1, local_sample_ids.unsqueeze(1)).squeeze(1).to(compute_dtype)
+        local_sampled = torch.where(local_sample_mask, local_sampled, 0.0)
     else:
-        local_member_values = _project_candidate_pairs(
+        local_values = _pr61_selected_hidden_projection(
             flat_source,
-            local_member_positions,
-            local_member_ids,
+            local_support_ids,
+            local_members,
             lm_head_weight,
             temperature,
             chunk_size,
+            float("-inf"),
         )
-    local_member_values = torch.where(local_member_mask, local_member_values, float("-inf"))
+        local_sampled = _pr61_selected_hidden_projection(
+            flat_source,
+            local_sample_ids.unsqueeze(1),
+            local_sample_mask.unsqueeze(1),
+            lm_head_weight,
+            temperature,
+            chunk_size,
+            0.0,
+        ).squeeze(1)
 
-    local_max = local_member_values.new_full((num_canonical_rows,), float("-inf"))
-    local_max.index_reduce_(0, member_rows, local_member_values.detach(), "amax", include_self=True)
+    local_max = local_values.detach().amax(dim=-1)
     global_max = local_max.clone()
     dist.all_reduce(global_max, op=dist.ReduceOp.MAX, group=tp_group)
-    safe_max = torch.where(canonical_validity, global_max, 0.0)
-
-    local_sum = local_member_values.new_zeros(num_canonical_rows).index_add(
-        0,
-        member_rows,
-        torch.where(local_member_mask, (local_member_values - safe_max[member_rows]).exp(), 0.0),
-    )
-    sampled_positions = canonical_positions.clamp_min(0)
-    sampled_for_row = flat_sampled[sampled_positions]
-    local_sample_mask = (
-        canonical_validity
-        & (canonical_positions >= 0)
-        & (sampled_for_row >= vocab_start_index)
-        & (sampled_for_row < vocab_end_index)
-    )
-    local_sample_ids = (sampled_for_row - vocab_start_index).clamp(0, vocab_end_index - vocab_start_index - 1)
-    if lm_head_weight is None:
-        local_sampled = flat_source[sampled_positions, local_sample_ids].to(compute_dtype)
-    else:
-        local_sampled = _project_candidate_pairs(
-            flat_source,
-            sampled_positions,
-            local_sample_ids,
-            lm_head_weight,
-            temperature,
-            chunk_size,
-        )
-    local_sampled = torch.where(local_sample_mask, local_sampled, 0.0)
-
+    safe_max = torch.where(valid_rows, global_max, 0.0)
+    local_sum = torch.where(local_members, (local_values - safe_max.unsqueeze(1)).exp(), 0.0).sum(dim=-1)
     local_stats = torch.stack((local_sum, local_sampled))
     global_stats = local_stats.detach().clone()
     dist.all_reduce(global_stats, op=dist.ReduceOp.SUM, group=tp_group)
     global_stats = global_stats + local_stats - local_stats.detach()
     denominator, sampled_score = global_stats
-    canonical_logprobs = sampled_score - safe_max - torch.where(canonical_validity, denominator, 1.0).log()
-    aligned_logprobs = canonical_logprobs[safe_aligned_rows.clamp_max(num_canonical_rows - 1)]
-    aligned_logprobs = torch.where(valid_support, aligned_logprobs, 0.0)
-    return aligned_logprobs.reshape(sampled_ids.shape), valid_support.reshape(sampled_ids.shape)
+    logprobs = sampled_score - safe_max - torch.where(valid_rows, denominator, 1.0).log()
+    logprobs = torch.where(valid_rows, logprobs, 0.0)
+    return logprobs.reshape(sampled_ids.shape), valid_rows.reshape(sampled_ids.shape)
+
+
+def _pr80_dense_sample_support_logprobs_and_entropy(
+    logits_or_hidden: torch.Tensor,
+    sampled_ids: torch.Tensor,
+    support_ids: torch.Tensor,
+    *,
+    vocab_start_index: int,
+    vocab_end_index: int,
+    tp_group: dist.ProcessGroup,
+    entropy_requires_grad: bool,
+    lm_head_weight: torch.Tensor | None = None,
+    temperature: float = 1.0,
+    chunk_size: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Exact dense replay-plus-entropy implementation at PR 80's head."""
+    flat_source = logits_or_hidden.reshape(-1, logits_or_hidden.shape[-1])
+    flat_sampled = sampled_ids.reshape(-1).long()
+    flat_support = support_ids.reshape(-1, support_ids.shape[-1]).long()
+    valid_members = flat_support >= 0
+    valid_rows = valid_members.any(dim=-1)
+    local_members = valid_members & (flat_support >= vocab_start_index) & (flat_support < vocab_end_index)
+    local_support_ids = (flat_support - vocab_start_index).clamp(0, vocab_end_index - vocab_start_index - 1)
+    local_sample_mask = (flat_sampled >= vocab_start_index) & (flat_sampled < vocab_end_index)
+    local_sample_ids = (flat_sampled - vocab_start_index).clamp(0, vocab_end_index - vocab_start_index - 1)
+
+    compute_dtype = (
+        torch.float32 if logits_or_hidden.dtype in (torch.float16, torch.bfloat16) else logits_or_hidden.dtype
+    )
+    if lm_head_weight is None:
+        local_values = flat_source.gather(1, local_support_ids).to(compute_dtype)
+        local_values = torch.where(local_members, local_values, float("-inf"))
+        local_sampled = flat_source.gather(1, local_sample_ids.unsqueeze(1)).squeeze(1).to(compute_dtype)
+        local_sampled = torch.where(local_sample_mask, local_sampled, 0.0)
+    else:
+        local_values = _pr61_selected_hidden_projection(
+            flat_source,
+            local_support_ids,
+            local_members,
+            lm_head_weight,
+            temperature,
+            chunk_size,
+            float("-inf"),
+        )
+        local_sampled = _pr61_selected_hidden_projection(
+            flat_source,
+            local_sample_ids.unsqueeze(1),
+            local_sample_mask.unsqueeze(1),
+            lm_head_weight,
+            temperature,
+            chunk_size,
+            0.0,
+        ).squeeze(1)
+
+    local_max = local_values.detach().amax(dim=-1)
+    global_max = local_max.clone()
+    dist.all_reduce(global_max, op=dist.ReduceOp.MAX, group=tp_group)
+    safe_max = torch.where(valid_rows, global_max, 0.0)
+    local_exp = torch.where(local_members, (local_values - safe_max.unsqueeze(1)).exp(), 0.0)
+    entropy_values = local_values if entropy_requires_grad else local_values.detach()
+    entropy_exp = local_exp if entropy_requires_grad else local_exp.detach()
+    shifted_values = torch.where(local_members, entropy_values - safe_max.unsqueeze(1), 0.0)
+    local_stats = torch.stack(
+        (
+            local_exp.sum(dim=-1),
+            local_sampled,
+            (entropy_exp * shifted_values).sum(dim=-1),
+        )
+    )
+    global_stats = local_stats.detach().clone()
+    dist.all_reduce(global_stats, op=dist.ReduceOp.SUM, group=tp_group)
+    global_stats = global_stats + local_stats - local_stats.detach()
+    denominator, sampled_score, shifted_score_sum = global_stats
+    logprobs = sampled_score - safe_max - torch.where(valid_rows, denominator, 1.0).log()
+    logprobs = torch.where(valid_rows, logprobs, 0.0)
+    entropy_denominator = denominator if entropy_requires_grad else denominator.detach()
+    shifted_score_sum = shifted_score_sum if entropy_requires_grad else shifted_score_sum.detach()
+    safe_denominator = torch.where(valid_rows, entropy_denominator, 1.0)
+    entropy = safe_denominator.log() - shifted_score_sum / safe_denominator
+    entropy = torch.where(valid_rows, entropy, 0.0)
+    return (
+        logprobs.reshape(sampled_ids.shape),
+        entropy.reshape(sampled_ids.shape),
+        valid_rows.reshape(sampled_ids.shape),
+    )
 
 
 def _reference_scores(
@@ -226,10 +276,10 @@ def _correctness(group: dist.ProcessGroup, device: torch.device) -> dict[str, fl
     local_vocab = vocab_size // world_size
     vocab_start = rank * local_vocab
     vocab_end = vocab_start + local_vocab
-    sampled, row_ids, ids, offsets, _ = _make_support(num_tokens, vocab_size, 0.7, 7, device)
+    sampled, row_ids, dense_ids, ids, offsets, _ = _make_support(num_tokens, vocab_size, 0.7, 7, device)
 
     logits = torch.randn(1, num_tokens, local_vocab, device=device, dtype=torch.float32, requires_grad=True)
-    actual_logprobs, actual_entropy, valid = sample_support_csr_logprobs_and_entropy(
+    actual = sample_support_csr_scores(
         logits,
         sampled,
         row_ids,
@@ -239,17 +289,37 @@ def _correctness(group: dist.ProcessGroup, device: torch.device) -> dict[str, fl
         vocab_start_index=vocab_start,
         vocab_end_index=vocab_end,
         tp_group=group,
+        compute_entropy=True,
         entropy_requires_grad=True,
     )
+    assert actual.entropy is not None
+    actual_logprobs = actual.logprobs
+    actual_entropy = actual.entropy
     full_logits = torch.cat(_gather_vocab_shards(logits, group), dim=-1).squeeze(0)
     expected_logprobs, expected_entropy = _reference_scores(full_logits, sampled, ids, offsets)
+    dense_logprobs, dense_entropy, dense_valid = _pr80_dense_sample_support_logprobs_and_entropy(
+        logits,
+        sampled,
+        dense_ids,
+        vocab_start_index=vocab_start,
+        vocab_end_index=vocab_end,
+        tp_group=group,
+        compute_entropy=True,
+        entropy_requires_grad=True,
+    )
     value_error = max(
         (actual_logprobs - expected_logprobs).abs().max().item(),
         (actual_entropy - expected_entropy).abs().max().item(),
     )
-    assert valid.all()
+    dense_value_error = max(
+        (dense_logprobs - expected_logprobs).abs().max().item(),
+        (dense_entropy - expected_entropy).abs().max().item(),
+    )
+    assert actual.valid_mask.all() and dense_valid.all()
     torch.testing.assert_close(actual_logprobs, expected_logprobs, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(actual_entropy, expected_entropy, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(dense_logprobs, expected_logprobs, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(dense_entropy, expected_entropy, rtol=1e-5, atol=1e-5)
 
     (actual_logprobs + actual_entropy).sum().backward()
     actual_logits_grad = logits.grad.detach().clone()
@@ -266,7 +336,7 @@ def _correctness(group: dist.ProcessGroup, device: torch.device) -> dict[str, fl
     dist.broadcast(hidden, src=0, group=group)
     hidden.requires_grad_()
     weight = torch.randn(local_vocab, hidden_size, device=device, dtype=torch.float32, requires_grad=True)
-    fused_logprobs, fused_entropy, _ = sample_support_csr_logprobs_and_entropy(
+    fused = sample_support_csr_scores(
         hidden,
         sampled,
         row_ids,
@@ -276,10 +346,14 @@ def _correctness(group: dist.ProcessGroup, device: torch.device) -> dict[str, fl
         vocab_start_index=vocab_start,
         vocab_end_index=vocab_end,
         tp_group=group,
+        compute_entropy=True,
         entropy_requires_grad=True,
         lm_head_weight=weight,
         chunk_size=64,
     )
+    assert fused.entropy is not None
+    fused_logprobs = fused.logprobs
+    fused_entropy = fused.entropy
     full_weight = torch.cat(_gather_vocab_shards(weight, group), dim=0)
     expected_fused_logprobs, expected_fused_entropy = _reference_scores(
         hidden.detach().squeeze(0) @ full_weight.T,
@@ -317,6 +391,7 @@ def _correctness(group: dist.ProcessGroup, device: torch.device) -> dict[str, fl
 
     return {
         "value_max_abs": value_error,
+        "pr80_dense_value_max_abs": dense_value_error,
         "logits_grad_max_abs": logits_grad_error,
         "fused_value_max_abs": fused_value_error,
         "fused_weight_grad_max_abs": weight_grad_error,
@@ -391,7 +466,7 @@ def _benchmark_case(args, singleton_fraction: float, group: dist.ProcessGroup, d
     local_vocab = args.vocab_size // world_size
     vocab_start = rank * local_vocab
     vocab_end = vocab_start + local_vocab
-    sampled, row_ids, ids, offsets, member_rows = _make_support(
+    sampled, row_ids, dense_ids, ids, offsets, member_rows = _make_support(
         args.tokens,
         args.vocab_size,
         singleton_fraction,
@@ -402,10 +477,13 @@ def _benchmark_case(args, singleton_fraction: float, group: dist.ProcessGroup, d
     member_ids = ids.tensors[0].long()
     active_members = row_sizes[member_rows] > 1
     local_members = active_members & (member_ids >= vocab_start) & (member_ids < vocab_end)
-    legacy_pairs = torch.tensor(member_ids.numel() + args.tokens, dtype=torch.float64, device=device)
-    optimized_pairs = local_members.sum(dtype=torch.float64)
-    dist.all_reduce(legacy_pairs, op=dist.ReduceOp.SUM, group=group)
-    dist.all_reduce(optimized_pairs, op=dist.ReduceOp.SUM, group=group)
+    dense_pairs = torch.tensor(
+        args.tokens * (args.max_support + 1) * world_size,
+        dtype=torch.float64,
+        device=device,
+    )
+    csr_pairs = local_members.sum(dtype=torch.float64)
+    dist.all_reduce(csr_pairs, op=dist.ReduceOp.SUM, group=group)
 
     hidden = torch.randn(
         1,
@@ -432,10 +510,25 @@ def _benchmark_case(args, singleton_fraction: float, group: dist.ProcessGroup, d
         requires_grad=True,
     )
 
-    def legacy_replay_backward():
+    def pr61_dense_replay_backward():
         hidden.grad = None
         weight.grad = None
-        logprobs, _ = _legacy_sample_support_csr_logprobs(
+        logprobs, _ = _pr61_dense_sample_support_logprobs(
+            hidden,
+            sampled,
+            dense_ids,
+            vocab_start_index=vocab_start,
+            vocab_end_index=vocab_end,
+            tp_group=group,
+            lm_head_weight=weight,
+            chunk_size=args.candidate_chunk_size,
+        )
+        (-logprobs.mean()).backward()
+
+    def pr62_csr_replay_backward():
+        hidden.grad = None
+        weight.grad = None
+        logprobs = sample_support_csr_scores(
             hidden,
             sampled,
             row_ids,
@@ -447,36 +540,17 @@ def _benchmark_case(args, singleton_fraction: float, group: dist.ProcessGroup, d
             tp_group=group,
             lm_head_weight=weight,
             chunk_size=args.candidate_chunk_size,
-        )
+            compute_entropy=False,
+            entropy_requires_grad=False,
+        ).logprobs
         (-logprobs.mean()).backward()
 
-    def optimized_replay_backward():
-        hidden.grad = None
-        weight.grad = None
-        logprobs, _ = sample_support_csr_logprobs(
-            hidden,
-            sampled,
-            row_ids,
-            ids,
-            offsets,
-            args.tokens,
-            vocab_start_index=vocab_start,
-            vocab_end_index=vocab_end,
-            tp_group=group,
-            lm_head_weight=weight,
-            chunk_size=args.candidate_chunk_size,
-        )
-        (-logprobs.mean()).backward()
-
-    def old_logits_entropy_backward():
+    def pr61_full_vocab_logits_entropy_backward():
         logits.grad = None
-        logprobs, _ = sample_support_csr_logprobs(
+        logprobs, _ = _pr61_dense_sample_support_logprobs(
             logits,
             sampled,
-            row_ids,
-            ids,
-            offsets,
-            args.tokens,
+            dense_ids,
             vocab_start_index=vocab_start,
             vocab_end_index=vocab_end,
             tp_group=group,
@@ -484,15 +558,12 @@ def _benchmark_case(args, singleton_fraction: float, group: dist.ProcessGroup, d
         entropy = vocab_parallel_entropy(logits, chunk_size=args.entropy_chunk_size)
         (-(logprobs.mean()) - args.entropy_coefficient * entropy.mean()).backward()
 
-    def support_logits_entropy_backward():
+    def pr80_support_logits_entropy_backward():
         logits.grad = None
-        logprobs, entropy, _ = sample_support_csr_logprobs_and_entropy(
+        logprobs, entropy, _ = _pr80_dense_sample_support_logprobs_and_entropy(
             logits,
             sampled,
-            row_ids,
-            ids,
-            offsets,
-            args.tokens,
+            dense_ids,
             vocab_start_index=vocab_start,
             vocab_end_index=vocab_end,
             tp_group=group,
@@ -500,15 +571,12 @@ def _benchmark_case(args, singleton_fraction: float, group: dist.ProcessGroup, d
         )
         (-(logprobs.mean()) - args.entropy_coefficient * entropy.mean()).backward()
 
-    def old_fused_entropy_metric():
+    def pr61_full_vocab_fused_entropy_metric():
         with torch.no_grad():
-            sample_support_csr_logprobs(
+            _pr61_dense_sample_support_logprobs(
                 hidden,
                 sampled,
-                row_ids,
-                ids,
-                offsets,
-                args.tokens,
+                dense_ids,
                 vocab_start_index=vocab_start,
                 vocab_end_index=vocab_end,
                 tp_group=group,
@@ -522,15 +590,12 @@ def _benchmark_case(args, singleton_fraction: float, group: dist.ProcessGroup, d
                 args.entropy_chunk_size,
             )
 
-    def support_fused_entropy_metric():
+    def pr80_support_fused_entropy_metric():
         with torch.no_grad():
-            sample_support_csr_logprobs_and_entropy(
+            _pr80_dense_sample_support_logprobs_and_entropy(
                 hidden,
                 sampled,
-                row_ids,
-                ids,
-                offsets,
-                args.tokens,
+                dense_ids,
                 vocab_start_index=vocab_start,
                 vocab_end_index=vocab_end,
                 tp_group=group,
@@ -540,60 +605,66 @@ def _benchmark_case(args, singleton_fraction: float, group: dist.ProcessGroup, d
             )
 
     measurements = {
-        "legacy_csr_fwd_bwd": _measure(legacy_replay_backward, args.warmup, args.iterations, group, device),
-        "optimized_csr_fwd_bwd": _measure(
-            optimized_replay_backward,
+        "pr61_dense_replay_fwd_bwd": _measure(
+            pr61_dense_replay_backward,
             args.warmup,
             args.iterations,
             group,
             device,
         ),
-        "full_vocab_logits_entropy_fwd_bwd": _measure(
-            old_logits_entropy_backward,
+        "pr62_csr_replay_fwd_bwd": _measure(
+            pr62_csr_replay_backward,
             args.warmup,
             args.iterations,
             group,
             device,
         ),
-        "support_logits_entropy_fwd_bwd": _measure(
-            support_logits_entropy_backward,
+        "pr61_full_vocab_logits_entropy_fwd_bwd": _measure(
+            pr61_full_vocab_logits_entropy_backward,
             args.warmup,
             args.iterations,
             group,
             device,
         ),
-        "full_vocab_fused_entropy_metric": _measure(
-            old_fused_entropy_metric,
+        "pr80_support_logits_entropy_fwd_bwd": _measure(
+            pr80_support_logits_entropy_backward,
             args.warmup,
             args.iterations,
             group,
             device,
         ),
-        "support_fused_entropy_metric": _measure(
-            support_fused_entropy_metric,
+        "pr61_full_vocab_fused_entropy_metric": _measure(
+            pr61_full_vocab_fused_entropy_metric,
+            args.warmup,
+            args.iterations,
+            group,
+            device,
+        ),
+        "pr80_support_fused_entropy_metric": _measure(
+            pr80_support_fused_entropy_metric,
             args.warmup,
             args.iterations,
             group,
             device,
         ),
     }
-    measurements["legacy_to_optimized_csr_speedup"] = (
-        measurements["legacy_csr_fwd_bwd"]["median_ms"] / measurements["optimized_csr_fwd_bwd"]["median_ms"]
+    measurements["pr61_dense_to_pr62_csr_speedup"] = (
+        measurements["pr61_dense_replay_fwd_bwd"]["median_ms"] / measurements["pr62_csr_replay_fwd_bwd"]["median_ms"]
     )
-    measurements["logits_entropy_speedup"] = (
-        measurements["full_vocab_logits_entropy_fwd_bwd"]["median_ms"]
-        / measurements["support_logits_entropy_fwd_bwd"]["median_ms"]
+    measurements["pr80_logits_entropy_speedup"] = (
+        measurements["pr61_full_vocab_logits_entropy_fwd_bwd"]["median_ms"]
+        / measurements["pr80_support_logits_entropy_fwd_bwd"]["median_ms"]
     )
-    measurements["fused_entropy_metric_speedup"] = (
-        measurements["full_vocab_fused_entropy_metric"]["median_ms"]
-        / measurements["support_fused_entropy_metric"]["median_ms"]
+    measurements["pr80_fused_entropy_metric_speedup"] = (
+        measurements["pr61_full_vocab_fused_entropy_metric"]["median_ms"]
+        / measurements["pr80_support_fused_entropy_metric"]["median_ms"]
     )
     return {
         "singleton_fraction": singleton_fraction,
         "mean_support_size": ids.tensors[0].numel() / args.tokens,
-        "legacy_projected_pairs_global": int(legacy_pairs.item()),
-        "optimized_projected_pairs_global": int(optimized_pairs.item()),
-        "projected_pair_reduction": legacy_pairs.item() / max(1.0, optimized_pairs.item()),
+        "pr61_dense_projected_pairs_global": int(dense_pairs.item()),
+        "pr62_csr_projected_pairs_global": int(csr_pairs.item()),
+        "projected_pair_reduction": dense_pairs.item() / max(1.0, csr_pairs.item()),
         "measurements": measurements,
     }
 
