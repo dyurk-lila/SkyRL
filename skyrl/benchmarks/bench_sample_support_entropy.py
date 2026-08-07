@@ -262,7 +262,9 @@ def _correctness(group: dist.ProcessGroup, device: torch.device) -> dict[str, fl
     logits_grad_error = (actual_logits_grad - reference_local_logits.grad).abs().max().item()
     torch.testing.assert_close(actual_logits_grad, reference_local_logits.grad, rtol=1e-5, atol=1e-5)
 
-    hidden = torch.randn(1, num_tokens, hidden_size, device=device, dtype=torch.float32, requires_grad=True)
+    hidden = torch.randn(1, num_tokens, hidden_size, device=device, dtype=torch.float32)
+    dist.broadcast(hidden, src=0, group=group)
+    hidden.requires_grad_()
     weight = torch.randn(local_vocab, hidden_size, device=device, dtype=torch.float32, requires_grad=True)
     fused_logprobs, fused_entropy, _ = sample_support_csr_logprobs_and_entropy(
         hidden,
@@ -411,8 +413,9 @@ def _benchmark_case(args, singleton_fraction: float, group: dist.ProcessGroup, d
         args.hidden_size,
         dtype=torch.bfloat16,
         device=device,
-        requires_grad=True,
     )
+    dist.broadcast(hidden, src=0, group=group)
+    hidden.requires_grad_()
     weight = torch.randn(
         local_vocab,
         args.hidden_size,
