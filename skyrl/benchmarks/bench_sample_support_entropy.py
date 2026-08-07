@@ -357,12 +357,31 @@ def _measure(
     }
 
 
+def _full_vocab_entropy_from_hidden(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    group: dist.ProcessGroup,
+    chunk_size: int,
+) -> torch.Tensor:
+    """Production-equivalent fused full-vocabulary entropy metric."""
+    output = torch.empty(hidden.shape[:-1], dtype=torch.float32, device=hidden.device)
+    for start in range(0, hidden.shape[1], chunk_size):
+        end = min(start + chunk_size, hidden.shape[1])
+        logits = (hidden[:, start:end].to(weight.dtype) @ weight.T).float()
+        logits_max = logits.max(dim=-1, keepdim=True).values
+        dist.all_reduce(logits_max, op=dist.ReduceOp.MAX, group=group)
+        exp_logits = (logits - logits_max).exp()
+        sum_exp = exp_logits.sum(dim=-1, keepdim=True)
+        dist.all_reduce(sum_exp, group=group)
+        weighted_logits = ((exp_logits / sum_exp) * logits).sum(dim=-1, keepdim=True)
+        dist.all_reduce(weighted_logits, group=group)
+        output[:, start:end] = (logits_max + sum_exp.log() - weighted_logits).squeeze(-1)
+    return output
+
+
 def _benchmark_case(args, singleton_fraction: float, group: dist.ProcessGroup, device: torch.device) -> dict:
     from skyrl.backends.skyrl_train.distributed.megatron.model_utils import (
         vocab_parallel_entropy,
-    )
-    from skyrl.backends.skyrl_train.workers.megatron.megatron_model_wrapper import (
-        _fused_vocab_parallel_entropy_from_hidden,
     )
 
     rank = dist.get_rank(group)
@@ -493,11 +512,11 @@ def _benchmark_case(args, singleton_fraction: float, group: dist.ProcessGroup, d
                 lm_head_weight=weight,
                 chunk_size=args.candidate_chunk_size,
             )
-            _fused_vocab_parallel_entropy_from_hidden(
+            _full_vocab_entropy_from_hidden(
                 hidden,
                 weight,
                 group,
-                chunk_size=args.entropy_chunk_size,
+                args.entropy_chunk_size,
             )
 
     def support_fused_entropy_metric():
