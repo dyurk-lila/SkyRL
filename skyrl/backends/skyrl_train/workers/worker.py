@@ -342,6 +342,20 @@ class Worker(DistributedTorchRayActor):
         length, so this is the FLOPs/token *at that context length*; on a
         hybrid, where attention is a minority of layers, it moves little.
 
+        Known bias, stated because the number reads as authoritative: with a
+        packed batch under varlen attention, each sequence attends only to
+        itself, so the honest figure is the length-weighted mean sequence
+        length (``sum(s^2) / sum(s)``). Passing the bin capacity instead
+        evaluates attention at too long a context and biases FLOPs/token --
+        and therefore any consumer's MFU -- high. The bias grows as sequences
+        get shorter relative to the bin, so it is workload-dependent rather
+        than a constant offset. It is bounded by the attention share of the
+        model: on Nemotron-3-Super-120B-A12B at 32k that share caps the error
+        near 8%, but on an attention-dominated stack it would be far larger.
+        ``num_floating_point_operations`` already accepts ``seqlen_sum`` and
+        ``seqlen_squared_sum`` separately, so a caller that can supply the
+        batch's real sums removes this exactly rather than approximately.
+
         Returns None on non-Megatron workers (no provider) and on any failure:
         this is telemetry, and no accounting problem should reach the caller.
         """
