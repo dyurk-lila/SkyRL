@@ -365,7 +365,9 @@ class Worker(DistributedTorchRayActor):
         try:
             from types import SimpleNamespace
 
-            from megatron.bridge.training.utils.flop_utils import num_floating_point_operations
+            from megatron.bridge.training.utils.flop_utils import (
+                num_floating_point_operations,
+            )
 
             # num_floating_point_operations reads cfg.model for every path we
             # can reach; cfg.dataset/cfg.train are touched only under a LoRA
