@@ -10,6 +10,10 @@ from skyrl.backends.skyrl_train.distributed.megatron.token_metadata import (
     TokenMetadataLayout,
     align_token_metadata,
 )
+from skyrl.backends.skyrl_train.utils.megatron_moe_profiler import (
+    MoEProfileRange,
+    moe_profile_range,
+)
 
 
 def _replay_padding_row(
@@ -228,40 +232,45 @@ def setup_per_microbatch_replay_forward(
         rollout_expert_indices.shape[2],
         instances,
     )
-    layer_index = torch.tensor(local_layer_indices, dtype=torch.long, device=rollout_expert_indices.device)
-    local_rollout_expert_indices = rollout_expert_indices.index_select(2, layer_index)
+    with moe_profile_range(MoEProfileRange.REPLAY_LAYER_SELECT):
+        layer_index = torch.tensor(local_layer_indices, dtype=torch.long, device=rollout_expert_indices.device)
+        local_rollout_expert_indices = rollout_expert_indices.index_select(2, layer_index)
 
     if (metadata_layout.padded_sequence_lengths is not None) != remove_microbatch_padding:
         raise ValueError("Shared token metadata layout does not match the model packing mode")
-    aligned_router_padding_mask = align_token_metadata(router_padding_mask.to(torch.bool), metadata_layout, True)
-    route_padding = _replay_padding_row(
-        rollout_expert_indices.shape[-1],
-        dtype=rollout_expert_indices.dtype,
-        device=local_rollout_expert_indices.device,
-    )
-    aligned_rollout_expert_indices = align_token_metadata(
-        local_rollout_expert_indices,
-        metadata_layout,
-        route_padding,
-    )
+    with moe_profile_range(MoEProfileRange.REPLAY_METADATA_ALIGN):
+        aligned_router_padding_mask = align_token_metadata(router_padding_mask.to(torch.bool), metadata_layout, True)
+        route_padding = _replay_padding_row(
+            rollout_expert_indices.shape[-1],
+            dtype=rollout_expert_indices.dtype,
+            device=local_rollout_expert_indices.device,
+        )
+        aligned_rollout_expert_indices = align_token_metadata(
+            local_rollout_expert_indices,
+            metadata_layout,
+            route_padding,
+        )
 
     # TP splitting: sequence parallelism across the tensor model parallel region
-    tp_size = mpu.get_tensor_model_parallel_world_size()
-    if tp_size > 1:
-        tp_rank = mpu.get_tensor_model_parallel_rank()
-        seq_len = aligned_rollout_expert_indices.shape[1]
-        chunk_size = seq_len // tp_size
-        aligned_rollout_expert_indices = aligned_rollout_expert_indices[
-            :, tp_rank * chunk_size : (tp_rank + 1) * chunk_size, :, :
-        ]
-    RouterReplay.set_replay_data(_split_replay_indices(aligned_rollout_expert_indices))
-    RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+    with moe_profile_range(MoEProfileRange.REPLAY_TP_SLICE):
+        tp_size = mpu.get_tensor_model_parallel_world_size()
+        if tp_size > 1:
+            tp_rank = mpu.get_tensor_model_parallel_rank()
+            seq_len = aligned_rollout_expert_indices.shape[1]
+            chunk_size = seq_len // tp_size
+            aligned_rollout_expert_indices = aligned_rollout_expert_indices[
+                :, tp_rank * chunk_size : (tp_rank + 1) * chunk_size, :, :
+            ]
+    with moe_profile_range(MoEProfileRange.REPLAY_INSTALL):
+        RouterReplay.set_replay_data(_split_replay_indices(aligned_rollout_expert_indices))
+        RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
 
-    model_router_padding_mask = scatter_router_padding_mask_for_model(
-        aligned_router_padding_mask,
-        model,
-        model_config,
-    )
+    with moe_profile_range(MoEProfileRange.REPLAY_PADDING_MASK_SCATTER):
+        model_router_padding_mask = scatter_router_padding_mask_for_model(
+            aligned_router_padding_mask,
+            model,
+            model_config,
+        )
     return {"padding_mask": model_router_padding_mask}
 
 
@@ -275,7 +284,8 @@ def setup_per_microbatch_replay_backward() -> None:
         RouterReplayAction,
     )
 
-    RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
+    with moe_profile_range(MoEProfileRange.REPLAY_BACKWARD_ACTION):
+        RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
 
 
 def clear_router_replay():

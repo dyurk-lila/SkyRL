@@ -316,6 +316,8 @@ class TorchProfilerConfig(BaseConfig):
     """Either ``chrome_trace`` or ``stacks``.
     ``chrome_trace`` writes ``*.pt.trace.json``; ``stacks`` writes self-CUDA-time stacks and
     requires ``with_stack=True``."""
+    profile_r3_moe: bool = False
+    """Add detailed router-replay and MoE phase ranges on selected Megatron ranks."""
 
     def validate(
         self,

@@ -947,6 +947,13 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         # Created only on profiled ranks.
         self.profiler = build_profiler_from_policy_cfg(self.cfg)
+        profiler_cfg = self.cfg.policy.torch_profiler_config
+        if profiler_cfg.profile_r3_moe and self.profiler is not None and self.profiler.check():
+            from skyrl.backends.skyrl_train.utils.megatron_moe_profiler import (
+                install_megatron_moe_profile_annotations,
+            )
+
+            install_megatron_moe_profile_annotations()
 
         # create optimizer (skipped for inference-only flows; Megatron's
         # DistributedOptimizer eagerly materializes fp32 master + AdamW state

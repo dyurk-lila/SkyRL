@@ -46,6 +46,10 @@ from skyrl.backends.skyrl_train.mtp.soft_ce import (
     unpadded_vocab_shard_width,
 )
 from skyrl.backends.skyrl_train.training_batch import TensorList
+from skyrl.backends.skyrl_train.utils.megatron_moe_profiler import (
+    MoEProfileRange,
+    moe_profile_range,
+)
 from skyrl.backends.skyrl_train.utils.ppo_utils import (
     PolicyLossRegistry,
     compute_approx_kl,
@@ -148,7 +152,18 @@ def _copy_tensor_tree_to_device(value: Any, device: int) -> Any:
 
 
 def _copy_tensor_dict_to_device(batch: Dict[str, Any], device: int) -> Dict[str, Any]:
-    return {key: _copy_tensor_tree_to_device(value, device) for key, value in batch.items()}
+    copied = {}
+    with moe_profile_range(MoEProfileRange.MICROBATCH_H2D):
+        for key, value in batch.items():
+            profile_range = (
+                MoEProfileRange.REPLAY_ROUTES_H2D if key in ("rollout_expert_indices", "router_padding_mask") else None
+            )
+            if profile_range is None:
+                copied[key] = _copy_tensor_tree_to_device(value, device)
+            else:
+                with moe_profile_range(profile_range):
+                    copied[key] = _copy_tensor_tree_to_device(value, device)
+    return copied
 
 
 class MegatronModelWrapper:

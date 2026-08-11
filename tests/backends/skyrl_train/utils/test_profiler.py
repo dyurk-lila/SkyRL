@@ -98,7 +98,7 @@ def test_kernel_summary_none_when_disabled(tmp_path):
 def test_kernel_summary_empty_before_first_window(tmp_path):
     prof = Profiler(_ProfCfg(skip_first=0, wait=0, warmup=0, active=1, save_path=str(tmp_path)))
     summary = prof.get_kernel_summary()
-    assert summary == {"window_count": 0, "pairs": []}
+    assert summary == {"window_count": 0, "pairs": [], "annotation_pairs": []}
 
 
 def test_kernel_summary_populated_after_window(tmp_path):
@@ -110,7 +110,8 @@ def test_kernel_summary_populated_after_window(tmp_path):
         # Do a little CPU work so the profiler records some ops.
         import torch
 
-        _ = torch.randn(64, 64) @ torch.randn(64, 64)
+        with torch.profiler.record_function("r3/test_phase"):
+            _ = torch.randn(64, 64) @ torch.randn(64, 64)
         prof.step()
     prof.stop()
 
@@ -124,6 +125,12 @@ def test_kernel_summary_populated_after_window(tmp_path):
     for name, self_us in summary["pairs"]:
         assert isinstance(name, str)
         assert isinstance(self_us, float)
+    assert summary["annotation_pairs"]
+    name, cpu_us, device_us, count = summary["annotation_pairs"][0]
+    assert name == "r3/test_phase"
+    assert cpu_us > 0
+    assert device_us >= 0
+    assert count > 0
 
 
 def test_activities_threaded_to_torch(tmp_path):

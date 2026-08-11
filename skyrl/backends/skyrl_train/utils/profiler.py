@@ -28,6 +28,7 @@ class Profiler:
         self.prof = None
         # Last closed-window kernel self time, exposed via get_kernel_summary().
         self._last_pairs: list = []
+        self._last_annotation_pairs: list = []
         self._window_count: int = 0
         if not config.enable:
             return
@@ -93,15 +94,29 @@ class Profiler:
                 for e in prof.key_averages()
                 if e.device_type == DeviceType.CUDA and not e.is_user_annotation
             ]
+            self._last_annotation_pairs = [
+                (
+                    str(e.key),
+                    float(e.cpu_time_total),
+                    float(e.device_time_total),
+                    int(e.count),
+                )
+                for e in prof.key_averages()
+                if e.is_user_annotation and str(e.key).startswith("r3/")
+            ]
             self._window_count += 1
         except Exception as e:
             logger.warning(f"[Profiler] rank {self.rank}: kernel-summary capture failed: {e}")
 
     def get_kernel_summary(self):
-        """Return ``{"window_count": int, "pairs": [(name, self_us), ...]}`` or None."""
+        """Return pickle-safe kernel and detailed R3 annotation summaries."""
         if not self.enable or self.prof is None:
             return None
-        return {"window_count": self._window_count, "pairs": list(self._last_pairs)}
+        return {
+            "window_count": self._window_count,
+            "pairs": list(self._last_pairs),
+            "annotation_pairs": list(self._last_annotation_pairs),
+        }
 
     def check(self) -> bool:
         return self.prof is not None and self.enable
