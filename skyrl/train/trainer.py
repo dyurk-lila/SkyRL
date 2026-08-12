@@ -873,6 +873,8 @@ class RayPPOTrainer:
 
         logprobs: Optional[List[List[float]]] = generator_output.get("rollout_logprobs", None)
         rollout_expert_indices = generator_output.get("rollout_expert_indices", None)
+        profiler_cfg = self.cfg.trainer.policy.torch_profiler_config
+        profile_r3_cpu = profiler_cfg.enable and profiler_cfg.profile_r3_moe
 
         pixel_values = generator_output.get("pixel_values", None)
         image_grid_thw = generator_output.get("image_grid_thw", None)
@@ -904,13 +906,22 @@ class RayPPOTrainer:
             logprobs,
             rollout_expert_indices,
             max_seq_len=self.cfg.trainer.algorithm.max_seq_len,
+            r3_profile_timings=self.all_timings if profile_r3_cpu else None,
+            r3_profile_metrics=self.all_metrics if profile_r3_cpu else None,
         )
         router_padding_mask = None
         if rollout_expert_indices is not None:
-            router_padding_mask = make_router_padding_mask(
-                attention_masks_tensor,
-                [len(indices) for indices in rollout_expert_indices],
-            )
+            if profile_r3_cpu:
+                with Timer("r3_cpu/router_padding_mask_s", self.all_timings):
+                    router_padding_mask = make_router_padding_mask(
+                        attention_masks_tensor,
+                        [len(indices) for indices in rollout_expert_indices],
+                    )
+            else:
+                router_padding_mask = make_router_padding_mask(
+                    attention_masks_tensor,
+                    [len(indices) for indices in rollout_expert_indices],
+                )
 
         # sanity check for off_policy_correction
         off_policy_correction = self.cfg.trainer.algorithm.off_policy_correction

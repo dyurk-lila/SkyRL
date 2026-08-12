@@ -1,4 +1,6 @@
 import logging
+import os
+import time
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
@@ -13,6 +15,31 @@ from skyrl.utils.routed_experts import (
 )
 
 logger = logging.getLogger(__name__)
+
+_R3_CPU_PREFIX = "r3_cpu/"
+
+
+def _record_profile_value(target: Optional[dict[str, float]], name: str, value: float) -> None:
+    if target is not None:
+        target[f"{_R3_CPU_PREFIX}{name}"] = float(value)
+
+
+def _record_profile_elapsed(target: Optional[dict[str, float]], name: str, started_at: float) -> None:
+    if target is not None:
+        elapsed = time.perf_counter() - started_at
+        _record_profile_value(target, name, elapsed)
+        logger.info(f"[r3-cpu-profile] {name}={elapsed:.3f}s")
+
+
+def _process_rss_bytes() -> int:
+    with open("/proc/self/statm") as statm:
+        resident_pages = int(statm.read().split()[1])
+    return resident_pages * os.sysconf("SC_PAGE_SIZE")
+
+
+def _record_profile_rss(target: Optional[dict[str, float]], name: str) -> None:
+    if target is not None:
+        _record_profile_value(target, name, _process_rss_bytes())
 
 
 def make_router_padding_mask(
@@ -97,6 +124,8 @@ def convert_prompts_responses_to_batch_tensors(
     logprobs: Optional[List[List[float]]] = None,
     rollout_expert_indices: Optional[List[RoutedExpertIndices]] = None,
     max_seq_len: Optional[int] = None,
+    r3_profile_timings: Optional[dict[str, float]] = None,
+    r3_profile_metrics: Optional[dict[str, float]] = None,
 ) -> Tuple[
     Float[torch.Tensor, "batch seq_len"],
     Float[torch.Tensor, "batch seq_len"],
@@ -157,6 +186,7 @@ def convert_prompts_responses_to_batch_tensors(
         loss_masks: ``(batch, max_response)`` — right-aligned.
         logprobs: ``(batch, max_response)`` — right-aligned, or ``None``.
     """
+    base_started_at = time.perf_counter()
     _verify_inputs(prompts, responses, rewards, loss_masks)
 
     prompt_token_lens = [len(p) for p in prompts]
@@ -225,12 +255,15 @@ def convert_prompts_responses_to_batch_tensors(
         logprobs_tensor = torch.from_numpy(logprobs_np)
 
     rollout_expert_indices_tensor = None
+    _record_profile_elapsed(r3_profile_timings, "base_tensor_conversion_s", base_started_at)
     if rollout_expert_indices is not None:
+        _record_profile_rss(r3_profile_metrics, "rss_before_route_conversion_bytes")
         if not isinstance(rollout_expert_indices, list):
             raise TypeError("rollout_expert_indices must be a list of NumPy arrays")
         if len(rollout_expert_indices) != num_samples:
             raise ValueError("rollout_expert_indices must contain routes for every trajectory")
 
+        compact_started_at = time.perf_counter()
         canonical_indices = []
         for sample_index, sample_indices in enumerate(rollout_expert_indices):
             if not isinstance(sample_indices, np.ndarray):
@@ -244,6 +277,7 @@ def convert_prompts_responses_to_batch_tensors(
                     "expected uint8, int16, or int32"
                 )
             canonical_indices.append(compact_routed_expert_indices(sample_indices))
+        _record_profile_elapsed(r3_profile_timings, "route_validate_compact_s", compact_started_at)
 
         first_shape = canonical_indices[0].shape
         if len(first_shape) != 3 or first_shape[0] == 0:
@@ -253,8 +287,35 @@ def convert_prompts_responses_to_batch_tensors(
             raise ValueError("rollout_expert_indices must contain at least one expert per layer")
 
         batch_dtype = max((indices.dtype for indices in canonical_indices), key=lambda dtype: dtype.itemsize)
+        input_bytes = sum(indices.nbytes for indices in canonical_indices)
+        padded_bytes = num_samples * max_total * num_layers * topk * batch_dtype.itemsize
+        route_rows = sum(indices.shape[0] for indices in canonical_indices)
+        _record_profile_value(r3_profile_metrics, "route_input_bytes", input_bytes)
+        _record_profile_value(r3_profile_metrics, "route_padded_bytes", padded_bytes)
+        _record_profile_value(r3_profile_metrics, "route_padding_amplification", padded_bytes / input_bytes)
+        _record_profile_value(r3_profile_metrics, "route_rows", route_rows)
+        _record_profile_value(r3_profile_metrics, "route_rows_max", max(indices.shape[0] for indices in canonical_indices))
+        _record_profile_value(r3_profile_metrics, "sequence_tokens_max", max_total)
+        _record_profile_value(r3_profile_metrics, "num_layers", num_layers)
+        _record_profile_value(r3_profile_metrics, "topk", topk)
+        if r3_profile_metrics is not None:
+            logger.info(
+                "[r3-cpu-profile] preparing padded routes: "
+                f"input={input_bytes / 1e9:.2f} GB padded={padded_bytes / 1e9:.2f} GB "
+                f"amplification={padded_bytes / input_bytes:.2f}x batch={num_samples} max_tokens={max_total} "
+                f"layers={num_layers} topk={topk} dtype={batch_dtype.name}"
+            )
+
+        allocate_started_at = time.perf_counter()
         padded = np.empty((num_samples, max_total, num_layers, topk), dtype=batch_dtype)
+        _record_profile_elapsed(r3_profile_timings, "route_allocate_s", allocate_started_at)
+
+        initialize_started_at = time.perf_counter()
         padded[...] = np.arange(topk, dtype=batch_dtype)
+        _record_profile_elapsed(r3_profile_timings, "route_initialize_padding_s", initialize_started_at)
+        _record_profile_rss(r3_profile_metrics, "rss_after_padding_init_bytes")
+
+        copy_started_at = time.perf_counter()
         for sample_index, sample_indices in enumerate(canonical_indices):
             if sample_indices.ndim != 3 or sample_indices.shape[1:] != (num_layers, topk):
                 raise ValueError(
@@ -269,7 +330,12 @@ def convert_prompts_responses_to_batch_tensors(
                 )
             route_end = left_pad + sample_indices.shape[0]
             padded[sample_index, left_pad:route_end] = sample_indices
+        _record_profile_elapsed(r3_profile_timings, "route_copy_samples_s", copy_started_at)
+
+        torch_view_started_at = time.perf_counter()
         rollout_expert_indices_tensor = torch.from_numpy(padded)
+        _record_profile_elapsed(r3_profile_timings, "route_torch_view_s", torch_view_started_at)
+        _record_profile_rss(r3_profile_metrics, "rss_after_route_conversion_bytes")
 
     return (
         sequences,

@@ -17,6 +17,7 @@ import os
 import sys
 import time
 import traceback
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Optional, Set, Tuple
 
@@ -969,6 +970,40 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         cur_generation_group_mini_batch: List[GeneratedOutputGroup],
         dropped_groups: Optional[List[GeneratedOutputGroup]] = None,
     ) -> TrainingInputBatch:
+        """Convert a generated mini-batch, optionally capturing host-side R3 call stacks."""
+        profiler_cfg = self.cfg.trainer.policy.torch_profiler_config
+        if not (profiler_cfg.enable and profiler_cfg.profile_r3_moe):
+            return self._convert_generation_group_mini_batch_to_training_input(
+                cur_generation_group_mini_batch,
+                dropped_groups,
+            )
+
+        import cProfile
+        import io
+        import pstats
+
+        profiler = cProfile.Profile()
+        result = profiler.runcall(
+            self._convert_generation_group_mini_batch_to_training_input,
+            cur_generation_group_mini_batch,
+            dropped_groups,
+        )
+        report = io.StringIO()
+        pstats.Stats(profiler, stream=report).strip_dirs().sort_stats("cumulative").print_stats(60)
+        logger.info(f"[r3-cpu-profile] conversion cProfile (top cumulative):\n{report.getvalue()}")
+        return result
+
+    def _r3_cpu_timer(self, name: str):
+        profiler_cfg = self.cfg.trainer.policy.torch_profiler_config
+        if profiler_cfg.enable and profiler_cfg.profile_r3_moe:
+            return Timer(f"r3_cpu/{name}_s", self.all_timings)
+        return nullcontext()
+
+    def _convert_generation_group_mini_batch_to_training_input(
+        self,
+        cur_generation_group_mini_batch: List[GeneratedOutputGroup],
+        dropped_groups: Optional[List[GeneratedOutputGroup]] = None,
+    ) -> TrainingInputBatch:
         """Concatenate the mini-batch of generated groups and convert to a TrainingInputBatch.
 
         ``dropped_groups`` (zero-variance groups dropped this step under ``sample_full_batch``) are not
@@ -1023,9 +1058,10 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 )
                 staleness_violation_count += 1
 
-        generator_output = concatenate_generator_outputs(
-            generator_outputs, step_wise=self.cfg.generator.step_wise_trajectories
-        )
+        with self._r3_cpu_timer("concatenate_generator_outputs"):
+            generator_output = concatenate_generator_outputs(
+                generator_outputs, step_wise=self.cfg.generator.step_wise_trajectories
+            )
         kept_rollout_metrics = generator_output["rollout_metrics"]
         assert kept_rollout_metrics is not None, "Rollout metrics should be non-null."
 
@@ -1118,9 +1154,10 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         )
 
         # Per-token reward conversion (kept groups only) + reward metrics over the kept+dropped view.
-        generator_output, uids = self.postprocess_generator_output(
-            generator_output, uids, metrics_generator_output=metrics_generator_output, metrics_uids=metrics_uids
-        )
+        with self._r3_cpu_timer("postprocess_generator_output"):
+            generator_output, uids = self.postprocess_generator_output(
+                generator_output, uids, metrics_generator_output=metrics_generator_output, metrics_uids=metrics_uids
+            )
 
         # print example just for debugging
         vis = self.tokenizer.decode(generator_output["response_ids"][0])
@@ -1141,7 +1178,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     include_idx=False,
                 )
 
-        return self.convert_to_training_input(generator_output, uids)
+        with self._r3_cpu_timer("build_training_input"):
+            return self.convert_to_training_input(generator_output, uids)
 
     def save_checkpoints(self) -> str:
         """

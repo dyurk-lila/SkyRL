@@ -48,6 +48,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import (
@@ -204,11 +206,18 @@ class RemoteInferenceGenerator:
         """POST JSON with retry on transient connection and response-decoding failures."""
         session = await self._get_session()
         last_exc: Optional[Exception] = None
+        request_started_at = time.perf_counter()
+        profile_r3 = os.environ.get("SKYRL_PROFILE_R3_CPU") == "1" and url.endswith("/skyrl/v1/generate")
         for attempt in range(_DATA_PLANE_RETRIES):
             try:
                 async with session.post(url, json=json, headers=headers) as resp:
                     try:
-                        body = orjson.loads(await resp.read())
+                        read_started_at = time.perf_counter()
+                        raw_body = await resp.read()
+                        read_elapsed = time.perf_counter() - read_started_at
+                        parse_started_at = time.perf_counter()
+                        body = orjson.loads(raw_body)
+                        parse_elapsed = time.perf_counter() - parse_started_at
                     except orjson.JSONDecodeError as exc:
                         if 400 <= resp.status < 500:
                             text = await resp.text()
@@ -224,6 +233,13 @@ class RemoteInferenceGenerator:
                         await asyncio.sleep(1)
                         continue
                     raise_for_status(resp, body)
+                    if profile_r3:
+                        logger.info(
+                            "[r3-cpu-profile] routed-expert HTTP response: "
+                            f"request_total_s={time.perf_counter() - request_started_at:.3f} "
+                            f"read_s={read_elapsed:.3f} json_parse_s={parse_elapsed:.3f} "
+                            f"body_bytes={len(raw_body)} attempts={attempt + 1}"
+                        )
                     return body
             except (aiohttp.ServerDisconnectedError, aiohttp.ClientOSError) as exc:
                 last_exc = exc
@@ -289,7 +305,14 @@ class RemoteInferenceGenerator:
             packed_routed_experts = choice.get("routed_experts")
             if not isinstance(packed_routed_experts, dict):
                 raise ValueError("/skyrl/v1/generate must return packed routed_experts")
+            decode_started_at = time.perf_counter()
             routed_experts = decode_packed_routed_experts(packed_routed_experts)
+            if os.environ.get("SKYRL_PROFILE_R3_CPU") == "1":
+                logger.info(
+                    "[r3-cpu-profile] decoded routed experts: "
+                    f"decode_s={time.perf_counter() - decode_started_at:.3f} bytes={routed_experts.nbytes} "
+                    f"shape={routed_experts.shape} dtype={routed_experts.dtype.name}"
+                )
 
         return RemoteGenerateResult(
             raw_response=response,

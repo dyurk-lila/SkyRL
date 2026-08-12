@@ -455,6 +455,34 @@ def test_rollout_expert_indices_none_when_not_provided(tokenizer):
     assert rei_tensor is None
 
 
+def test_rollout_expert_indices_records_cpu_profile(tokenizer):
+    routes = [np.ones((3, 2, 2), dtype=np.uint8), np.ones((2, 2, 2), dtype=np.uint8)]
+    timings: dict[str, float] = {}
+    metrics: dict[str, float] = {}
+
+    convert_prompts_responses_to_batch_tensors(
+        tokenizer,
+        [[1, 2], [3]],
+        [[10], [20]],
+        [[0.0], [0.0]],
+        [[1], [1]],
+        rollout_expert_indices=routes,
+        r3_profile_timings=timings,
+        r3_profile_metrics=metrics,
+    )
+
+    assert metrics["r3_cpu/route_input_bytes"] == 20
+    assert metrics["r3_cpu/route_padded_bytes"] == 24
+    assert metrics["r3_cpu/route_padding_amplification"] == 1.2
+    assert metrics["r3_cpu/route_rows"] == 5
+    assert metrics["r3_cpu/sequence_tokens_max"] == 3
+    assert metrics["r3_cpu/num_layers"] == 2
+    assert metrics["r3_cpu/topk"] == 2
+    assert timings["r3_cpu/route_validate_compact_s"] >= 0
+    assert timings["r3_cpu/route_initialize_padding_s"] >= 0
+    assert timings["r3_cpu/route_copy_samples_s"] >= 0
+
+
 def test_stepwise_anti_correlation_no_inflation(tokenizer):
     """Step-wise anti-correlated prompt/response lengths: seq_len = max(prompt_i + response_i),
     NOT max(prompt_i) + max(response_i)."""
