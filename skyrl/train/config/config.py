@@ -306,7 +306,7 @@ class TorchProfilerConfig(BaseConfig):
     """Passed to ``torch.profiler.profile``."""
     profile_memory: bool = False
     """Passed to ``torch.profiler.profile``."""
-    with_stack: bool = True
+    with_stack: bool = False
     """Passed to ``torch.profiler.profile``. Required when ``export_type="stacks"``."""
     with_flops: bool = False
     """Passed to ``torch.profiler.profile``."""

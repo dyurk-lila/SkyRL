@@ -62,7 +62,7 @@ class Profiler:
                 on_trace_ready=self._on_trace_ready,
                 record_shapes=getattr(config, "record_shapes", True),
                 profile_memory=getattr(config, "profile_memory", False),
-                with_stack=getattr(config, "with_stack", True),
+                with_stack=getattr(config, "with_stack", False),
                 with_flops=getattr(config, "with_flops", False),
                 with_modules=getattr(config, "with_modules", False),
             )
