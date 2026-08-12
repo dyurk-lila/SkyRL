@@ -56,6 +56,7 @@ from skyrl.backends.skyrl_train.workers.worker_utils import (
     reduce_metrics,
 )
 from skyrl.env_vars import (
+    SKYRL_PROFILE_R3_CPU_ENV,
     SKYRL_RAY_PG_TIMEOUT_IN_S,
     SKYRL_WORKER_NCCL_TIMEOUT_IN_S,
 )
@@ -710,6 +711,8 @@ class PPORayActorGroup:
             "num_gpus": num_gpus_per_actor,
             "resources": self._resources,
         }
+        if profile_r3_cpu := os.environ.get(SKYRL_PROFILE_R3_CPU_ENV):
+            actor_options["runtime_env"] = {"env_vars": {SKYRL_PROFILE_R3_CPU_ENV: profile_r3_cpu}}
         if sched is not None:
             actor_options["scheduling_strategy"] = sched
 
@@ -736,6 +739,8 @@ class PPORayActorGroup:
                     "num_gpus": num_gpus_per_actor,
                     "resources": self._resources,
                 }
+                if profile_r3_cpu := os.environ.get(SKYRL_PROFILE_R3_CPU_ENV):
+                    actor_options["runtime_env"] = {"env_vars": {SKYRL_PROFILE_R3_CPU_ENV: profile_r3_cpu}}
                 if sched is not None:
                     actor_options["scheduling_strategy"] = sched
 

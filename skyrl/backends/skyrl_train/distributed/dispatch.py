@@ -1,11 +1,14 @@
 """Defines dispatch and collect logic for distributed training"""
 
+import os
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Tuple, Type
 
 import ray
 import torch
+from loguru import logger
 from ray import ObjectRef
 from ray.actor import ActorHandle
 
@@ -14,6 +17,15 @@ from skyrl.backends.skyrl_train.training_batch import (
     TrainingOutputBatch,
     pad_training_input_batch,
 )
+from skyrl.env_vars import SKYRL_PROFILE_R3_CPU_ENV
+
+
+def _batch_nbytes(data: TrainingInputBatch) -> int:
+    return sum(
+        value.nbytes if torch.is_tensor(value) else sum(tensor.nbytes for tensor in value.tensors)
+        for value in data.values()
+        if value is not None
+    )
 
 
 @dataclass
@@ -110,16 +122,35 @@ class MeshDispatch(Dispatch):
             len(data), dp_size
         )
         chunk_size = len(data) // dp_size
+        profile_r3_cpu = os.environ.get(SKYRL_PROFILE_R3_CPU_ENV) == "1"
+        dispatch_started_at = time.perf_counter()
         data_chunks: List[TrainingInputBatch] = data.chunk(chunk_size)
+        chunked_at = time.perf_counter()
 
         # Put each unique chunk in object store ONCE to avoid redundant serialization
         # when the same chunk is sent to multiple workers (e.g., SP/TP replicas)
-        chunk_refs: List[ObjectRef] = [ray.put(chunk) for chunk in data_chunks]
+        chunk_refs: List[ObjectRef] = []
+        put_durations = []
+        for chunk in data_chunks:
+            put_started_at = time.perf_counter()
+            chunk_refs.append(ray.put(chunk))
+            put_durations.append(time.perf_counter() - put_started_at)
+        put_finished_at = time.perf_counter()
 
         for actor_info in actor_infos:
             # Pass ObjectRef instead of data - workers will fetch from object store
             chunk_ref = chunk_refs[actor_info.rank.dp]
             object_refs.append(getattr(actor_info.handle, method).remote(chunk_ref, **kwargs))
+        if profile_r3_cpu:
+            logger.info(
+                "[r3-cpu-profile] mesh_dispatch "
+                f"method={method} batch_bytes={_batch_nbytes(data)} "
+                f"chunks={len(data_chunks)} actors={len(actor_infos)} "
+                f"chunk_s={chunked_at - dispatch_started_at:.3f} "
+                f"ray_put_s={put_finished_at - chunked_at:.3f} "
+                f"ray_put_each_s={put_durations} "
+                f"actor_submit_s={time.perf_counter() - put_finished_at:.3f}"
+            )
         return object_refs
 
     @classmethod
@@ -144,7 +175,10 @@ class MeshDispatch(Dispatch):
         Returns:
             ``result[i][dp_rank]`` - ObjectRef for mini-batch *i*, DP rank *dp_rank*.
         """
+        profile_r3_cpu = os.environ.get(SKYRL_PROFILE_R3_CPU_ENV) == "1"
+        stage_started_at = time.perf_counter()
         all_chunk_refs: List[List[ObjectRef]] = []
+        put_durations = []
         for start, end in mini_batch_boundaries:
             mini_batch = data[start:end]
             mb_size = end - start
@@ -160,7 +194,20 @@ class MeshDispatch(Dispatch):
             ), f"mini_batch_size % dp_size != 0, got {mini_batch_size} and {dp_size}"
             chunk_size = mini_batch_size // dp_size
             chunks = mini_batch.chunk(chunk_size)
-            all_chunk_refs.append([ray.put(chunk) for chunk in chunks])
+            chunk_refs = []
+            for chunk in chunks:
+                put_started_at = time.perf_counter()
+                chunk_refs.append(ray.put(chunk))
+                put_durations.append(time.perf_counter() - put_started_at)
+            all_chunk_refs.append(chunk_refs)
+        if profile_r3_cpu:
+            logger.info(
+                "[r3-cpu-profile] mesh_stage "
+                f"batch_bytes={_batch_nbytes(data)} mini_batches={len(mini_batch_boundaries)} "
+                f"chunks={sum(len(refs) for refs in all_chunk_refs)} "
+                f"total_s={time.perf_counter() - stage_started_at:.3f} "
+                f"ray_put_each_s={put_durations}"
+            )
         return all_chunk_refs
 
     @classmethod

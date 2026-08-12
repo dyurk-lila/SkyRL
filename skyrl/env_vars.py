@@ -6,6 +6,9 @@ All environment variables used by SkyRL should be defined here for discoverabili
 
 import os
 
+SKYRL_PROFILE_R3_CPU_ENV = "SKYRL_PROFILE_R3_CPU"
+"""Opt-in host-side router-replay profiling flag."""
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Ray / Placement Group
 # ─────────────────────────────────────────────────────────────────────────────

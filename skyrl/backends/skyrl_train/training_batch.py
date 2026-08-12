@@ -2,14 +2,18 @@
 
 import copy
 import io
+import os
 import pickle
+import time
 from typing import Any, Dict, Generic, List, Optional, TypedDict, TypeVar
 
 import numpy as np
 import torch
 from jaxtyping import Bool, Float, Integer
+from loguru import logger
 
 from skyrl.backends.skyrl_train.utils.replay_utils import make_replay_padding_indices
+from skyrl.env_vars import SKYRL_PROFILE_R3_CPU_ENV
 
 DictType = TypeVar("DictType")
 
@@ -258,6 +262,8 @@ class TensorBatch(dict, Generic[DictType]):
         Uses fast numpy-based serialization when possible, with fallback to torch.save
         for dtypes not supported by numpy (e.g., bfloat16).
         """
+        profile_r3_cpu = os.environ.get(SKYRL_PROFILE_R3_CPU_ENV) == "1"
+        started_at = time.perf_counter()
         self.contiguous()
         if self._device is not None:
             assert self._device == torch.device("cpu"), "Tensors must be on CPU before serialization"
@@ -273,18 +279,27 @@ class TensorBatch(dict, Generic[DictType]):
             else:
                 batch_dict[key] = _serialize_tensor(value)
 
-        return {
+        state = {
             "batch_dict": batch_dict,
             "batch_size": self._batch_size,
             "device": self._device,
             "metadata": self.metadata,
         }
+        if profile_r3_cpu:
+            logger.info(
+                "[r3-cpu-profile] tensor_batch_serialize "
+                f"batch_size={self._batch_size} fields={len(batch_dict)} "
+                f"elapsed_s={time.perf_counter() - started_at:.3f}"
+            )
+        return state
 
     def __setstate__(self, state):
         """Deserialize the `TensorBatch` object and load it into memory.
 
         Handles both numpy-based format (fast path) and torch format (fallback for bfloat16 etc).
         """
+        profile_r3_cpu = os.environ.get(SKYRL_PROFILE_R3_CPU_ENV) == "1"
+        started_at = time.perf_counter()
         for key, value in state["batch_dict"].items():
             if value is None:
                 self[key] = None
@@ -297,6 +312,12 @@ class TensorBatch(dict, Generic[DictType]):
         self._device = state["device"]
         self.metadata = state["metadata"]
         self._check_consistency()
+        if profile_r3_cpu:
+            logger.info(
+                "[r3-cpu-profile] tensor_batch_deserialize "
+                f"batch_size={self._batch_size} fields={len(state['batch_dict'])} "
+                f"elapsed_s={time.perf_counter() - started_at:.3f}"
+            )
         return self
 
     def repeat(self, repeats: int) -> "TensorBatch[DictType]":

@@ -81,6 +81,7 @@ from skyrl.backends.skyrl_train.inference_servers.routed_experts_wire import (
 from skyrl.env_vars import (
     SKYRL_GENERATE_CONCURRENCY_PER_ENGINE,
     SKYRL_HTTP_CONNECTION_LIMIT,
+    SKYRL_PROFILE_R3_CPU_ENV,
 )
 from skyrl.utils.routed_experts import RoutedExpertIndices
 
@@ -207,7 +208,7 @@ class RemoteInferenceGenerator:
         session = await self._get_session()
         last_exc: Optional[Exception] = None
         request_started_at = time.perf_counter()
-        profile_r3 = os.environ.get("SKYRL_PROFILE_R3_CPU") == "1" and url.endswith("/skyrl/v1/generate")
+        profile_r3 = os.environ.get(SKYRL_PROFILE_R3_CPU_ENV) == "1" and url.endswith("/skyrl/v1/generate")
         for attempt in range(_DATA_PLANE_RETRIES):
             try:
                 async with session.post(url, json=json, headers=headers) as resp:
@@ -307,7 +308,7 @@ class RemoteInferenceGenerator:
                 raise ValueError("/skyrl/v1/generate must return packed routed_experts")
             decode_started_at = time.perf_counter()
             routed_experts = decode_packed_routed_experts(packed_routed_experts)
-            if os.environ.get("SKYRL_PROFILE_R3_CPU") == "1":
+            if os.environ.get(SKYRL_PROFILE_R3_CPU_ENV) == "1":
                 logger.info(
                     "[r3-cpu-profile] decoded routed experts: "
                     f"decode_s={time.perf_counter() - decode_started_at:.3f} bytes={routed_experts.nbytes} "

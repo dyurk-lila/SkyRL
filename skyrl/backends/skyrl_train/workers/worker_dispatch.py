@@ -8,6 +8,8 @@ Automatically handles GPU placement:
 The trainer interacts with the worker dispatch if all models are always on GPU.
 """
 
+import os
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -23,6 +25,7 @@ from skyrl.backends.skyrl_train.training_batch import (
     TrainingInputBatch,
 )
 from skyrl.backends.skyrl_train.workers.worker import PPORayActorGroup
+from skyrl.env_vars import SKYRL_PROFILE_R3_CPU_ENV
 from skyrl.train.config import SkyRLTrainConfig
 
 if TYPE_CHECKING:
@@ -246,7 +249,13 @@ class WorkerDispatch:
             kwargs["loss_fn_config"] = loss_fn_config
 
         refs = self._actor_groups[model].async_run_ray_method("mesh", "forward", data=data, **kwargs)
+        wait_started_at = time.perf_counter()
         results = ray.get(refs)
+        if os.environ.get(SKYRL_PROFILE_R3_CPU_ENV) == "1":
+            logger.info(
+                "[r3-cpu-profile] mesh_wait "
+                f"model={model} method=forward actors={len(refs)} ray_get_s={time.perf_counter() - wait_started_at:.3f}"
+            )
 
         return WorkerOutput.cat(self._actor_groups[model].actor_infos, results)
 
@@ -295,7 +304,14 @@ class WorkerDispatch:
             chunk_refs=chunk_refs,
             **kwargs,
         )
+        wait_started_at = time.perf_counter()
         results = ray.get(refs)
+        if os.environ.get(SKYRL_PROFILE_R3_CPU_ENV) == "1":
+            logger.info(
+                "[r3-cpu-profile] mesh_wait "
+                f"model={model} method=forward_from_staged actors={len(refs)} "
+                f"ray_get_s={time.perf_counter() - wait_started_at:.3f}"
+            )
         return WorkerOutput.cat(self._actor_groups[model].actor_infos, results)
 
     def stage_data(
@@ -361,7 +377,14 @@ class WorkerDispatch:
             kwargs["loss_fn_config"] = loss_fn_config
 
         refs = self._actor_groups[model].async_run_ray_method("mesh", "forward_backward", data, **kwargs)
+        wait_started_at = time.perf_counter()
         statuses = ray.get(refs)
+        if os.environ.get(SKYRL_PROFILE_R3_CPU_ENV) == "1":
+            logger.info(
+                "[r3-cpu-profile] mesh_wait "
+                f"model={model} method=forward_backward actors={len(refs)} "
+                f"ray_get_s={time.perf_counter() - wait_started_at:.3f}"
+            )
 
         self._save_memory_snapshot(model, "forward_backward")
 
@@ -408,7 +431,14 @@ class WorkerDispatch:
             chunk_refs=chunk_refs,
             **kwargs,
         )
+        wait_started_at = time.perf_counter()
         statuses = ray.get(refs)
+        if os.environ.get(SKYRL_PROFILE_R3_CPU_ENV) == "1":
+            logger.info(
+                "[r3-cpu-profile] mesh_wait "
+                f"model={model} method=forward_backward_from_staged actors={len(refs)} "
+                f"ray_get_s={time.perf_counter() - wait_started_at:.3f}"
+            )
 
         self._save_memory_snapshot(model, "forward_backward")
         return WorkerOutput.cat(self._actor_groups[model].actor_infos, statuses)
