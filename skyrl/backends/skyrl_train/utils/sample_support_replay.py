@@ -9,12 +9,14 @@ from skyrl.backends.skyrl_train.distributed.megatron.token_metadata import (
     align_token_metadata,
     scatter_packed_token_values_to_batch,
 )
+from skyrl.backends.skyrl_train.utils.packed_ragged_tensor import PackedRaggedTensor
 from skyrl.backends.skyrl_train.utils.packed_tensor import PackedTensor
 from skyrl.backends.skyrl_train.utils.sample_support import (
     SAMPLE_SUPPORT_FIELD,
     SAMPLE_SUPPORT_NO_ROW,
     SAMPLE_SUPPORT_PADDING,
     SAMPLE_SUPPORT_TORCH_DTYPE,
+    PackedSampleSupport,
     align_sample_support_row_ids,
 )
 
@@ -258,6 +260,181 @@ def sample_support_scores(
     )
 
 
+def _invert_row_ids(row_ids: torch.Tensor, num_rows: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return each support row's model position, and the row id every position names.
+
+    The fixed-width scorer joins the other way round -- it gathers a ``[top_k]`` row per position
+    -- which tolerates two positions naming one row. Scoring the members in place cannot: the row
+    is projected against exactly one position's hidden state, so a second claimant would be scored
+    from the first one's. ``align_packed_token_metadata`` lays a segment's rows down as ``arange``,
+    which makes the map injective by construction, so a duplicate is a bug and is refused. Reading
+    that costs one host sync per microbatch, the same one the synthetic-EOS guard already pays.
+    """
+    flat_rows = row_ids.reshape(-1).long()
+    named = (flat_rows >= 0) & (flat_rows < num_rows)
+    # One slot past the last row absorbs every position that names none, so the scatters below
+    # stay in range without a separate mask.
+    safe_rows = torch.where(named, flat_rows, num_rows)
+    row_position = torch.full((num_rows + 1,), -1, dtype=torch.long, device=flat_rows.device)
+    row_position.scatter_(0, safe_rows, torch.arange(flat_rows.numel(), device=flat_rows.device))
+    claims = torch.zeros(num_rows + 1, dtype=torch.long, device=flat_rows.device).scatter_add_(
+        0, safe_rows, named.long()
+    )
+    contested = (claims[:-1] > 1).nonzero().flatten()
+    if contested.numel():
+        raise ValueError(
+            f"support rows {contested.tolist()} are each named by more than one model position, "
+            "so no single position's scores can stand for the row"
+        )
+    return row_position[:-1], safe_rows
+
+
+def sample_support_csr_scores(
+    logits_or_hidden: torch.Tensor,
+    sampled_ids: torch.Tensor,
+    support: PackedRaggedTensor,
+    row_ids: torch.Tensor,
+    *,
+    vocab_start_index: int,
+    vocab_end_index: int,
+    tp_group: torch.distributed.ProcessGroup | None,
+    compute_entropy: bool,
+    entropy_requires_grad: bool,
+    lm_head_weight: torch.Tensor | None = None,
+    temperature: float = 1.0,
+    chunk_size: int | None = None,
+) -> SampleSupportScores:
+    """Renormalize over each token's own recorded members, scoring the ragged support in place.
+
+    Same statistics as :func:`sample_support_scores`, reduced over a member list rather than over a
+    fixed ``[rows, top_k]`` matrix. Nothing is gathered into that matrix, so the empty columns a
+    ``top_k`` wide enough to contain the nucleus must carry are not projected, not summed, and not
+    stored as an fp32 intermediate.
+
+    Two consequences follow from working per row instead of per model position. The reductions run
+    over support rows -- response tokens -- rather than over every position in the microbatch, so
+    the tensor-parallel payload shrinks with them. And a row of one member needs no projection at
+    all: renormalizing over a single candidate gives probability 1, hence logprob 0.0 and entropy
+    0.0.
+
+    Both rest on the two properties capture establishes: a row's members are DISTINCT, because they
+    are a top-k set, and they CONTAIN the sampled token, because vLLM drew it from them and the
+    capture path re-inserts it when its approximate pivot leaves it out. The numerator is read off
+    the member equal to the sampled token, which is free because that member is already projected;
+    a duplicated member would be summed twice, and a sampled token outside the row would leave the
+    numerator at zero rather than falling back to the vocabulary. Neither shape can be recorded.
+    """
+    if logits_or_hidden.shape[:-1] != sampled_ids.shape or row_ids.shape != sampled_ids.shape:
+        raise ValueError(
+            "logits, sampled_ids, and row_ids must have matching prefix shapes, got "
+            f"{logits_or_hidden.shape[:-1]}, {sampled_ids.shape}, and {row_ids.shape}"
+        )
+    if support.dtype != SAMPLE_SUPPORT_TORCH_DTYPE:
+        raise ValueError(f"sample support must use {SAMPLE_SUPPORT_TORCH_DTYPE} vocab ids, got {support.dtype}")
+    if temperature <= 0:
+        raise ValueError(f"temperature must be positive, got {temperature}")
+    if entropy_requires_grad and not compute_entropy:
+        raise ValueError("entropy gradients require compute_entropy=True")
+
+    device = logits_or_hidden.device
+    flat_source = logits_or_hidden.reshape(-1, logits_or_hidden.shape[-1])
+    flat_sampled = sampled_ids.reshape(-1).long()
+    num_rows = support.num_rows
+    row_position, safe_rows = _invert_row_ids(row_ids, num_rows)
+
+    row_lengths = support.row_lengths.to(torch.long)
+    scored_rows = row_position >= 0
+    valid_rows = scored_rows & (row_lengths > 0)
+    projected_rows = scored_rows & (row_lengths > 1)
+
+    member_rows = torch.repeat_interleave(
+        torch.arange(num_rows, device=device), row_lengths, output_size=support.values.numel()
+    )
+    member_vocab = support.values.long()
+    local_members = projected_rows[member_rows] & (member_vocab >= vocab_start_index) & (member_vocab < vocab_end_index)
+    local_rows = member_rows[local_members]
+    local_vocab = member_vocab[local_members]
+    local_ids = local_vocab - vocab_start_index
+    local_positions = row_position[local_rows]
+
+    compute_dtype = (
+        torch.float32 if logits_or_hidden.dtype in (torch.float16, torch.bfloat16) else logits_or_hidden.dtype
+    )
+    if lm_head_weight is None:
+        local_values = flat_source[local_positions, local_ids].to(compute_dtype)
+    else:
+        if lm_head_weight.shape[0] != vocab_end_index - vocab_start_index:
+            raise ValueError(
+                f"lm_head_weight holds {lm_head_weight.shape[0]} rows for vocabulary shard "
+                f"[{vocab_start_index}, {vocab_end_index})"
+            )
+        local_values = _project_candidate_pairs(
+            flat_source, local_positions, local_ids, lm_head_weight, temperature, chunk_size
+        )
+
+    local_max = torch.full((num_rows,), float("-inf"), dtype=local_values.dtype, device=device)
+    local_max.scatter_reduce_(0, local_rows, local_values.detach(), reduce="amax", include_self=True)
+    if tp_group is not None and torch.distributed.get_world_size(tp_group) > 1:
+        torch.distributed.all_reduce(local_max, op=torch.distributed.ReduceOp.MAX, group=tp_group)
+    safe_max = torch.where(projected_rows, local_max, 0.0)
+
+    shifted = local_values - safe_max[local_rows]
+    local_exp = shifted.exp()
+    sampled_for_row = flat_sampled[row_position.clamp(min=0)]
+    sampled_member = local_vocab == sampled_for_row[local_rows]
+    local_stats = [
+        local_values.new_zeros(num_rows).index_add(0, local_rows, local_exp),
+        local_values.new_zeros(num_rows).index_add(0, local_rows, torch.where(sampled_member, local_values, 0.0)),
+    ]
+    if compute_entropy:
+        # Same decomposition the fixed-width scorer uses: H = log(Z) - E_p[l - max], and both terms
+        # are sums over the members Z already sums over, so this is another row of the reduction.
+        weights = local_exp if entropy_requires_grad else local_exp.detach()
+        local_stats.append(
+            local_values.new_zeros(num_rows).index_add(
+                0, local_rows, weights * (shifted if entropy_requires_grad else shifted.detach())
+            )
+        )
+    # A vocabulary shard that owns no member of this microbatch would otherwise leave the backward
+    # graph entirely -- `_project_candidate_pairs` short-circuits an empty pair list -- and both
+    # Megatron and FSDP expect a gradient buffer for the hidden states and the LM head on every
+    # rank. A zero-weighted touch of each input restores the edge and adds 0.0 to the value.
+    connect = flat_source.reshape(-1)[:1].sum() * 0.0
+    if lm_head_weight is not None:
+        connect = connect + lm_head_weight.reshape(-1)[:1].sum() * 0.0
+    local_stats[0] = local_stats[0] + connect.to(local_stats[0].dtype)
+
+    stacked = torch.stack(local_stats)
+    global_stats = stacked.detach().clone()
+    if tp_group is not None and torch.distributed.get_world_size(tp_group) > 1:
+        torch.distributed.all_reduce(global_stats, op=torch.distributed.ReduceOp.SUM, group=tp_group)
+    global_stats = global_stats + stacked - stacked.detach()
+    denominator, sampled_score = global_stats[0], global_stats[1]
+    row_logprobs = torch.where(
+        projected_rows,
+        sampled_score - safe_max - torch.where(projected_rows, denominator, 1.0).log(),
+        0.0,
+    )
+
+    row_entropy = None
+    if compute_entropy:
+        weighted_sum = global_stats[2] if entropy_requires_grad else global_stats[2].detach()
+        safe_denominator = torch.where(
+            projected_rows, denominator if entropy_requires_grad else denominator.detach(), 1.0
+        )
+        row_entropy = torch.where(projected_rows, safe_denominator.log() - weighted_sum / safe_denominator, 0.0)
+
+    def at_positions(row_values: torch.Tensor) -> torch.Tensor:
+        """Read each model position's row, with the sentinel slot standing in for "no row"."""
+        return torch.cat([row_values, row_values.new_zeros(1)])[safe_rows].reshape(sampled_ids.shape)
+
+    return SampleSupportScores(
+        logprobs=at_positions(row_logprobs),
+        entropy=None if row_entropy is None else at_positions(row_entropy),
+        valid_mask=at_positions(valid_rows),
+    )
+
+
 def _trajectory_ids_for_fallback(
     synthetic_eos_mask: torch.Tensor,
     metadata_layout: TokenMetadataLayout | None,
@@ -410,7 +587,7 @@ def synthetic_eos_logprobs(
 
 
 def sample_support_row_ids_in_batch_positions(
-    sample_support: PackedTensor,
+    sample_support: PackedSampleSupport,
     layout: TokenMetadataLayout,
 ) -> torch.Tensor:
     """Map support rows into canonical left-padded batch coordinates."""
@@ -442,7 +619,7 @@ def score_aligned_sample_support(
     aligned_sampled_ids: torch.Tensor,
     aligned_row_ids: torch.Tensor,
     aligned_loss_mask: torch.Tensor,
-    sample_support: PackedTensor,
+    sample_support: PackedSampleSupport,
     *,
     vocab_start_index: int,
     vocab_end_index: int,
@@ -462,11 +639,9 @@ def score_aligned_sample_support(
 
     ``temperature`` applies only when ``aligned_source`` contains hidden states.
     Synthetic-EOS rows use full-vocabulary logprobs and remain outside the support-entropy mask.
+    Both packed support forms share outer segmentation and row IDs.
     """
-    scores = sample_support_scores(
-        aligned_source,
-        aligned_sampled_ids,
-        _gather_support_rows(sample_support, aligned_row_ids),
+    scorer_kwargs = dict(
         vocab_start_index=vocab_start_index,
         vocab_end_index=vocab_end_index,
         tp_group=tp_group,
@@ -476,6 +651,21 @@ def score_aligned_sample_support(
         temperature=temperature if lm_head_weight is not None else 1.0,
         chunk_size=chunk_size,
     )
+    if isinstance(sample_support, PackedRaggedTensor):
+        scores = sample_support_csr_scores(
+            aligned_source,
+            aligned_sampled_ids,
+            sample_support,
+            aligned_row_ids,
+            **scorer_kwargs,
+        )
+    else:
+        scores = sample_support_scores(
+            aligned_source,
+            aligned_sampled_ids,
+            _gather_support_rows(sample_support, aligned_row_ids),
+            **scorer_kwargs,
+        )
     synthetic_eos_mask = aligned_loss_mask & ~scores.valid_mask
     eos_logprobs = synthetic_eos_logprobs(
         aligned_source,
@@ -504,7 +694,7 @@ def compute_sample_support_scores(
     logits_or_hidden: torch.Tensor,
     sequences: torch.Tensor,
     loss_mask: torch.Tensor | None,
-    sample_support: PackedTensor | None,
+    sample_support: PackedSampleSupport | None,
     num_actions: int,
     *,
     packed: bool,
