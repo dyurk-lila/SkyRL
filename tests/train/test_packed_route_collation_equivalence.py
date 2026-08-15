@@ -149,13 +149,14 @@ def _make_batch(lengths: list[tuple[int, int]], *, captured_shortfall: int = 0, 
         if index == len(lengths) - 1:
             captured -= captured_shortfall
         routes.append(
-            RoutedExpertRoutes.covering_all_layers(
+            RoutedExpertRoutes(
                 rng.integers(
                     MIN_EXPERT_ID,
                     MIN_EXPERT_ID + 2000,
                     size=(captured, NUM_LAYERS, TOPK),
                     dtype=np.int16,
-                )
+                ),
+                range(NUM_LAYERS),
             )
         )
     return prompts, responses, rewards, loss_masks, routes

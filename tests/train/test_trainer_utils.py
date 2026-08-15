@@ -1165,7 +1165,7 @@ def _make_side_channel_output(
 
 
 def _routes(num_rows):
-    return RoutedExpertRoutes.covering_all_layers(np.zeros((num_rows, 2, 2), dtype=np.int16))
+    return RoutedExpertRoutes(np.zeros((num_rows, 2, 2), dtype=np.int16), range(2))
 
 
 def _support(num_rows):
