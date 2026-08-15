@@ -159,6 +159,14 @@ R3 requires per-token routes that line up with the trained tokens, so `SkyRLGymG
 R3 does induce additional training bias when mini-batching, since routing decisions are fixed for all mini-batches in a training batch. However, it has been shown to be important for stabilizing large-scale MoE training, particularly
 in models adopting a DeepSeek-V3 like architecture (notably the GLM family) due to the use of sigmoid-based affinity scoring instead of softmax for top-k routing.
 
+`moe_router_fusion=True` is rejected with routing replay: TransformerEngine's fused top-k has no parameter that can accept precomputed indices, and Megatron's `topk_routing_with_score_function` drops the `router_replay` argument on its fused early return, so the pair trains against TE-selected experts instead of the rollout's — measured at 4.408% index overlap with the rollout, against 4.297% for random chance at 512 experts and topk 22. Nothing in a loss curve distinguishes that from working replay, so SkyRL also forces fusion off at runtime (with a warning) if it is enabled some other way.
+
+Each worker logs one line the first time replay runs, naming the path it took (`fused replay kernel` or `unfused replay`), the layers replayed on that rank, topk and the router token count. If replay is configured but a training step's microbatches arrive without rollout routes, that step trains without replay and is warned about once per worker.
+
+## Fused routing replay
+
+`trainer.policy.megatron_config.moe_fused_routing_replay=True` serves replayed routing with a single fused CUDA kernel instead of Megatron's unfused gather/sigmoid/normalize chain. It emits Megatron's exact `(routing_probs, routing_map)` contract, so no dispatcher change is involved. Measured at 512 experts, topk 22 and 4096 tokens per rank on an H100: 15.05 us versus 78.8 us of device time for the unfused replay path, in one launch each way instead of fifteen, and 10.4 MiB of saved activations instead of 33.0. The kernel requires `moe_router_score_function="sigmoid"`, an fp32, fp16, or bf16 router and `2 <= topk <= 32`; anything else — including a toolchain that cannot build the extension — logs a reason and falls back to the unfused replay path. The extension is compiled on first use into a node-local, torch-version-keyed build directory; the router is a small fraction of a step, so treat this as a launch-count and memory win rather than an end-to-end throughput claim.
+
 # Algorithmic Off Policy Correction
 
 In the previous sections, we described some reasons why off-policy drift can occur, and some ways to mitigate it (e.g., batch invariant kernels, routing replay). However,
