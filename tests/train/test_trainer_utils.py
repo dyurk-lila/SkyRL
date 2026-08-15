@@ -14,7 +14,10 @@ import numpy as np
 import pytest
 import ray
 
-from skyrl.backends.skyrl_train.utils.routed_experts import RoutedExpertTrace
+from skyrl.backends.skyrl_train.utils.routed_experts import (
+    RoutedExpertRoutes,
+    RoutedExpertTrace,
+)
 from skyrl.backends.skyrl_train.utils.sample_support import SAMPLE_SUPPORT_DTYPE
 from skyrl.train.config import SkyRLTrainConfig
 from skyrl.train.generators.base import GeneratorInput, GeneratorOutput, TrajectoryID
@@ -1162,7 +1165,7 @@ def _make_side_channel_output(
 
 
 def _routes(num_rows):
-    return np.zeros((num_rows, 2, 2), dtype=np.int16)
+    return RoutedExpertRoutes.covering_all_layers(np.zeros((num_rows, 2, 2), dtype=np.int16))
 
 
 def _support(num_rows):
@@ -1202,7 +1205,7 @@ def test_validate_generator_output_accepts_the_coverage_a_multi_turn_trace_produ
     trace.record_generation(prompt_token_count=7, generated_token_count=2, routed_experts=_routes(4))
     loss_mask = [1, 1, 0, 0, 1, 1]
     routes = trace.finalize(token_count=9, loss_mask=[0, 0, 0] + loss_mask)
-    assert len(routes) == 8
+    assert routes.num_tokens == 8
 
     output = GeneratorOutput(
         prompt_token_ids=[[1, 2, 3]],

@@ -14,6 +14,7 @@ from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
     CLAMPED_LOGPROB,
     PackedArrayKey,
     PackedField,
+    RoutedExpertsWireKey,
     build_logprobs_content,
     decode_packed_routed_experts,
     decode_packed_sample_support,
@@ -21,8 +22,10 @@ from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
     pack_ndarray,
     pack_routed_experts,
     pack_sample_support,
+    routes_from_capture,
     unpack_ndarray,
 )
+from skyrl.backends.skyrl_train.utils.routed_experts import RoutedExpertRoutes
 
 _FLOAT32 = frozenset({np.dtype(np.float32)})
 _INT16 = frozenset({np.dtype(np.int16)})
@@ -30,6 +33,18 @@ _INT16 = frozenset({np.dtype(np.int16)})
 
 def _support_envelope(support: np.ndarray) -> dict:
     return pack_ndarray(support, allowed_dtypes=_FLOAT32)
+
+
+def _routes(indices, layer_indices=None) -> RoutedExpertRoutes:
+    """Pair route values with their captured layers, defaulting to the whole stack."""
+    indices = np.asarray(indices)
+    if layer_indices is None:
+        return RoutedExpertRoutes.covering_all_layers(indices)
+    return RoutedExpertRoutes(indices, layer_indices)
+
+
+def _routed_experts_envelope(indices, layer_indices=None) -> dict:
+    return pack_routed_experts(_routes(indices, layer_indices))
 
 
 def _body(**choice_fields) -> dict:
@@ -83,7 +98,7 @@ def test_null_logprob_entry_is_clamped_not_raised():
 
 
 @pytest.mark.parametrize(
-    "routes,expected_dtype",
+    "indices,expected_dtype",
     [
         (np.arange(12).reshape(3, 2, 2), "uint8"),
         (np.array([[[2**8 - 1]]]), "uint8"),
@@ -95,43 +110,56 @@ def test_null_logprob_entry_is_clamped_not_raised():
         (np.arange(24).reshape(6, 2, 2)[::2], "uint8"),
     ],
 )
-def test_packed_routed_experts_round_trip(routes, expected_dtype):
+def test_packed_routed_experts_round_trip(indices, expected_dtype):
+    routes = _routes(indices)
     payload = pack_routed_experts(routes)
     decoded = decode_packed_routed_experts(payload)
 
     assert payload["dtype"] == expected_dtype
-    assert decoded.dtype.name == expected_dtype
-    assert decoded.flags.c_contiguous
-    assert np.array_equal(decoded, routes)
+    assert decoded.indices.dtype.name == expected_dtype
+    assert decoded.indices.flags.c_contiguous
+    assert np.array_equal(decoded.indices, indices)
+    assert decoded.layer_indices == routes.layer_indices
+
+
+def test_packed_routed_experts_carries_interleaved_layer_indices():
+    """A hybrid stack's MoE layers are not contiguous, so the list must survive verbatim."""
+    layer_indices = (1, 3, 5, 7, 9)
+    payload = _routed_experts_envelope(np.arange(2 * 5 * 3).reshape(2, 5, 3), layer_indices)
+
+    assert payload[RoutedExpertsWireKey.LAYER_INDICES] == list(layer_indices)
+    assert decode_packed_routed_experts(payload).layer_indices == layer_indices
 
 
 def test_packed_routed_experts_uses_raw_base64():
-    assert pack_routed_experts(np.array([[[1, 2, 3]]]))["data"] == "AQID"
+    assert _routed_experts_envelope([[[1, 2, 3]]])["data"] == "AQID"
 
 
 @pytest.mark.parametrize(
-    "routes",
-    [np.array([1, 2]), np.array([[[-1]]]), np.array([[[2**31]]], dtype=np.uint64)],
+    "indices",
+    [np.array([[[-1]]]), np.array([[[2**31]]], dtype=np.uint64)],
 )
-def test_pack_rejects_invalid_routes(routes):
+def test_pack_rejects_invalid_routes(indices):
     with pytest.raises(ValueError):
-        pack_routed_experts(routes)
+        pack_routed_experts(_routes(indices))
 
 
 def test_pack_rejects_nested_lists():
-    # The coercion in pack_routed_experts must not turn the old nested-list
+    # The coercion in routes_from_capture must not turn the old nested-list
     # format into a valid payload.
     with pytest.raises(TypeError, match="NumPy array"):
-        pack_routed_experts([[[1, 2]]])
+        routes_from_capture([[[1, 2]]])
 
 
 def test_pack_accepts_torch_tensors():
     routes = torch.arange(12, dtype=torch.int64).reshape(3, 2, 2)
 
-    decoded = decode_packed_routed_experts(pack_routed_experts(routes))
+    decoded = decode_packed_routed_experts(pack_routed_experts(routes_from_capture(routes)))
 
-    assert decoded.dtype == np.uint8
-    assert np.array_equal(decoded, routes.numpy())
+    assert decoded.indices.dtype == np.uint8
+    assert np.array_equal(decoded.indices, routes.numpy())
+    # A capture spans every transformer layer, so the identity mapping is what a server can name.
+    assert decoded.layer_indices == (0, 1)
 
 
 def test_pack_moves_device_tensors_to_host():
@@ -159,36 +187,68 @@ def test_pack_moves_device_tensors_to_host():
             return self._array
 
     routes = np.arange(12, dtype=np.int64).reshape(3, 2, 2)
-    decoded = decode_packed_routed_experts(pack_routed_experts(_DeviceTensor(routes)))
+    decoded = decode_packed_routed_experts(pack_routed_experts(routes_from_capture(_DeviceTensor(routes))))
 
     assert calls == ["detach", "cpu", "numpy"]
-    assert np.array_equal(decoded, routes)
+    assert np.array_equal(decoded.indices, routes)
 
 
 @pytest.mark.parametrize("shape", [[1, 1, 1], [np.int64(1), np.int32(1), 1]])
 def test_decode_accepts_numpy_integer_dims(shape):
-    assert decode_packed_routed_experts({"data": "AQ==", "shape": shape, "dtype": "uint8"}).shape == (1, 1, 1)
+    payload = {"data": "AQ==", "shape": shape, "dtype": "uint8", "layer_indices": [0]}
+
+    assert decode_packed_routed_experts(payload).indices.shape == (1, 1, 1)
 
 
 def test_decode_rejects_incorrect_byte_count():
     with pytest.raises(ValueError, match="bytes"):
-        decode_packed_routed_experts({"data": "AQ==", "shape": [2, 1, 1], "dtype": "uint8"})
+        decode_packed_routed_experts({"data": "AQ==", "shape": [2, 1, 1], "dtype": "uint8", "layer_indices": [0]})
 
 
 @pytest.mark.parametrize(
     "payload",
     [
-        {"data": "AQ==", "shape": [1, 1, 1], "dtype": "uint16"},
-        {"data": "!", "shape": [1, 1, 1], "dtype": "uint8"},
+        {"data": "AQ==", "shape": [1, 1, 1], "dtype": "uint16", "layer_indices": [0]},
+        {"data": "!", "shape": [1, 1, 1], "dtype": "uint8", "layer_indices": [0]},
         # bool is a subclass of int, so widening the dim check must not admit it.
-        {"data": "AQ==", "shape": [True, 1, 1], "dtype": "uint8"},
-        {"data": "AQ==", "shape": [np.bool_(True), 1, 1], "dtype": "uint8"},
-        {"data": "AQ==", "shape": [1.0, 1, 1], "dtype": "uint8"},
-        {"data": "AQ==", "shape": [-1, 1, 1], "dtype": "uint8"},
+        {"data": "AQ==", "shape": [True, 1, 1], "dtype": "uint8", "layer_indices": [0]},
+        {"data": "AQ==", "shape": [np.bool_(True), 1, 1], "dtype": "uint8", "layer_indices": [0]},
+        {"data": "AQ==", "shape": [1.0, 1, 1], "dtype": "uint8", "layer_indices": [0]},
+        {"data": "AQ==", "shape": [-1, 1, 1], "dtype": "uint8", "layer_indices": [0]},
     ],
 )
 def test_decode_rejects_malformed_payloads(payload):
     with pytest.raises(ValueError):
+        decode_packed_routed_experts(payload)
+
+
+@pytest.mark.parametrize(
+    "layer_indices",
+    [
+        None,  # a sender that never named its layers
+        [],
+        [True],  # bool is a subclass of int
+        [0.0],
+        "01",
+        [1, 1],
+        [1, 0],
+        [-1],
+    ],
+)
+def test_decode_rejects_bad_layer_indices(layer_indices):
+    """The whole point of carrying the layers is that the trainer never has to guess them."""
+    payload = {"data": "AQID", "shape": [1, 2, 1], "dtype": "uint8"}
+    if layer_indices is not None:
+        payload["layer_indices"] = layer_indices
+
+    with pytest.raises(ValueError):
+        decode_packed_routed_experts(payload)
+
+
+def test_decode_rejects_layer_indices_that_miss_a_slot():
+    payload = {"data": "AQID", "shape": [1, 3, 1], "dtype": "uint8", "layer_indices": [0, 1]}
+
+    with pytest.raises(ValueError, match="cover 3 layers"):
         decode_packed_routed_experts(payload)
 
 
@@ -198,6 +258,7 @@ def test_decode_rejects_noncanonical_dtype():
         "data": base64.b64encode(routes.tobytes()).decode("ascii"),
         "shape": [1, 1, 1],
         "dtype": "int32",
+        "layer_indices": [0],
     }
 
     with pytest.raises(ValueError, match="non-canonical dtype"):
@@ -257,9 +318,13 @@ def test_packed_envelope_leads_with_data():
 
 
 def test_pack_routed_experts_is_byte_identical_to_the_hand_built_envelope():
-    routes = np.arange(12).reshape(3, 2, 2)
+    """`data` leads and every key is a plain str: orjson rejects StrEnum dict keys outright."""
+    envelope = _routed_experts_envelope(np.arange(12).reshape(3, 2, 2))
 
-    assert orjson.dumps(pack_routed_experts(routes)) == b'{"data":"AAECAwQFBgcICQoL","shape":[3,2,2],"dtype":"uint8"}'
+    assert all(type(key) is str for key in envelope)
+    assert orjson.dumps(envelope) == (
+        b'{"data":"AAECAwQFBgcICQoL","shape":[3,2,2],"dtype":"uint8","layer_indices":[0,1]}'
+    )
 
 
 @pytest.mark.parametrize(
@@ -313,7 +378,7 @@ def test_load_packed_body_splices_both_blobs_in_one_body():
     raw = orjson.dumps(
         _body(
             logprobs={"content": [{"logprob": -0.5}]},
-            routed_experts=pack_routed_experts(routes),
+            routed_experts=_routed_experts_envelope(routes),
             rollout_sample_support=_support_envelope(support),
         )
     )
@@ -324,7 +389,7 @@ def test_load_packed_body_splices_both_blobs_in_one_body():
         isinstance(choice[field][PackedArrayKey.DATA], memoryview)
         for field in (PackedField.ROUTED_EXPERTS, PackedField.ROLLOUT_SAMPLE_SUPPORT)
     )
-    assert np.array_equal(decode_packed_routed_experts(choice[PackedField.ROUTED_EXPERTS]), routes)
+    assert np.array_equal(decode_packed_routed_experts(choice[PackedField.ROUTED_EXPERTS]).indices, routes)
     decoded_support, _ = unpack_ndarray(choice[PackedField.ROLLOUT_SAMPLE_SUPPORT], allowed_dtypes=_FLOAT32, ndim=2)
     assert np.array_equal(decoded_support, support)
     assert choice["logprobs"] == {"content": [{"logprob": -0.5}]}
@@ -355,7 +420,7 @@ def test_load_packed_body_passes_through_absent_and_null_fields(value):
 
 def test_load_packed_body_rejects_reordered_envelope_keys():
     routes = np.arange(12).reshape(3, 2, 2)
-    envelope = pack_routed_experts(routes)
+    envelope = _routed_experts_envelope(routes)
     reordered = {key: envelope[key] for key in reversed(list(envelope))}
 
     with pytest.raises(ValueError, match="layout drifted"):
@@ -365,7 +430,7 @@ def test_load_packed_body_rejects_reordered_envelope_keys():
 def test_load_packed_body_rejects_a_reserialized_body():
     # stdlib json spaces its separators; the blob would silently land in a
     # ~121 MiB Python str instead, which is exactly the cost this avoids.
-    raw = json.dumps(_body(routed_experts=pack_routed_experts(np.arange(12).reshape(3, 2, 2)))).encode()
+    raw = json.dumps(_body(routed_experts=_routed_experts_envelope(np.arange(12).reshape(3, 2, 2)))).encode()
 
     with pytest.raises(ValueError, match="layout drifted"):
         load_packed_body(raw)
@@ -374,12 +439,12 @@ def test_load_packed_body_rejects_a_reserialized_body():
 def test_load_packed_body_is_not_spoofable_from_a_string_value():
     routes = np.arange(12).reshape(3, 2, 2)
     spoof = '"routed_experts":{"data":"AAAA","shape":[1,1,1],"dtype":"uint8"}'
-    raw = orjson.dumps(_body(note=spoof, routed_experts=pack_routed_experts(routes)))
+    raw = orjson.dumps(_body(note=spoof, routed_experts=_routed_experts_envelope(routes)))
 
     choice = load_packed_body(raw)["choices"][0]
 
     assert choice["note"] == spoof
-    assert np.array_equal(decode_packed_routed_experts(choice[PackedField.ROUTED_EXPERTS]), routes)
+    assert np.array_equal(decode_packed_routed_experts(choice[PackedField.ROUTED_EXPERTS]).indices, routes)
 
 
 def test_load_packed_body_ignores_unregistered_packed_fields():
@@ -391,7 +456,7 @@ def test_load_packed_body_ignores_unregistered_packed_fields():
 
 def test_load_packed_body_honours_a_narrowed_field_registry():
     routes = np.arange(12).reshape(3, 2, 2)
-    raw = orjson.dumps(_body(routed_experts=pack_routed_experts(routes)))
+    raw = orjson.dumps(_body(routed_experts=_routed_experts_envelope(routes)))
 
     body = load_packed_body(raw, fields=(PackedField.ROLLOUT_SAMPLE_SUPPORT,))
 
@@ -400,16 +465,19 @@ def test_load_packed_body_honours_a_narrowed_field_registry():
 
 def test_load_packed_body_splices_one_blob_per_choice():
     first, second = np.arange(12).reshape(3, 2, 2), np.arange(12, 24).reshape(3, 2, 2)
-    raw = orjson.dumps({"choices": [{"routed_experts": pack_routed_experts(routes)} for routes in (first, second)]})
+    raw = orjson.dumps(
+        {"choices": [{"routed_experts": _routed_experts_envelope(routes)} for routes in (first, second)]}
+    )
 
     choices = load_packed_body(raw)["choices"]
 
-    assert np.array_equal(decode_packed_routed_experts(choices[0][PackedField.ROUTED_EXPERTS]), first)
-    assert np.array_equal(decode_packed_routed_experts(choices[1][PackedField.ROUTED_EXPERTS]), second)
+    # Blobs are matched to envelopes in document order.
+    assert np.array_equal(decode_packed_routed_experts(choices[0][PackedField.ROUTED_EXPERTS]).indices, first)
+    assert np.array_equal(decode_packed_routed_experts(choices[1][PackedField.ROUTED_EXPERTS]).indices, second)
 
 
 def test_load_packed_body_rejects_an_unterminated_blob():
-    raw = orjson.dumps(_body(routed_experts=pack_routed_experts(np.arange(12).reshape(3, 2, 2))))
+    raw = orjson.dumps(_body(routed_experts=_routed_experts_envelope(np.arange(12).reshape(3, 2, 2))))
     truncated = raw[: raw.index(b'"shape"') - 2]
 
     with pytest.raises(ValueError, match="unterminated"):
