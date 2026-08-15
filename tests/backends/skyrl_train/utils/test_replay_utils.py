@@ -87,7 +87,7 @@ def test_setup_replay_installs_indices_and_returns_model_mask(monkeypatch, paral
     router_replay_module = types.ModuleType("megatron.core.transformer.moe.router_replay")
 
     class RouterReplay:
-        global_router_replay_instances = [object()]
+        global_router_replay_instances = [SimpleNamespace(layer_number=2)]
         replay_data = None
         action = None
 
@@ -142,6 +142,7 @@ def test_setup_replay_installs_indices_and_returns_model_mask(monkeypatch, paral
 
     model_kwargs = replay_utils.setup_per_microbatch_replay_forward(
         _pack_routes(routes, attention_mask),
+        (0, 1, 2),
         router_padding_mask,
         attention_mask,
         model=object(),
@@ -163,7 +164,7 @@ def test_replay_indices_are_dtype_independent(monkeypatch, parallel_state, packe
     router_replay_module = types.ModuleType("megatron.core.transformer.moe.router_replay")
 
     class RouterReplay:
-        global_router_replay_instances = [object(), object()]
+        global_router_replay_instances = [SimpleNamespace(layer_number=2), SimpleNamespace(layer_number=3)]
         replay_data = None
 
         @classmethod
@@ -205,6 +206,7 @@ def test_replay_indices_are_dtype_independent(monkeypatch, parallel_state, packe
         )
         replay_utils.setup_per_microbatch_replay_forward(
             _pack_routes(routes, attention_mask),
+            range(num_layers),
             router_padding_mask,
             attention_mask,
             model=object(),
@@ -221,6 +223,179 @@ def test_replay_indices_are_dtype_independent(monkeypatch, parallel_state, packe
     for narrow, wide in zip(from_int16, from_int32, strict=True):
         assert narrow.dtype == wide.dtype == torch.int32
         assert torch.equal(narrow, wide)
+
+
+# Stands for a router the layer-number patch never touched, which has no such attribute.
+_UNPATCHED = object()
+
+
+def _install_router_replay(monkeypatch, layer_numbers):
+    """Stub RouterReplay whose instances report the given 1-based Megatron layer numbers."""
+    module = types.ModuleType("megatron.core.transformer.moe.router_replay")
+
+    class RouterReplay:
+        global_router_replay_instances = [
+            object() if n is _UNPATCHED else SimpleNamespace(layer_number=n) for n in layer_numbers
+        ]
+        replay_data = None
+
+        @classmethod
+        def set_replay_data(cls, replay_data):
+            cls.replay_data = replay_data
+
+        @classmethod
+        def set_global_router_replay_action(cls, action):
+            pass
+
+    module.RouterReplay = RouterReplay
+    module.RouterReplayAction = SimpleNamespace(REPLAY_FORWARD="replay_forward")
+    monkeypatch.setitem(sys.modules, "megatron.core.transformer.moe.router_replay", module)
+    return RouterReplay
+
+
+def _routes_tagged_by_layer(captured_layer_indices, *, seq_len=2, topk=2):
+    """Routes whose every value encodes the global layer index its slot came from."""
+    routes = torch.zeros((1, seq_len, len(captured_layer_indices), topk), dtype=torch.int16)
+    for slot, layer_index in enumerate(captured_layer_indices):
+        routes[:, :, slot, :] = 300 + layer_index
+    return routes
+
+
+def _run_replay_setup(monkeypatch, routes, captured_layer_indices, *, stage_range):
+    monkeypatch.setattr(replay_utils, "_get_current_pp_stage_layer_range", lambda model_config: stage_range)
+    monkeypatch.setattr(
+        replay_utils,
+        "scatter_router_padding_mask_for_model",
+        lambda mask, model, model_config: mask,
+    )
+    batch, seq_len = routes.shape[0], routes.shape[1]
+    attention_mask = torch.ones((batch, seq_len), dtype=torch.long)
+    router_padding_mask = torch.zeros((batch, seq_len), dtype=torch.bool)
+    layout = build_token_metadata_layout(attention_mask, routes.device, packed=False, fp8_enabled=False)
+    return replay_utils.setup_per_microbatch_replay_forward(
+        _pack_routes(routes, attention_mask),
+        captured_layer_indices,
+        router_padding_mask,
+        attention_mask,
+        model=object(),
+        model_config=SimpleNamespace(fp8=None, sequence_parallel=False),
+        metadata_layout=layout,
+    )
+
+
+def test_replay_maps_interleaved_hybrid_routers_by_carried_layer(monkeypatch, parallel_state):
+    """Nemotron-style alternating mamba/MoE stack: only the odd layers own a router.
+
+    The capture spans all 8 layers, so slot selection must follow each router's own layer
+    number. The tagged values catch a mapping that walks the routers positionally instead.
+    """
+    captured_layer_indices = tuple(range(8))
+    moe_layers = (1, 3, 5, 7)
+    router_replay = _install_router_replay(monkeypatch, [layer + 1 for layer in moe_layers])
+    routes = _routes_tagged_by_layer(captured_layer_indices)
+
+    _run_replay_setup(monkeypatch, routes, captured_layer_indices, stage_range=(0, 8))
+
+    assert len(router_replay.replay_data) == len(moe_layers)
+    for position, layer_index in enumerate(moe_layers):
+        assert torch.all(router_replay.replay_data[position] == 300 + layer_index)
+
+
+def test_replay_maps_an_all_moe_model_unchanged(monkeypatch, parallel_state):
+    """Every layer owns a router, so the mapping is the identity."""
+    captured_layer_indices = tuple(range(4))
+    router_replay = _install_router_replay(monkeypatch, [1, 2, 3, 4])
+    routes = _routes_tagged_by_layer(captured_layer_indices)
+
+    _run_replay_setup(monkeypatch, routes, captured_layer_indices, stage_range=(0, 4))
+
+    for slot, layer_index in enumerate(captured_layer_indices):
+        assert torch.all(router_replay.replay_data[slot] == 300 + layer_index)
+
+
+def test_replay_selects_a_pp_stage_whose_slots_are_not_zero_based(monkeypatch, parallel_state):
+    """A later PP stage's slots start partway into the captured layer dimension.
+
+    Routers for global layers 5 and 7 sit at slots 5 and 7, not at slots 0 and 1 nor at the
+    slots an offset walk over this stage's own router list would produce.
+    """
+    captured_layer_indices = tuple(range(8))
+    router_replay = _install_router_replay(monkeypatch, [6, 8])
+    routes = _routes_tagged_by_layer(captured_layer_indices)
+
+    _run_replay_setup(monkeypatch, routes, captured_layer_indices, stage_range=(4, 4))
+
+    assert len(router_replay.replay_data) == 2
+    assert torch.all(router_replay.replay_data[0] == 300 + 5)
+    assert torch.all(router_replay.replay_data[1] == 300 + 7)
+
+
+def test_replay_tolerates_a_captured_layer_that_owns_no_router(monkeypatch, parallel_state):
+    """DeepSeek V3's layer 0 is dense: captured, but never replayed."""
+    captured_layer_indices = tuple(range(4))
+    router_replay = _install_router_replay(monkeypatch, [2, 3, 4])
+    routes = _routes_tagged_by_layer(captured_layer_indices)
+
+    _run_replay_setup(monkeypatch, routes, captured_layer_indices, stage_range=(0, 4))
+
+    assert len(router_replay.replay_data) == 3
+    assert torch.all(router_replay.replay_data[0] == 300 + 1)
+
+
+def test_replay_raises_when_a_router_layer_was_not_captured(monkeypatch, parallel_state):
+    """A router whose layer the rollout never captured must fail, not borrow a neighbour."""
+    captured_layer_indices = tuple(range(4))
+    _install_router_replay(monkeypatch, [2, 6])
+    routes = _routes_tagged_by_layer(captured_layer_indices)
+
+    with pytest.raises(ValueError, match="has no captured rollout routes"):
+        _run_replay_setup(monkeypatch, routes, captured_layer_indices, stage_range=(0, 4))
+
+
+def test_replay_raises_when_the_capture_does_not_cover_this_pp_stage(monkeypatch, parallel_state):
+    """A stage running past the capture means the two stacks differ in depth.
+
+    Every local router here IS captured, so only the stage-level check catches it -- and it has
+    to, because the layer numbers those routers matched on came from a different model.
+    """
+    captured_layer_indices = tuple(range(4))
+    _install_router_replay(monkeypatch, [3, 4])
+    routes = _routes_tagged_by_layer(captured_layer_indices)
+
+    with pytest.raises(ValueError, match=r"captured no routes for layers \[4, 5\]"):
+        _run_replay_setup(monkeypatch, routes, captured_layer_indices, stage_range=(2, 4))
+
+
+@pytest.mark.parametrize("layer_numbers", [[None, None], [_UNPATCHED, _UNPATCHED]])
+def test_replay_raises_when_a_router_layer_number_is_unset(monkeypatch, parallel_state, layer_numbers):
+    """Without patch_topk_router_layer_number the mapping is unknowable; guessing is unsafe.
+
+    The patch injects ``layer_number``, so a router it never touched carries no such attribute
+    at all; both that and an explicit ``None`` have to name the missing patch.
+    """
+    captured_layer_indices = tuple(range(4))
+    _install_router_replay(monkeypatch, layer_numbers)
+    routes = _routes_tagged_by_layer(captured_layer_indices)
+
+    with pytest.raises(ValueError, match="no layer_number"):
+        _run_replay_setup(monkeypatch, routes, captured_layer_indices, stage_range=(0, 4))
+
+
+def test_replay_raises_on_layer_count_mismatch(monkeypatch, parallel_state):
+    """The carried list must describe every slot of the route tensor's layer dimension."""
+    _install_router_replay(monkeypatch, [2])
+    routes = _routes_tagged_by_layer((0, 1))
+
+    with pytest.raises(ValueError, match="captured layer indices were carried"):
+        _run_replay_setup(monkeypatch, routes, (1,), stage_range=(0, 2))
+
+
+def test_replay_raises_on_duplicate_captured_layers(monkeypatch, parallel_state):
+    _install_router_replay(monkeypatch, [2])
+    routes = _routes_tagged_by_layer((0, 1))
+
+    with pytest.raises(ValueError, match="duplicates"):
+        _run_replay_setup(monkeypatch, routes, (1, 1), stage_range=(0, 2))
 
 
 @pytest.mark.parametrize(

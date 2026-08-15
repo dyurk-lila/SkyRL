@@ -22,7 +22,7 @@ import pybase64
 
 from skyrl.backends.skyrl_train.utils.routed_experts import (
     ROUTED_EXPERT_DTYPES,
-    RoutedExpertIndices,
+    RoutedExpertRoutes,
     compact_routed_expert_indices,
 )
 from skyrl.backends.skyrl_train.utils.sample_support import (
@@ -48,6 +48,12 @@ class PackedField(StrEnum):
 
     ROUTED_EXPERTS = "routed_experts"
     ROLLOUT_SAMPLE_SUPPORT = "rollout_sample_support"
+
+
+class RoutedExpertsWireKey(StrEnum):
+    """Sidecar fields the routed-experts envelope carries beside ``PackedArrayKey``."""
+
+    LAYER_INDICES = "layer_indices"
 
 
 PACKED_SIDE_CHANNEL_FIELDS: tuple[str, ...] = tuple(PackedField)
@@ -176,19 +182,57 @@ def unpack_ndarray(
     return array, sidecar
 
 
-def pack_routed_experts(routed_experts: RoutedExpertIndices) -> dict[str, Any]:
-    compact = compact_routed_expert_indices(_to_host_array(routed_experts))
-    return pack_ndarray(compact, allowed_dtypes=ROUTED_EXPERT_DTYPES)
+def routes_from_capture(routed_experts: Any) -> RoutedExpertRoutes:
+    """Name the layers of one vLLM routed-expert capture.
+
+    vLLM sizes its capture buffer by ``num_hidden_layers`` and exposes no knob to restrict
+    which layers it writes, so a capture's layer dimension is the whole stack, in order.
+    """
+    return RoutedExpertRoutes.covering_all_layers(_to_host_array(routed_experts))
 
 
-def decode_packed_routed_experts(payload: dict[str, Any]) -> RoutedExpertIndices:
-    decoded, _ = unpack_ndarray(payload, allowed_dtypes=ROUTED_EXPERT_DTYPES, ndim=_ROUTED_EXPERTS_NDIM)
+def pack_routed_experts(routes: RoutedExpertRoutes) -> dict[str, Any]:
+    """Serialize routes plus the global transformer layer each captured layer came from.
+
+    The layer list rides as a sidecar field rather than its own envelope: it is one small int
+    per captured layer, and ``data`` has to stay first for the client's byte-offset splice.
+    """
+    compact = compact_routed_expert_indices(routes.indices)
+    return pack_ndarray(
+        compact,
+        allowed_dtypes=ROUTED_EXPERT_DTYPES,
+        # `.value` key: orjson rejects str subclasses as dict keys.
+        extra={RoutedExpertsWireKey.LAYER_INDICES.value: list(routes.layer_indices)},
+    )
+
+
+def decode_packed_routed_experts(payload: dict[str, Any]) -> RoutedExpertRoutes:
+    decoded, sidecar = unpack_ndarray(payload, allowed_dtypes=ROUTED_EXPERT_DTYPES, ndim=_ROUTED_EXPERTS_NDIM)
     compact = compact_routed_expert_indices(decoded)
     if compact.dtype != decoded.dtype:
         raise ValueError(
             f"packed routed_experts uses non-canonical dtype {decoded.dtype.name}; expected {compact.dtype.name}"
         )
-    return compact
+    return RoutedExpertRoutes(compact, _decode_layer_indices(sidecar))
+
+
+def _decode_layer_indices(sidecar: Mapping[str, Any]) -> tuple[int, ...]:
+    """Read the captured layer list off a packed routed-experts envelope.
+
+    A capture whose layer dimension the sender did not name is unusable: the trainer would
+    have to guess which model layer each slot holds, which is what carrying them prevents.
+    """
+    if RoutedExpertsWireKey.LAYER_INDICES not in sidecar:
+        raise ValueError(f"packed routed_experts carries no {RoutedExpertsWireKey.LAYER_INDICES}")
+    layer_indices = sidecar[RoutedExpertsWireKey.LAYER_INDICES]
+    # bool is a subclass of int, so it needs an explicit rejection.
+    if not isinstance(layer_indices, list) or any(
+        not isinstance(layer_index, int) or isinstance(layer_index, bool) for layer_index in layer_indices
+    ):
+        raise ValueError(
+            f"packed routed_experts {RoutedExpertsWireKey.LAYER_INDICES} must be a list of ints, got {layer_indices!r}"
+        )
+    return tuple(layer_indices)
 
 
 def pack_sample_support(sample_support: SampleSupport) -> dict[str, Any]:

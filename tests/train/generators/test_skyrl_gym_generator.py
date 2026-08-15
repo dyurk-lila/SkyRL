@@ -8,12 +8,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import numpy as np
 import pytest
 
+from skyrl.backends.skyrl_train.utils.replay_utils import replay_padding_row
+from skyrl.backends.skyrl_train.utils.routed_experts import RoutedExpertRoutes
 from skyrl.backends.skyrl_train.utils.sample_support import (
     SAMPLE_SUPPORT_DTYPE,
     SAMPLE_SUPPORT_PADDING,
     SampleSupportTrace,
 )
 from skyrl.train.config import ChatTemplateConfig, GeneratorConfig
+from skyrl.train.dataset.preprocess import convert_prompts_responses_to_batch_tensors
 from skyrl.train.generators.base import (
     TRAINING_PHASE_EVAL,
     TRAINING_PHASE_TRAIN,
@@ -28,6 +31,9 @@ from skyrl.train.generators.skyrl_gym_generator import (
     TurnOutput,
 )
 from skyrl_gym.envs.base_text_env import BaseTextEnv, BaseTextEnvStepOutput
+
+# Interleaved MoE layers, as a hybrid Mamba-MoE model reports them.
+MOE_LAYERS = (1, 3)
 
 # Mock constants, where 4 is the eos token id
 MOCK_LLM_OUTPUT_IDS = [1, 10, 12, 4]
@@ -460,14 +466,15 @@ async def test_agent_loop_uses_incremental_replay_metadata_traces(
         prompt_starts.append(prompt_start)
         output_ids = [10, 11]
         num_route_rows = len(prompt_tokens) - prompt_start + len(output_ids) - 1
-        routes = np.arange(num_route_rows * 4, dtype=np.int32).reshape(num_route_rows, 2, 2) % 8
+        indices = np.arange(num_route_rows * 4, dtype=np.int32).reshape(num_route_rows, 2, 2) % 8
         sample_support = np.array([[10, 100 + generation_index], [11, 110 + generation_index]], dtype=np.int32)
         generation_index += 1
         return {
             "responses": ["mocked output"],
             "response_ids": [output_ids],
             "stop_reasons": ["stop"],
-            "rollout_expert_indices": [routes],
+            # Interleaved MoE layers, as a hybrid Mamba-MoE model reports them.
+            "rollout_expert_indices": [RoutedExpertRoutes(indices, MOE_LAYERS)],
             "rollout_sample_support": [sample_support],
         }
 
@@ -489,6 +496,8 @@ async def test_agent_loop_uses_incremental_replay_metadata_traces(
     )
 
     assert prompt_starts == [0, 5]
+    assert output.rollout_expert_indices.layer_indices == MOE_LAYERS
+    assert output.rollout_expert_indices.indices.shape[1] == len(MOE_LAYERS)
     support = output.rollout_sample_support
     assert support.dtype == SAMPLE_SUPPORT_DTYPE
     np.testing.assert_array_equal(support[:2], np.array([[10, 100], [11, 110]], dtype=SAMPLE_SUPPORT_DTYPE))
@@ -679,7 +688,10 @@ async def test_generate_retains_routed_experts_only_for_the_train_phase(
             "response_ids": [[10, 11]] * num_prompts,
             "stop_reasons": ["stop"] * num_prompts,
             "rollout_expert_indices": [
-                np.arange((prompt_len + 1) * 4, dtype=np.int32).reshape(prompt_len + 1, 2, 2) % 8
+                RoutedExpertRoutes(
+                    np.arange((prompt_len + 1) * 4, dtype=np.int32).reshape(prompt_len + 1, 2, 2) % 8,
+                    (1, 3),
+                )
             ]
             * num_prompts,
         }
@@ -705,13 +717,11 @@ async def test_generate_retains_routed_experts_only_for_the_train_phase(
 
     if training_phase == TRAINING_PHASE_TRAIN:
         assert output["rollout_expert_indices"] is not None
-        assert output["rollout_expert_indices"][0] is not None
-        if not batched:
-            assert captured["routed_experts_prompt_starts"] == [0]
+        assert output["rollout_expert_indices"][0].layer_indices == (1, 3)
+        assert captured["routed_experts_prompt_starts"] == [0]
     else:
         assert output["rollout_expert_indices"] is None
-        if not batched:
-            assert captured["routed_experts_prompt_starts"] is None
+        assert captured["routed_experts_prompt_starts"] is None
 
 
 @pytest.mark.asyncio
@@ -887,6 +897,225 @@ async def test_generate_batched_metrics_use_truncated_responses(
     assert generator_output["response_ids"][0] == MOCK_LLM_OUTPUT_IDS[:2]
     assert generator_output["loss_masks"][0] == [1] * 2
     assert generator_output["rollout_metrics"]["generate/max_num_tokens"] == 2
+
+
+def _batched_route_generate(rows_per_prompt=None, routes_override=None):
+    """Build a batched-mode engine stub that records its input batch and returns R3 routes.
+
+    ``rows_per_prompt`` maps a prompt's token count to the number of route rows the engine
+    returns, defaulting to the full-sequence capture (one row per next-token prediction).
+    """
+    captured: Dict[str, Any] = {}
+
+    def generate(input_batch, model=None):
+        captured.update(input_batch)
+        prompt_token_ids = input_batch["prompt_token_ids"]
+        num_prompts = len(prompt_token_ids)
+        output = {
+            "responses": ["mocked output"] * num_prompts,
+            "stop_reasons": ["stop"] * num_prompts,
+            "response_ids": [MOCK_LLM_OUTPUT_IDS.copy() for _ in range(num_prompts)],
+        }
+        if routes_override is not None:
+            output.update(routes_override)
+            return output
+        routes = []
+        for prompt_tokens in prompt_token_ids:
+            num_rows = rows_per_prompt(len(prompt_tokens))
+            # uint8, as the wire decoder hands compacted routes to the generator.
+            indices = (np.arange(num_rows * len(MOE_LAYERS) * 2) % 8).astype(np.uint8)
+            routes.append(RoutedExpertRoutes(indices.reshape(num_rows, len(MOE_LAYERS), 2), MOE_LAYERS))
+        output["rollout_expert_indices"] = routes
+        return output
+
+    return captured, generate
+
+
+@pytest.mark.asyncio
+@patch("skyrl_gym.make")
+async def test_generate_batched_captures_routes_from_the_first_prompt_token(
+    mock_make, mock_tokenizer, mock_llm, mock_env, generator_cfg, mock_env_cfg
+):
+    """Batched generation must ask for a capture window starting at token 0 and hand the
+    collator rows that are already aligned to the packed sequence, not a prefix it has to
+    guess at."""
+    generator_cfg.batched = True
+    generator_cfg.inference_engine.enable_return_routed_experts = True
+    mock_make.return_value = mock_env
+    mock_env.init.return_value = ([{"role": "user", "content": "Initial input"}], {})
+    captured, generate = _batched_route_generate(
+        rows_per_prompt=lambda prompt_len: prompt_len + len(MOCK_LLM_OUTPUT_IDS) - 1
+    )
+    mock_llm.generate = AsyncMock(side_effect=generate)
+
+    generator = SkyRLGymGenerator(
+        generator_cfg=generator_cfg,
+        skyrl_gym_cfg=mock_env_cfg,
+        inference_engine_client=mock_llm,
+        tokenizer=mock_tokenizer,
+    )
+    generator.base_conversation_token_ids = []
+
+    prompts = [[{"role": "user", "content": "What is 3 + 5?"}], [{"role": "user", "content": "What is 2 + 2?"}]]
+    output = await generator.generate(
+        {
+            "prompts": prompts,
+            "env_extras": [{"answer": "8"}, {"answer": "4"}],
+            "env_classes": [mock_env_cfg.env_class for _ in prompts],
+        }
+    )
+
+    # The window is stated per request, so the row alignment never depends on the server's default.
+    assert captured["routed_experts_prompt_starts"] == [0, 0]
+
+    prompt_token_ids = output["prompt_token_ids"]
+    response_ids = output["response_ids"]
+    routes = output["rollout_expert_indices"]
+    assert len(routes) == len(prompts)
+    for sample_routes, prompt_tokens, response in zip(routes, prompt_token_ids, response_ids):
+        assert sample_routes.layer_indices == MOE_LAYERS
+        assert sample_routes.num_tokens == len(prompt_tokens) + len(response) - 1
+
+    # Consumer contract: the collator packs each trajectory's rows against prompt + response and
+    # dummy-fills only the final token, which predicts nothing.
+    *_, packed, layer_indices, _ = convert_prompts_responses_to_batch_tensors(
+        pad_token_id=0,
+        prompts=prompt_token_ids,
+        responses=response_ids,
+        rewards=[[0.0] * len(response) for response in response_ids],
+        loss_masks=output["loss_masks"],
+        rollout_expert_indices=routes,
+    )
+    assert layer_indices == MOE_LAYERS
+    for sample_index, (sample_routes, prompt_tokens, response) in enumerate(
+        zip(routes, prompt_token_ids, response_ids)
+    ):
+        segment = packed.segment(sample_index)
+        assert segment.shape[0] == len(prompt_tokens) + len(response)
+        np.testing.assert_array_equal(segment[:-1].numpy(), sample_routes.indices)
+        padding_row = replay_padding_row(segment.shape[-1], dtype=segment.dtype)
+        np.testing.assert_array_equal(
+            segment[-1].numpy(),
+            padding_row.expand(segment.shape[1], -1).numpy(),
+        )
+
+
+@pytest.mark.asyncio
+@patch("skyrl_gym.make")
+async def test_generate_batched_rejects_a_misaligned_route_capture(
+    mock_make, mock_tokenizer, mock_llm, mock_env, generator_cfg, mock_env_cfg
+):
+    """A window that opened one token late returns one row short. The collator would accept it
+    as a left-aligned prefix and dummy-pad the shortfall, so the generator has to reject it."""
+    generator_cfg.batched = True
+    generator_cfg.inference_engine.enable_return_routed_experts = True
+    mock_make.return_value = mock_env
+    mock_env.init.return_value = ([{"role": "user", "content": "Initial input"}], {})
+    _, generate = _batched_route_generate(rows_per_prompt=lambda prompt_len: prompt_len + len(MOCK_LLM_OUTPUT_IDS) - 2)
+    mock_llm.generate = AsyncMock(side_effect=generate)
+
+    generator = SkyRLGymGenerator(
+        generator_cfg=generator_cfg,
+        skyrl_gym_cfg=mock_env_cfg,
+        inference_engine_client=mock_llm,
+        tokenizer=mock_tokenizer,
+    )
+    generator.base_conversation_token_ids = []
+
+    with pytest.raises(ValueError, match="routed-expert rows"):
+        await generator.generate(
+            {
+                "prompts": [[{"role": "user", "content": "What is 3 + 5?"}]],
+                "env_extras": [{"answer": "8"}],
+                "env_classes": [mock_env_cfg.env_class],
+            }
+        )
+
+
+@pytest.mark.asyncio
+@patch("skyrl_gym.make")
+async def test_generate_batched_truncates_routes_to_the_trained_response(
+    mock_make, mock_tokenizer, mock_llm, mock_env, generator_cfg, mock_env_cfg
+):
+    """The engine captures the response it generated, which max_generate_length then cuts down.
+    The row count is checked against the generated response and the rows are cut to the trained
+    one, whose final token does have a captured route."""
+    generator_cfg.batched = True
+    generator_cfg.inference_engine.enable_return_routed_experts = True
+    generator_cfg.sampling_params.max_generate_length = 2  # < len(MOCK_LLM_OUTPUT_IDS) == 4
+    mock_make.return_value = mock_env
+    mock_env.init.return_value = ([{"role": "user", "content": "Initial input"}], {})
+    _, generate = _batched_route_generate(rows_per_prompt=lambda prompt_len: prompt_len + len(MOCK_LLM_OUTPUT_IDS) - 1)
+    mock_llm.generate = AsyncMock(side_effect=generate)
+
+    generator = SkyRLGymGenerator(
+        generator_cfg=generator_cfg,
+        skyrl_gym_cfg=mock_env_cfg,
+        inference_engine_client=mock_llm,
+        tokenizer=mock_tokenizer,
+    )
+    generator.base_conversation_token_ids = []
+
+    output = await generator.generate(
+        {
+            "prompts": [[{"role": "user", "content": "What is 3 + 5?"}]],
+            "env_extras": [{"answer": "8"}],
+            "env_classes": [mock_env_cfg.env_class],
+        }
+    )
+
+    prompt_tokens = output["prompt_token_ids"][0]
+    response = output["response_ids"][0]
+    assert response == MOCK_LLM_OUTPUT_IDS[:2]
+    routes = output["rollout_expert_indices"][0]
+    assert routes.num_tokens == len(prompt_tokens) + len(response)
+
+    # Consumer contract: every token of the trained sequence carries a captured route, so the
+    # collator writes the segment with no dummy tail at all.
+    *_, packed, _, _ = convert_prompts_responses_to_batch_tensors(
+        pad_token_id=0,
+        prompts=[prompt_tokens],
+        responses=[response],
+        rewards=[[0.0] * len(response)],
+        loss_masks=output["loss_masks"],
+        rollout_expert_indices=output["rollout_expert_indices"],
+    )
+    segment = packed.segment(0)
+    assert segment.shape[0] == len(prompt_tokens) + len(response)
+    np.testing.assert_array_equal(segment.numpy(), routes.indices)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("routes_override", [{}, {"rollout_expert_indices": [None]}])
+@patch("skyrl_gym.make")
+async def test_generate_batched_requires_routes_when_capture_is_enabled(
+    mock_make, mock_tokenizer, mock_llm, mock_env, generator_cfg, mock_env_cfg, routes_override
+):
+    """An engine that silently drops the side channel must fail the step, not train on a
+    batch with no routes."""
+    generator_cfg.batched = True
+    generator_cfg.inference_engine.enable_return_routed_experts = True
+    mock_make.return_value = mock_env
+    mock_env.init.return_value = ([{"role": "user", "content": "Initial input"}], {})
+    _, generate = _batched_route_generate(routes_override=routes_override)
+    mock_llm.generate = AsyncMock(side_effect=generate)
+
+    generator = SkyRLGymGenerator(
+        generator_cfg=generator_cfg,
+        skyrl_gym_cfg=mock_env_cfg,
+        inference_engine_client=mock_llm,
+        tokenizer=mock_tokenizer,
+    )
+    generator.base_conversation_token_ids = []
+
+    with pytest.raises(ValueError, match="did not return routed expert indices"):
+        await generator.generate(
+            {
+                "prompts": [[{"role": "user", "content": "What is 3 + 5?"}]],
+                "env_extras": [{"answer": "8"}],
+                "env_classes": [mock_env_cfg.env_class],
+            }
+        )
 
 
 @pytest.mark.asyncio

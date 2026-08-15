@@ -10,7 +10,10 @@ import numpy as np
 import pytest
 import torch
 
-from skyrl.backends.skyrl_train.utils.routed_experts import ROUTED_EXPERT_DTYPES
+from skyrl.backends.skyrl_train.utils.routed_experts import (
+    ROUTED_EXPERT_DTYPES,
+    RoutedExpertRoutes,
+)
 from skyrl.backends.skyrl_train.utils.sample_support import (
     SAMPLE_SUPPORT_DTYPE,
     SAMPLE_SUPPORT_PADDING,
@@ -22,6 +25,17 @@ from skyrl.train.dataset.preprocess import (
     convert_prompts_responses_to_batch_tensors,
     make_router_padding_mask,
 )
+
+
+def routes_for(indices, layer_indices=None) -> RoutedExpertRoutes:
+    """Pair one trajectory's route values with the layers they were captured from."""
+    if layer_indices is None:
+        return RoutedExpertRoutes.covering_all_layers(indices)
+    return RoutedExpertRoutes(indices, layer_indices)
+
+
+def routes_batch(indices_list, layer_indices=None) -> List[RoutedExpertRoutes]:
+    return [routes_for(indices, layer_indices) for indices in indices_list]
 
 
 # NOTE (sumanthrh): the tests in this file are hardcoded to use the below character-level tokenizer
@@ -95,13 +109,13 @@ def test_routed_expert_tensor_uses_unique_dummy_routes(tokenizer):
         ),
     ]
 
-    *_, routed, _ = convert_prompts_responses_to_batch_tensors(
+    *_, routed, _, _ = convert_prompts_responses_to_batch_tensors(
         tokenizer.pad_token_id,
         prompts=[[10], [20]],
         responses=[[11, 12], [21, 22]],
         rewards=[[0.0, 0.0], [0.0, 0.0]],
         loss_masks=[[1, 1], [1, 1]],
-        rollout_expert_indices=routes,
+        rollout_expert_indices=routes_batch(routes),
     )
 
     assert routed.values.shape == (6, 2, 2)
@@ -125,13 +139,13 @@ def test_routed_expert_tensor_promotes_mixed_batch_dtype(
         np.asarray([[[max_expert_id, max_expert_id + 1]]], dtype=source_dtype),
     ]
 
-    *_, routed, _ = convert_prompts_responses_to_batch_tensors(
+    *_, routed, _, _ = convert_prompts_responses_to_batch_tensors(
         tokenizer.pad_token_id,
         prompts=[[10], [20]],
         responses=[[11], [21]],
         rewards=[[0.0], [0.0]],
         loss_masks=[[1], [1]],
-        rollout_expert_indices=routes,
+        rollout_expert_indices=routes_batch(routes),
     )
 
     assert routed.dtype == expected_dtype
@@ -142,28 +156,29 @@ def test_routed_expert_tensor_accepts_read_only_arrays(tokenizer):
     routes = np.asarray([[[1, 2]], [[3, 4]]], dtype=np.uint8)
     routes.flags.writeable = False
 
-    *_, routed, _ = convert_prompts_responses_to_batch_tensors(
+    *_, routed, _, _ = convert_prompts_responses_to_batch_tensors(
         tokenizer.pad_token_id,
         prompts=[[10]],
         responses=[[11]],
         rewards=[[0.0]],
         loss_masks=[[1]],
-        rollout_expert_indices=[routes],
+        rollout_expert_indices=[routes_for(routes)],
     )
 
     assert routed.dtype == torch.uint8
     assert routed.segment(0).tolist() == [[[1, 2]], [[3, 4]]]
 
 
-def test_routed_expert_tensor_rejects_nested_lists(tokenizer):
-    with pytest.raises(TypeError, match="NumPy arrays"):
+def test_routed_expert_tensor_rejects_bare_arrays(tokenizer):
+    """Routes must arrive paired with their layers; a bare array names no layers at all."""
+    with pytest.raises(TypeError, match="RoutedExpertRoutes"):
         convert_prompts_responses_to_batch_tensors(
             tokenizer.pad_token_id,
             prompts=[[10]],
             responses=[[11]],
             rewards=[[0.0]],
             loss_masks=[[1]],
-            rollout_expert_indices=[[[[1, 2]], [[3, 4]]]],
+            rollout_expert_indices=[np.asarray([[[1, 2]], [[3, 4]]], dtype=np.uint8)],
         )
 
 
@@ -173,13 +188,13 @@ def test_routed_expert_tensor_accepts_non_contiguous_arrays(tokenizer):
     routes = base[:, :, ::2]
     assert not routes.flags.c_contiguous
 
-    *_, routed, _ = convert_prompts_responses_to_batch_tensors(
+    *_, routed, _, _ = convert_prompts_responses_to_batch_tensors(
         tokenizer.pad_token_id,
         prompts=[[10]],
         responses=[[11]],
         rewards=[[0.0]],
         loss_masks=[[1]],
-        rollout_expert_indices=[routes],
+        rollout_expert_indices=[routes_for(routes)],
     )
 
     assert routed.dtype == torch.uint8
@@ -198,7 +213,7 @@ def test_routed_expert_tensor_rejects_non_canonical_dtypes(tokenizer, dtype):
             responses=[[11]],
             rewards=[[0.0]],
             loss_masks=[[1]],
-            rollout_expert_indices=[routes],
+            rollout_expert_indices=[routes_for(routes)],
         )
 
 
@@ -206,13 +221,13 @@ def test_routed_expert_tensor_keeps_the_sender_dtype_after_truncation(tokenizer)
     # The dropped trailing value required int16 on the sender.
     routes = np.asarray([[[1, 2]], [[3, 4]], [[300, 5]]], dtype=np.int16)
 
-    *_, routed, _ = convert_prompts_responses_to_batch_tensors(
+    *_, routed, _, _ = convert_prompts_responses_to_batch_tensors(
         tokenizer.pad_token_id,
         prompts=[[10]],
         responses=[[11]],
         rewards=[[0.0]],
         loss_masks=[[1]],
-        rollout_expert_indices=[routes[:2]],
+        rollout_expert_indices=[routes_for(routes[:2])],
     )
 
     assert routed.dtype == torch.int16
@@ -227,13 +242,13 @@ def test_routed_expert_tensor_warns_only_on_an_int32_batch(tokenizer, caplog, dt
     routes = np.asarray([[[expert_id, expert_id + 1]]], dtype=dtype)
 
     with caplog.at_level(logging.WARNING, logger="skyrl.train.dataset.preprocess"):
-        *_, routed, _ = convert_prompts_responses_to_batch_tensors(
+        *_, routed, _, _ = convert_prompts_responses_to_batch_tensors(
             tokenizer.pad_token_id,
             prompts=[[10]],
             responses=[[11]],
             rewards=[[0.0]],
             loss_masks=[[1]],
-            rollout_expert_indices=[routes],
+            rollout_expert_indices=[routes_for(routes)],
         )
 
     assert routed.dtype == ROUTED_EXPERT_TORCH_DTYPES[np.dtype(dtype)]
@@ -272,13 +287,13 @@ def test_routed_expert_tensor_is_bit_identical_to_numpy_collation(tokenizer):
         (np.arange(6 * num_layers * topk, dtype=np.int16) + 300).reshape(6, num_layers, topk),
     ]
 
-    *_, routed, _ = convert_prompts_responses_to_batch_tensors(
+    *_, routed, _, _ = convert_prompts_responses_to_batch_tensors(
         tokenizer.pad_token_id,
         prompts,
         responses,
         rewards=[[0.0] * 3, [0.0] * 2],
         loss_masks=[[1] * 3, [1] * 2],
-        rollout_expert_indices=routes,
+        rollout_expert_indices=routes_batch(routes),
     )
 
     padded = _numpy_padded_routes(routes, prompts, responses)
@@ -315,7 +330,7 @@ def test_convert_prompts_responses_to_batch_tensors_exact(tokenizer):
     loss_masks = [[1, 1, 0], [1, 1, 1, 0, 0]]
     rewards = [torch.tensor([0, 1, 0]), torch.tensor([1, 0, 0, 0, 0])]
 
-    sequences, attention_mask, response_mask, ret_rewards, ret_loss_masks, ret_log_probs, _, _ = (
+    sequences, attention_mask, response_mask, ret_rewards, ret_loss_masks, ret_log_probs, _, _, _ = (
         convert_prompts_responses_to_batch_tensors(
             tokenizer.pad_token_id,
             prompts,
@@ -351,7 +366,7 @@ def test_convert_prompts_responses_to_batch_tensors_different_lengths(tokenizer)
     rewards = [torch.tensor([1.0, 0.5, 0.3]), torch.tensor([0.8])]
     loss_masks = [[1, 1, 1], [1]]
 
-    sequences, attention_mask, response_mask, ret_rewards, ret_loss_masks, ret_log_probs, _, _ = (
+    sequences, attention_mask, response_mask, ret_rewards, ret_loss_masks, ret_log_probs, _, _, _ = (
         convert_prompts_responses_to_batch_tensors(
             tokenizer.pad_token_id,
             prompts,
@@ -432,7 +447,7 @@ def test_unified_left_padding_layout(tokenizer):
     rewards = [[0.0] * 3, [0.0] * 2]
     loss_masks = [[1] * 3, [1] * 2]
 
-    seq, attn, action, rew, lm, _, _, _ = convert_prompts_responses_to_batch_tensors(
+    seq, attn, action, rew, lm, _, _, _, _ = convert_prompts_responses_to_batch_tensors(
         tokenizer.pad_token_id,
         prompts,
         responses,
@@ -462,7 +477,7 @@ def test_right_aligned_response_data(tokenizer):
     prompts_copy = [p[:] for p in prompts]
     responses_copy = [r[:] for r in responses]
 
-    seq, attn, action, rew, lm, lp, _, _ = convert_prompts_responses_to_batch_tensors(
+    seq, attn, action, rew, lm, lp, _, _, _ = convert_prompts_responses_to_batch_tensors(
         tokenizer.pad_token_id,
         prompts,
         responses,
@@ -497,7 +512,7 @@ def test_max_seq_len_warns_but_does_not_truncate(tokenizer):
     rewards = [[0.0] * 10, [0.0] * 50]
     loss_masks = [[1] * 10, [1] * 50]
 
-    seq, _, action, _, _, _, _, _ = convert_prompts_responses_to_batch_tensors(
+    seq, _, action, _, _, _, _, _, _ = convert_prompts_responses_to_batch_tensors(
         tokenizer.pad_token_id,
         prompts,
         responses,
@@ -523,13 +538,13 @@ def test_rollout_expert_indices_shape_padding_and_alignment(tokenizer):
     rei_0 = np.asarray([[[1, 2]] * num_layers for _ in range(5)], dtype=np.uint8)
     rei_1 = np.asarray([[[3, 4]] * num_layers for _ in range(6)], dtype=np.uint8)
 
-    seq, attn, action, rew, lm, lp, rei_tensor, _ = convert_prompts_responses_to_batch_tensors(
+    seq, attn, action, rew, lm, lp, rei_tensor, rei_layer_indices, _ = convert_prompts_responses_to_batch_tensors(
         tokenizer.pad_token_id,
         prompts,
         responses,
         rewards,
         loss_masks,
-        rollout_expert_indices=[rei_0, rei_1],
+        rollout_expert_indices=[routes_for(rei_0), routes_for(rei_1)],
     )
 
     assert rei_tensor is not None
@@ -538,6 +553,7 @@ def test_rollout_expert_indices_shape_padding_and_alignment(tokenizer):
     assert rei_tensor.sequence_lengths.tolist() == attn.sum(dim=1).tolist()
     assert rei_tensor.segment(0).tolist() == [[[1, 2]] * num_layers] * 5
     assert rei_tensor.segment(1).tolist() == [[[3, 4]] * num_layers] * 6
+    assert rei_layer_indices == (0, 1)
 
 
 def test_rollout_expert_indices_none_when_not_provided(tokenizer):
@@ -547,7 +563,7 @@ def test_rollout_expert_indices_none_when_not_provided(tokenizer):
     rewards = [[0.0], [0.0]]
     loss_masks = [[1], [1]]
 
-    *_, rei_tensor, _ = convert_prompts_responses_to_batch_tensors(
+    *_, rei_tensor, rei_layer_indices, _ = convert_prompts_responses_to_batch_tensors(
         tokenizer.pad_token_id,
         prompts,
         responses,
@@ -555,6 +571,7 @@ def test_rollout_expert_indices_none_when_not_provided(tokenizer):
         loss_masks,
     )
     assert rei_tensor is None
+    assert rei_layer_indices is None
 
 
 def test_stepwise_anti_correlation_no_inflation(tokenizer):
@@ -567,7 +584,7 @@ def test_stepwise_anti_correlation_no_inflation(tokenizer):
     rewards = [[0.0] * 90, [0.0] * 10]
     loss_masks = [[1] * 90, [1] * 10]
 
-    seq, attn, action, rew, lm, _, _, _ = convert_prompts_responses_to_batch_tensors(
+    seq, attn, action, rew, lm, _, _, _, _ = convert_prompts_responses_to_batch_tensors(
         tokenizer.pad_token_id,
         prompts,
         responses,
@@ -701,3 +718,38 @@ def test_sample_support_none_when_not_provided(tokenizer):
         loss_masks=[[1]],
     )
     assert packed is None
+def test_routed_expert_tensor_carries_interleaved_layer_indices(tokenizer):
+    moe_layers = (1, 3)
+    routes = [
+        routes_for(np.asarray([[[1, 2]] * 2] * 3, dtype=np.uint8), moe_layers),
+        routes_for(np.asarray([[[3, 4]] * 2] * 3, dtype=np.uint8), moe_layers),
+    ]
+
+    *_, routed, layer_indices, _ = convert_prompts_responses_to_batch_tensors(
+        tokenizer.pad_token_id,
+        prompts=[[10], [20]],
+        responses=[[11, 12], [21, 22]],
+        rewards=[[0.0, 0.0], [0.0, 0.0]],
+        loss_masks=[[1, 1], [1, 1]],
+        rollout_expert_indices=routes,
+    )
+
+    assert routed.values.shape[1] == len(moe_layers)
+    assert layer_indices == moe_layers
+
+
+def test_routed_expert_tensor_rejects_disagreeing_layer_indices(tokenizer):
+    routes = [
+        routes_for(np.asarray([[[1, 2]]] * 3, dtype=np.uint8), (1,)),
+        routes_for(np.asarray([[[5, 6]]] * 3, dtype=np.uint8), (3,)),
+    ]
+
+    with pytest.raises(ValueError, match="captured MoE layers"):
+        convert_prompts_responses_to_batch_tensors(
+            tokenizer.pad_token_id,
+            prompts=[[10], [20]],
+            responses=[[11, 12], [21, 22]],
+            rewards=[[0.0, 0.0], [0.0, 0.0]],
+            loss_masks=[[1, 1], [1, 1]],
+            rollout_expert_indices=routes,
+        )

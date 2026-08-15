@@ -13,7 +13,7 @@ from skyrl.backends.skyrl_train.utils.packed_tensor import (
 from skyrl.backends.skyrl_train.utils.replay_utils import replay_padding_row
 from skyrl.backends.skyrl_train.utils.routed_experts import (
     ROUTED_EXPERT_DTYPES,
-    RoutedExpertIndices,
+    RoutedExpertRoutes,
 )
 from skyrl.backends.skyrl_train.utils.sample_support import (
     SAMPLE_SUPPORT_DTYPES,
@@ -108,11 +108,11 @@ def _reward_to_numpy(custom_reward: Union[List[float], torch.Tensor]) -> np.ndar
 def _fill_routed_expert_segment(
     packed: torch.Tensor,
     cu_seqlens: torch.Tensor,
-    rollout_expert_indices: List[RoutedExpertIndices],
+    rollout_expert_indices: List[RoutedExpertRoutes],
     sample_index: int,
 ) -> None:
     """Write one route segment, using distinct dummy routes for uncaptured trailing tokens."""
-    sample_indices = rollout_expert_indices[sample_index]
+    sample_indices = rollout_expert_indices[sample_index].indices
     flags = sample_indices.flags
     # torch.from_numpy refuses a non-writeable buffer, and decoded wire routes may be read-only.
     if not flags.c_contiguous or not flags.writeable:
@@ -124,39 +124,50 @@ def _fill_routed_expert_segment(
 
 
 def _collate_rollout_expert_indices(
-    rollout_expert_indices: List[RoutedExpertIndices],
+    rollout_expert_indices: List[RoutedExpertRoutes],
     total_real: np.ndarray,
-) -> PackedTensor:
+) -> Tuple[PackedTensor, Tuple[int, ...]]:
     """Pack per-trajectory routes into one ``[sum(seq_len_i), layers, topk]`` buffer.
 
     Entries already have a canonical dtype and are filled from the trainer's local thread pool.
+    Returns the buffer and the captured MoE layer indices every trajectory agreed on, which name
+    the layer dimension of that buffer for the trainer.
     """
     num_samples = len(rollout_expert_indices)
-    for sample_index, sample_indices in enumerate(rollout_expert_indices):
-        if not isinstance(sample_indices, np.ndarray):
+    for sample_index, sample_routes in enumerate(rollout_expert_indices):
+        if not isinstance(sample_routes, RoutedExpertRoutes):
             raise TypeError(
-                f"rollout_expert_indices entries must be NumPy arrays, got {type(sample_indices).__name__} "
-                f"at sample {sample_index}"
+                f"rollout_expert_indices entries must be {RoutedExpertRoutes.__name__}, got "
+                f"{type(sample_routes).__name__} at sample {sample_index}"
             )
-        if sample_indices.dtype not in ROUTED_EXPERT_DTYPES:
+        if sample_routes.indices.dtype not in ROUTED_EXPERT_DTYPES:
             supported = ", ".join(
                 dtype.name for dtype in sorted(ROUTED_EXPERT_DTYPES, key=lambda dtype: dtype.itemsize)
             )
             raise ValueError(
                 f"rollout_expert_indices entries must use a canonical routed-expert dtype ({supported}), "
-                f"got {sample_indices.dtype} at sample {sample_index}"
+                f"got {sample_routes.indices.dtype} at sample {sample_index}"
             )
 
-    first_shape = rollout_expert_indices[0].shape
-    if len(first_shape) != 3 or first_shape[0] == 0:
+    layer_indices = rollout_expert_indices[0].layer_indices
+    first_shape = rollout_expert_indices[0].indices.shape
+    if first_shape[0] == 0:
         raise ValueError("rollout_expert_indices must contain routes for every trajectory")
     num_layers, topk = first_shape[1:]
     if topk < 1:
         raise ValueError("rollout_expert_indices must contain at least one expert per layer")
 
     # Validate serially so an invalid trajectory raises deterministically rather than from a worker.
-    for sample_index, sample_indices in enumerate(rollout_expert_indices):
-        if sample_indices.ndim != 3 or sample_indices.shape[1:] != (num_layers, topk):
+    for sample_index, sample_routes in enumerate(rollout_expert_indices):
+        sample_indices = sample_routes.indices
+        # One collated buffer has one layer dimension, so a batch whose trajectories captured
+        # different MoE layers cannot be described by a single layer list.
+        if sample_routes.layer_indices != layer_indices:
+            raise ValueError(
+                f"Trajectory {sample_index} captured MoE layers {sample_routes.layer_indices}, "
+                f"but the batch captured {layer_indices}"
+            )
+        if sample_indices.shape[1:] != (num_layers, topk):
             raise ValueError(
                 "rollout_expert_indices entries must share [layers, topk], "
                 f"got shape {sample_indices.shape} at sample {sample_index}"
@@ -167,7 +178,7 @@ def _collate_rollout_expert_indices(
                 f"Trajectory {sample_index} has {sample_indices.shape[0]} route rows for {available} tokens"
             )
 
-    batch_dtype = max((indices.dtype for indices in rollout_expert_indices), key=lambda dtype: dtype.itemsize)
+    batch_dtype = max((routes.indices.dtype for routes in rollout_expert_indices), key=lambda dtype: dtype.itemsize)
     if batch_dtype == np.dtype(np.int32):
         logger.warning(
             "Collating rollout_expert_indices as int32, which doubles this buffer. No supported expert count "
@@ -182,7 +193,7 @@ def _collate_rollout_expert_indices(
         functools.partial(_fill_routed_expert_segment, packed, cu_seqlens, rollout_expert_indices),
         num_samples,
     )
-    return PackedTensor(packed, cu_seqlens)
+    return PackedTensor(packed, cu_seqlens), layer_indices
 
 
 def _fill_sample_support_segment(
@@ -254,7 +265,7 @@ def convert_prompts_responses_to_batch_tensors(
     rewards: List[Union[List[float], torch.Tensor]],
     loss_masks: List[List[int]],
     logprobs: Optional[List[List[float]]] = None,
-    rollout_expert_indices: Optional[List[RoutedExpertIndices]] = None,
+    rollout_expert_indices: Optional[List[RoutedExpertRoutes]] = None,
     rollout_sample_support: Optional[List[SampleSupport]] = None,
     max_seq_len: Optional[int] = None,
 ) -> Tuple[
@@ -265,6 +276,7 @@ def convert_prompts_responses_to_batch_tensors(
     Float[torch.Tensor, "batch response_len"],
     Optional[Float[torch.Tensor, "batch response_len"]],
     Optional[PackedTensor],
+    Optional[Tuple[int, ...]],
     Optional[PackedTensor],
 ]:
     """
@@ -312,6 +324,8 @@ def convert_prompts_responses_to_batch_tensors(
         rewards: List of rewards for each response (lists or 1D tensors)
         loss_masks: List of loss masks for each response
         logprobs: List of rollout log probs for each response
+        rollout_expert_indices: Per-trajectory R3 routes. Every entry must cover the same MoE
+            layers, since one collated buffer has one layer dimension.
         max_seq_len: Optional. If provided and ``max(prompt_i + response_i)``
             exceeds it, a warning is logged (no truncation is performed).
 
@@ -323,8 +337,10 @@ def convert_prompts_responses_to_batch_tensors(
         loss_masks: ``(batch, max_response)`` — right-aligned.
         logprobs: ``(batch, max_response)`` — right-aligned, or ``None``.
         rollout_expert_indices: ``PackedTensor`` whose values are
-            ``(sum(prompt_i + response_i), layers, topk)`` in canonical batch order, with
+            ``(sum(prompt_i + response_i), moe_layers, topk)`` in canonical batch order, with
             ``cu_seqlens`` naming each trajectory's segment, or ``None``.
+        rollout_expert_layer_indices: The global transformer-layer index of every slot in the
+            layer dimension above, or ``None``.
         rollout_sample_support: ``PackedTensor`` whose values are
             ``(sum(response_i), top_k)`` in canonical batch order, with ``cu_seqlens`` naming
             each trajectory's segment, or ``None``.
@@ -396,14 +412,17 @@ def convert_prompts_responses_to_batch_tensors(
         logprobs_tensor = torch.from_numpy(logprobs_np)
 
     rollout_expert_indices_tensor = None
+    rollout_expert_layer_indices = None
     if rollout_expert_indices is not None:
         num_samples = len(prompts)
         if not isinstance(rollout_expert_indices, list):
-            raise TypeError("rollout_expert_indices must be a list of NumPy arrays")
+            raise TypeError(f"rollout_expert_indices must be a list of {RoutedExpertRoutes.__name__}")
         if len(rollout_expert_indices) != num_samples:
             raise ValueError("rollout_expert_indices must contain routes for every trajectory")
 
-        rollout_expert_indices_tensor = _collate_rollout_expert_indices(rollout_expert_indices, total_real)
+        rollout_expert_indices_tensor, rollout_expert_layer_indices = _collate_rollout_expert_indices(
+            rollout_expert_indices, total_real
+        )
 
     sample_support_tensor = None
     if rollout_sample_support is not None:
@@ -422,6 +441,7 @@ def convert_prompts_responses_to_batch_tensors(
         ret_loss_masks,
         logprobs_tensor,
         rollout_expert_indices_tensor,
+        rollout_expert_layer_indices,
         sample_support_tensor,
     )
 

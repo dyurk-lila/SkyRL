@@ -25,7 +25,7 @@ from skyrl.backends.skyrl_train.inference_servers.base import (
     InferenceEngineInterface,
 )
 from skyrl.backends.skyrl_train.utils.routed_experts import (
-    RoutedExpertIndices,
+    RoutedExpertRoutes,
     RoutedExpertTrace,
 )
 from skyrl.backends.skyrl_train.utils.sample_support import (
@@ -64,7 +64,7 @@ class TrajectoryOutput:
     prompt_ids: List[int]
     rollout_logprobs: Optional[List[float]]
     env_metrics: Dict[str, Any]
-    rollout_expert_indices: Optional[RoutedExpertIndices] = None
+    rollout_expert_indices: Optional[RoutedExpertRoutes] = None
     rollout_sample_support: Optional[SampleSupport] = None
     pixel_values: Optional[torch.Tensor] = None
     image_grid_thw: Optional[torch.Tensor] = None
@@ -898,6 +898,10 @@ class SkyRLGymGenerator(GeneratorInterface):
         engine_input = InferenceEngineInput(
             prompt_token_ids=prompt_token_ids,
             sampling_params=sampling_params,
+            # Single-turn generation wants routes for the whole sequence, so the capture window
+            # opens at the first prompt token. Stated per request rather than left to the
+            # inference server's default, which would decide the alignment of every row below.
+            routed_experts_prompt_starts=[0] * len(prompt_token_ids) if capture_routed_experts else None,
             return_sample_support=capture_sample_support,
             cache_salt=cache_salt,
         )
@@ -910,13 +914,15 @@ class SkyRLGymGenerator(GeneratorInterface):
             engine_output.get("rollout_expert_indices", None) if capture_routed_experts else None
         )
         raw_rollout_sample_support = engine_output.get("rollout_sample_support", None)
+        if capture_routed_experts and raw_rollout_expert_indices is None:
+            raise ValueError("R3 generation did not return routed expert indices")
 
         truncated_responses = []
         rewards = []
         loss_masks = []
         env_metrics = []
         truncated_logprobs: Optional[List[List[float]]] = [] if logprobs is not None else None
-        truncated_indices: Optional[List[RoutedExpertIndices]] = [] if raw_rollout_expert_indices is not None else None
+        truncated_indices: Optional[List[RoutedExpertRoutes]] = [] if raw_rollout_expert_indices is not None else None
         truncated_sample_support: Optional[List[SampleSupport]] = [] if raw_rollout_sample_support is not None else None
 
         for i, (output, response, env, env_class) in enumerate(zip(outputs, responses, envs, env_classes)):
@@ -933,9 +939,24 @@ class SkyRLGymGenerator(GeneratorInterface):
                 sample_logprobs = logprobs[i][: len(response)]
                 truncated_logprobs.append(sample_logprobs)
             if raw_rollout_expert_indices is not None:
-                sample_indices = raw_rollout_expert_indices[i]
+                sample_routes = raw_rollout_expert_indices[i]
+                if sample_routes is None:
+                    raise ValueError(f"R3 generation did not return routed expert indices for trajectory {i}")
                 prompt_len = len(prompt_token_ids[i])
-                truncated_indices.append(sample_indices[: prompt_len + len(response)])
+                # The engine captured the untruncated generation, so the row count is checked
+                # against that. One row per next-token prediction over prompt + generation, so the
+                # last generated token predicts nothing and carries no row. A different count means
+                # the window did not open at the first prompt token, and every row below would be
+                # reinterpreted as a left-aligned prefix by the collator.
+                generated_token_count = len(responses[i])
+                expected_rows = prompt_len + generated_token_count - 1
+                if sample_routes.num_tokens != expected_rows:
+                    raise ValueError(
+                        f"Trajectory {i} has {sample_routes.num_tokens} routed-expert rows for a "
+                        f"{prompt_len}-token prompt and {generated_token_count} generated tokens, "
+                        f"expected {expected_rows}"
+                    )
+                truncated_indices.append(sample_routes.truncate(prompt_len + len(response)))
             if raw_rollout_sample_support is not None:
                 truncated_sample_support.append(raw_rollout_sample_support[i][: len(response)])
 

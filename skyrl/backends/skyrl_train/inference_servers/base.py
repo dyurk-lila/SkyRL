@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, Hashable, List, Optional, Tuple, TypedDict
 
-from skyrl.backends.skyrl_train.utils.routed_experts import RoutedExpertIndices
+from skyrl.backends.skyrl_train.utils.routed_experts import RoutedExpertRoutes
 from skyrl.backends.skyrl_train.utils.sample_support import SampleSupport
 
 if TYPE_CHECKING:
@@ -53,7 +53,7 @@ class InferenceEngineOutput(TypedDict):
     stop_reasons: List[str]
     response_logprobs: Optional[List[List[float]]]
     prompt_logprobs: Optional[List[List[float]]]  # per-prompt-token logprobs under the current model
-    rollout_expert_indices: Optional[List[RoutedExpertIndices]]
+    rollout_expert_indices: Optional[List[RoutedExpertRoutes]]
     # One ``[generated_tokens, top_k]`` int32 support array per prompt.
     rollout_sample_support: Optional[List[SampleSupport]]
 

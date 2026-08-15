@@ -39,10 +39,13 @@ from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import
 from skyrl.backends.skyrl_train.inference_servers.setup import (
     build_new_inference_client,
 )
+from skyrl.backends.skyrl_train.utils.routed_experts import RoutedExpertRoutes
 from skyrl.train.config import SkyRLTrainConfig
 
 _SUPPORT_DTYPES = frozenset({np.dtype(np.float32)})
-_ROUTES = np.arange(12).reshape(3, 2, 2)
+# Interleaved MoE layers, as a hybrid Mamba-MoE model reports them.
+_MOE_LAYERS = (1, 3)
+_ROUTES = RoutedExpertRoutes(np.arange(12).reshape(3, 2, 2), _MOE_LAYERS)
 
 
 async def _fake_detokenize(token_id_lists: List[List[int]]) -> List[str]:
@@ -199,8 +202,7 @@ def create_mock_vllm_server(server_id: int) -> FastAPI:
             ]
         }
         if request.url.path == "/skyrl/v1/generate":
-            routes = np.arange(12).reshape(3, 2, 2)
-            response["choices"][0]["routed_experts"] = pack_routed_experts(routes)
+            response["choices"][0]["routed_experts"] = pack_routed_experts(_ROUTES)
 
         features = body.get("features")
         app.state.last_generate_features = features
@@ -559,9 +561,31 @@ class TestDataPlane:
             await client.teardown()
 
         assert len(result["rollout_expert_indices"]) == 1
-        assert result["rollout_expert_indices"][0].dtype == np.uint8
-        assert np.array_equal(result["rollout_expert_indices"][0], np.arange(12).reshape(3, 2, 2))
+        decoded = result["rollout_expert_indices"][0]
+        assert decoded.indices.dtype == np.uint8
+        assert np.array_equal(decoded.indices, _ROUTES.indices)
+        # The captured layer mapping must reach the generator, not just the route values.
+        assert decoded.layer_indices == _MOE_LAYERS
         assert captured["routed_experts_prompt_start"] == 1
+
+    @pytest.mark.asyncio
+    async def test_generate_forwards_a_whole_sequence_capture_window(self, mock_servers):
+        """Single-turn callers open the window at token 0. Zero is falsy, so it has to survive
+        every hop to the request instead of being read as "no window given"."""
+        client = RemoteInferenceClient(
+            proxy_url=mock_servers["proxy_url"],
+            server_urls=mock_servers["server_urls"],
+            data_parallel_size=1,
+            enable_return_routed_experts=True,
+        )
+        try:
+            await client.generate({"prompt_token_ids": [[1, 2, 3]], "routed_experts_prompt_starts": [0]})
+            async with httpx.AsyncClient() as http:
+                captured = (await http.get(f"{mock_servers['proxy_url']}/test/last_generate_sampling_params")).json()
+        finally:
+            await client.teardown()
+
+        assert captured["routed_experts_prompt_start"] == 0
 
     @pytest.mark.asyncio
     async def test_external_generator_requests_sample_support(self, monkeypatch):
@@ -730,7 +754,7 @@ class TestPackedSideChannelBodies:
 
         assert isinstance(choice[PackedField.ROUTED_EXPERTS][PackedArrayKey.DATA], memoryview)
         assert isinstance(choice[PackedField.ROLLOUT_SAMPLE_SUPPORT][PackedArrayKey.DATA], memoryview)
-        assert np.array_equal(decode_packed_routed_experts(choice[PackedField.ROUTED_EXPERTS]), _ROUTES)
+        assert decode_packed_routed_experts(choice[PackedField.ROUTED_EXPERTS]) == _ROUTES
         support, _ = unpack_ndarray(choice[PackedField.ROLLOUT_SAMPLE_SUPPORT], allowed_dtypes=_SUPPORT_DTYPES, ndim=2)
         assert np.array_equal(support, _SUPPORT)
 
@@ -754,10 +778,7 @@ class TestPackedSideChannelBodies:
         async with httpx.AsyncClient() as http:
             counts = (await http.get(f"{mock_servers['proxy_url']}/test/packed_body_calls")).json()
         assert counts["flaky"] == 2
-        assert np.array_equal(
-            decode_packed_routed_experts(body["choices"][0][PackedField.ROUTED_EXPERTS]),
-            _ROUTES,
-        )
+        assert decode_packed_routed_experts(body["choices"][0][PackedField.ROUTED_EXPERTS]) == _ROUTES
 
     @pytest.mark.asyncio
     async def test_client_error_with_non_json_body_surfaces_the_text(self, client, mock_servers):
@@ -796,7 +817,7 @@ class TestPackedSideChannelBodies:
             await client.teardown()
 
         assert len(calls) == 1
-        assert np.array_equal(result["rollout_expert_indices"][0], _ROUTES)
+        assert result["rollout_expert_indices"][0] == _ROUTES
 
 
 class TestControlPlane:

@@ -501,6 +501,7 @@ async def test_generator_multi_turn_gsm8k_router_replay(ray_init_fixture):
     total_batch_size = num_prompts * n_samples_per_prompt
 
     assert len(rollout_expert_indices) == total_batch_size
-    assert len(rollout_expert_indices[0]) < max_input_length
-    assert len(rollout_expert_indices[0][0]) == 16  # 16 layers in OLMoE-1B-7B-0924
-    assert len(rollout_expert_indices[0][0][0]) == 8  # 8 topk for each layer
+    assert rollout_expert_indices[0].num_tokens < max_input_length
+    # 16 layers in OLMoE-1B-7B-0924, 8 topk each; every layer owns a router, so all are captured.
+    assert rollout_expert_indices[0].indices.shape[1:] == (16, 8)
+    assert rollout_expert_indices[0].layer_indices == tuple(range(16))
