@@ -42,11 +42,15 @@ from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
     CLAMPED_LOGPROB,
     PackedField,
     build_logprobs_content,
+    capture_to_host_array,
     pack_routed_experts,
     pack_sample_support,
-    routes_from_capture,
 )
 from skyrl.backends.skyrl_train.inference_servers.protocols import ServerActorProtocol
+from skyrl.backends.skyrl_train.inference_servers.routed_experts_layers import (
+    MoELayerIndexResolver,
+)
+from skyrl.backends.skyrl_train.utils.routed_experts import select_moe_layer_routes
 from skyrl.backends.skyrl_train.utils.sample_support import (
     SAMPLE_SUPPORT_DTYPE,
     SAMPLE_SUPPORT_PADDING,
@@ -521,6 +525,10 @@ class VLLMServerActor(ServerActorProtocol):
                 "lora_int_id": lora_int_id,
             }
 
+        # Resolved on the first capture and reused: the served model's layer structure is fixed
+        # at load, so weight sync cannot move its MoE layers.
+        moe_layer_resolver = MoELayerIndexResolver(engine)
+
         # NOTE (sumanthrh): We use a custom generate endpoint /skyrl/v1/generate because the native
         # endpoint /inference/v1/generate does not support returning routed expert IDs.
         # TODO (sumanthrh): Migrate back to /inference/v1/generate once this is fixed on the vllm side
@@ -588,9 +596,14 @@ class VLLMServerActor(ServerActorProtocol):
 
             routed_experts = None
             if resp.routed_experts is not None:
-                # The captured layers travel with the routes: the trainer maps its own MoE
-                # layers onto the layer dimension by looking them up, never by position.
-                routed_experts = pack_routed_experts(routes_from_capture(resp.routed_experts))
+                # vLLM's capture buffer spans every transformer layer but only the MoE ones
+                # carry routes, so drop the rest before they reach the wire. The surviving
+                # layers travel with the routes: the trainer maps its own MoE layers onto the
+                # layer dimension by looking them up, never by position.
+                capture = capture_to_host_array(resp.routed_experts)
+                moe_layer_indices = await moe_layer_resolver.get()
+                moe_layer_resolver.crosscheck_against_capture(capture)
+                routed_experts = pack_routed_experts(select_moe_layer_routes(capture, moe_layer_indices))
 
             payload = {
                 "choices": [

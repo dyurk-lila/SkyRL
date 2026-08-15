@@ -32,7 +32,7 @@ from skyrl.train.dataset.preprocess import (
 
 def routes_for(indices, layer_indices=None) -> RoutedExpertRoutes:
     if layer_indices is None:
-        return RoutedExpertRoutes.covering_all_layers(indices)
+        layer_indices = range(indices.shape[1])
     return RoutedExpertRoutes(indices, layer_indices)
 
 

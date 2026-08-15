@@ -166,17 +166,25 @@ def _get_local_router_slot_indices(captured_layer_indices: Sequence[int], instan
     return slot_indices
 
 
-def _verify_captured_layers_cover_pp_stage(captured_layer_indices: Sequence[int], model_config) -> None:
-    """Fail if the rollout capture does not cover this pipeline stage."""
+def _verify_stage_routers_cover_captured_layers(
+    captured_layer_indices: Sequence[int],
+    local_router_layer_indices: Sequence[int],
+    model_config,
+) -> None:
+    """Fail if a captured layer in this pipeline stage owns no local router."""
     local_layer_offset, local_num_layers = _get_current_pp_stage_layer_range(model_config)
     stage_range = range(local_layer_offset, local_layer_offset + local_num_layers)
-    uncaptured = sorted(set(stage_range) - set(captured_layer_indices))
-    if uncaptured:
+    local_router_layers = set(local_router_layer_indices)
+    unmatched = sorted(
+        layer_index
+        for layer_index in captured_layer_indices
+        if layer_index in stage_range and layer_index not in local_router_layers
+    )
+    if unmatched:
         raise ValueError(
-            f"This pipeline stage owns layers {local_layer_offset}.."
-            f"{local_layer_offset + local_num_layers - 1}, but the rollout captured no routes for "
-            f"layers {uncaptured} (it captured {list(captured_layer_indices)}). Trainer and rollout "
-            "model structures disagree."
+            f"The rollout captured routes for MoE layers {unmatched}, but this pipeline stage "
+            f"(layers {local_layer_offset}..{local_layer_offset + local_num_layers - 1}) built no "
+            "RouterReplay for them. Trainer and rollout model structures disagree."
         )
 
 
@@ -207,8 +215,7 @@ def setup_per_microbatch_replay_forward(
     Handles sequence parallelism: when TP > 1, the sequence is split across
     TP ranks, so each rank's MoE router only sees its local chunk of tokens.
 
-    ``rollout_expert_layer_indices`` maps local routers to captured slots, including for
-    models with dense or non-transformer layers interleaved with MoE layers.
+    ``rollout_expert_layer_indices`` maps local routers to the captured MoE-layer slots.
 
     Handles pipeline parallelism: when PP > 1, transformer layers are split
     across PP ranks, so each rank only sees its local RouterReplay instances and
@@ -243,7 +250,11 @@ def setup_per_microbatch_replay_forward(
     topk = rollout_expert_indices.row_shape[1]
     instances = RouterReplay.global_router_replay_instances
     local_slot_indices = _get_local_router_slot_indices(captured_layer_indices, instances)
-    _verify_captured_layers_cover_pp_stage(captured_layer_indices, model_config)
+    _verify_stage_routers_cover_captured_layers(
+        captured_layer_indices,
+        [captured_layer_indices[slot] for slot in local_slot_indices],
+        model_config,
+    )
     layer_index = torch.tensor(local_slot_indices, dtype=torch.long, device=rollout_expert_indices.device)
     local_rollout_expert_indices = PackedTensor(
         rollout_expert_indices.values.index_select(1, layer_index),

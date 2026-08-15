@@ -23,7 +23,7 @@ from tests.train.util import example_dummy_config
 
 
 def _routes(num_rows: int, fill: int) -> RoutedExpertRoutes:
-    return RoutedExpertRoutes.covering_all_layers(np.full((num_rows, 1, 2), fill, dtype=np.uint8))
+    return RoutedExpertRoutes(np.full((num_rows, 1, 2), fill, dtype=np.uint8), range(1))
 
 
 def test_generator_output_concatenation():
