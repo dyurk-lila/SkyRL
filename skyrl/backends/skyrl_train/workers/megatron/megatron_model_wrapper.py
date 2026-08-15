@@ -60,6 +60,7 @@ from skyrl.backends.skyrl_train.utils.replay_utils import (
     router_replay_schedule,
     setup_per_microbatch_replay_backward,
     setup_per_microbatch_replay_forward,
+    warn_if_training_without_replay,
 )
 from skyrl.backends.skyrl_train.utils.routed_experts import (
     ROUTED_EXPERT_LAYER_INDICES_KEY,
@@ -1278,6 +1279,15 @@ class MegatronModelWrapper:
         batch_generator = make_batch_generator(micro_batches, vpp_size=len(self.actor_module))
 
         replay_enabled = any(batch["rollout_expert_indices"] is not None for batch in micro_batches)
+        if not forward_only:
+            # Training runs the policy, so the policy section holds this pass's replay
+            # config. Forward-only passes legitimately carry no routes.
+            warn_if_training_without_replay(
+                self.cfg.policy.megatron_config.moe_enable_routing_replay,
+                sum(1 for batch in micro_batches if batch["rollout_expert_indices"] is None),
+                len(micro_batches),
+            )
+
         with router_replay_schedule(replay_enabled):
             metrics_list = forward_backward_func(
                 forward_step_func=forward_step,

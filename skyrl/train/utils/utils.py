@@ -263,6 +263,9 @@ def validate_megatron_cfg(cfg: SkyRLTrainConfig):
                 "virtual_pipeline_model_parallel_size -- interleaved chunks desync the replay FIFO. "
                 "Unset virtual_pipeline_model_parallel_size."
             )
+        assert (
+            not config.megatron_config.moe_fused_routing_replay or config.megatron_config.moe_enable_routing_replay
+        ), f"{worker_type}.megatron_config: moe_fused_routing_replay=True requires moe_enable_routing_replay=True"
         # context, expert, and expert tensor parallel are not yet supported for megatron
         if config.megatron_config.context_parallel_size > 1:
             assert (

@@ -3,6 +3,8 @@ Run with:
 uv run --isolated --extra dev --extra megatron pytest -s tests/backends/skyrl_train/gpu/gpu_ci/megatron/test_router_replay.py
 """
 
+import os
+
 import pytest
 import ray
 import torch
@@ -37,6 +39,10 @@ from tests.backends.skyrl_train.gpu.utils import (
 )
 
 MOE_MODEL_NAME = "moonshotai/Moonlight-16B-A3B-Instruct"
+# Run the whole file against the fused router-replay kernel instead of Megatron's unfused
+# replay path. An env switch rather than a parametrization so the default CI cost is
+# unchanged: the meaning of every assertion below is identical either way.
+FUSED_ROUTING_REPLAY = os.environ.get("SKYRL_TEST_FUSED_ROUTING_REPLAY", "0") == "1"
 NUM_PROMPTS = 10
 N_SAMPLES_PER_PROMPT = 4
 MAX_GENERATE_LENGTH = 128
@@ -297,6 +303,7 @@ async def test_logprobs(tp, pp, cp, ep, etp, extra_tf_kwargs):
 
         def run_megatron_forward(enable_replay: bool) -> torch.Tensor:
             cfg.trainer.policy.megatron_config.moe_enable_routing_replay = enable_replay
+            cfg.trainer.policy.megatron_config.moe_fused_routing_replay = enable_replay and FUSED_ROUTING_REPLAY
             actor_group = init_worker_with_type(
                 "policy",
                 shared_pg=pg,
@@ -419,6 +426,7 @@ def test_forward_backward(tp, pp, cp, ep, etp, extra_tf_kwargs):
         cfg.trainer.micro_forward_batch_size_per_gpu = 2
         cfg.trainer.micro_train_batch_size_per_gpu = 2
         cfg.trainer.policy.megatron_config.moe_enable_routing_replay = True
+        cfg.trainer.policy.megatron_config.moe_fused_routing_replay = FUSED_ROUTING_REPLAY
 
         actor_group = init_worker_with_type(
             "policy",
@@ -564,6 +572,7 @@ def test_forward_backward_variable_length_full_recompute(tp, pp, cp, ep, etp, ex
         cfg.trainer.micro_forward_batch_size_per_gpu = 2
         cfg.trainer.micro_train_batch_size_per_gpu = 2
         cfg.trainer.policy.megatron_config.moe_enable_routing_replay = True
+        cfg.trainer.policy.megatron_config.moe_fused_routing_replay = FUSED_ROUTING_REPLAY
 
         actor_group = init_worker_with_type(
             "policy",
