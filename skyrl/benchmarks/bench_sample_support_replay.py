@@ -151,7 +151,7 @@ def _saved_activation_bytes(fn, inputs) -> int:
       the slots are occupied -- the part that scales with ``top_k``;
     * in the unfused logits arm, the flattened source itself, because ``gather`` retains its input
       and the ragged path's advanced index does not. That part is ``top_k``-independent, and it
-      does not arise in the fused-LM-head arm the 120B runs take.
+      does not arise when the fused LM-head path is used.
 
     ``inputs`` and views of them are excluded: the forward that produced the hidden states holds
     them either way, so counting them would swamp what replay adds.
