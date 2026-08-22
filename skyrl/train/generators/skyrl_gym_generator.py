@@ -898,9 +898,7 @@ class SkyRLGymGenerator(GeneratorInterface):
         engine_input = InferenceEngineInput(
             prompt_token_ids=prompt_token_ids,
             sampling_params=sampling_params,
-            # Single-turn generation wants routes for the whole sequence, so the capture window
-            # opens at the first prompt token. Stated per request rather than left to the
-            # inference server's default, which would decide the alignment of every row below.
+            # Capture routes for the full prompt and response.
             routed_experts_prompt_starts=[0] * len(prompt_token_ids) if capture_routed_experts else None,
             return_sample_support=capture_sample_support,
             cache_salt=cache_salt,
@@ -943,11 +941,7 @@ class SkyRLGymGenerator(GeneratorInterface):
                 if sample_routes is None:
                     raise ValueError(f"R3 generation did not return routed expert indices for trajectory {i}")
                 prompt_len = len(prompt_token_ids[i])
-                # The engine captured the untruncated generation, so the row count is checked
-                # against that. One row per next-token prediction over prompt + generation, so the
-                # last generated token predicts nothing and carries no row. A different count means
-                # the window did not open at the first prompt token, and every row below would be
-                # reinterpreted as a left-aligned prefix by the collator.
+                # The final generated token has no next-token prediction row.
                 generated_token_count = len(responses[i])
                 expected_rows = prompt_len + generated_token_count - 1
                 if sample_routes.num_tokens != expected_rows:

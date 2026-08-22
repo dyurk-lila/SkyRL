@@ -47,15 +47,9 @@ def make_replay_padding_indices(
 
 
 def patch_topk_router_layer_number():
-    """Monkey-patch TopKRouter.set_layer_number to propagate the global layer
-    number to the RouterReplay instance.
+    """Propagate each router's global layer number to its replay instance.
 
-    Megatron only creates RouterReplay instances for MoE layers, so an instance's
-    position in ``global_router_replay_instances`` says nothing about which
-    transformer layer it serves. Storing the global layer_number lets replay setup
-    look each router up in the layer indices carried with the rollout routes.
-
-    Must be called BEFORE model creation (i.e. before make_megatron_module).
+    Must run before model creation.
     """
     try:
         from megatron.core.transformer.moe.router import TopKRouter
@@ -146,26 +140,14 @@ def _get_current_pp_stage_layer_range(model_config) -> tuple[int, int]:
 
 
 def _get_local_router_slot_indices(captured_layer_indices: Sequence[int], instances: list) -> list[int]:
-    """Map every local ``RouterReplay`` instance onto its slot in the captured layer dimension.
-
-    ``captured_layer_indices`` is the authoritative record of which global transformer layer
-    each slot of ``rollout_expert_indices``' layer dimension holds, carried with the routes
-    from the inference server. Each router's ``layer_number`` (1-based, set by
-    ``patch_topk_router_layer_number``) is looked up in that record rather than derived from
-    the model structure, so a captured list that disagrees with this model raises instead of
-    silently replaying another layer's routes.
-
-    Returned in ``global_router_replay_instances`` order, which is what
-    ``RouterReplay.set_replay_data`` consumes positionally.
-    """
+    """Map local routers to captured route slots in ``instances`` order."""
     slot_by_layer_index = {layer_index: slot for slot, layer_index in enumerate(captured_layer_indices)}
     if len(slot_by_layer_index) != len(captured_layer_indices):
         raise ValueError(f"Captured routed-expert layer indices contain duplicates: {list(captured_layer_indices)}")
 
     slot_indices = []
     for local_router_index, router_instance in enumerate(instances):
-        # getattr: layer_number is injected by patch_topk_router_layer_number, so its absence
-        # is exactly the condition reported below rather than a missing field on the class.
+        # The patch injects this instance attribute during model creation.
         layer_number = getattr(router_instance, "layer_number", None)
         if layer_number is None:
             raise ValueError(
@@ -185,14 +167,7 @@ def _get_local_router_slot_indices(captured_layer_indices: Sequence[int], instan
 
 
 def _verify_captured_layers_cover_pp_stage(captured_layer_indices: Sequence[int], model_config) -> None:
-    """Fail if this PP stage owns a transformer layer the rollout never captured.
-
-    ``_get_local_router_slot_indices`` only sees layers this stage built a ``RouterReplay``
-    for, so a stage of purely dense or mamba layers passes it while describing a different
-    model than the rollout served. The inference server captures every transformer layer, so
-    the captured list must span this stage's whole range; a gap means the two stacks differ in
-    depth, and the routers that did match were matched against another model's layer numbering.
-    """
+    """Fail if the rollout capture does not cover this pipeline stage."""
     local_layer_offset, local_num_layers = _get_current_pp_stage_layer_range(model_config)
     stage_range = range(local_layer_offset, local_layer_offset + local_num_layers)
     uncaptured = sorted(set(stage_range) - set(captured_layer_indices))
@@ -232,12 +207,8 @@ def setup_per_microbatch_replay_forward(
     Handles sequence parallelism: when TP > 1, the sequence is split across
     TP ranks, so each rank's MoE router only sees its local chunk of tokens.
 
-    Handles layer-structure mismatch: ``rollout_expert_layer_indices`` names the global
-    transformer layer that every slot of ``rollout_expert_indices``' layer dimension holds, and
-    each local ``RouterReplay`` is matched to its slot by looking its ``layer_number`` up in
-    that list. DeepSeek V3-style leading dense layers and Nemotron-style interleaved mamba
-    layers therefore need no special casing: they simply own no router. Any disagreement
-    between the two model structures raises rather than replaying the wrong layer's routes.
+    ``rollout_expert_layer_indices`` maps local routers to captured slots, including for
+    models with dense or non-transformer layers interleaved with MoE layers.
 
     Handles pipeline parallelism: when PP > 1, transformer layers are split
     across PP ranks, so each rank only sees its local RouterReplay instances and

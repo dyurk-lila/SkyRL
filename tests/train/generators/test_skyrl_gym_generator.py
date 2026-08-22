@@ -32,7 +32,6 @@ from skyrl.train.generators.skyrl_gym_generator import (
 )
 from skyrl_gym.envs.base_text_env import BaseTextEnv, BaseTextEnvStepOutput
 
-# Interleaved MoE layers, as a hybrid Mamba-MoE model reports them.
 MOE_LAYERS = (1, 3)
 
 # Mock constants, where 4 is the eos token id
@@ -473,7 +472,6 @@ async def test_agent_loop_uses_incremental_replay_metadata_traces(
             "responses": ["mocked output"],
             "response_ids": [output_ids],
             "stop_reasons": ["stop"],
-            # Interleaved MoE layers, as a hybrid Mamba-MoE model reports them.
             "rollout_expert_indices": [RoutedExpertRoutes(indices, MOE_LAYERS)],
             "rollout_sample_support": [sample_support],
         }
@@ -900,11 +898,7 @@ async def test_generate_batched_metrics_use_truncated_responses(
 
 
 def _batched_route_generate(rows_per_prompt=None, routes_override=None):
-    """Build a batched-mode engine stub that records its input batch and returns R3 routes.
-
-    ``rows_per_prompt`` maps a prompt's token count to the number of route rows the engine
-    returns, defaulting to the full-sequence capture (one row per next-token prediction).
-    """
+    """Build a batched engine stub that records requests and returns R3 routes."""
     captured: Dict[str, Any] = {}
 
     def generate(input_batch, model=None):
@@ -922,7 +916,6 @@ def _batched_route_generate(rows_per_prompt=None, routes_override=None):
         routes = []
         for prompt_tokens in prompt_token_ids:
             num_rows = rows_per_prompt(len(prompt_tokens))
-            # uint8, as the wire decoder hands compacted routes to the generator.
             indices = (np.arange(num_rows * len(MOE_LAYERS) * 2) % 8).astype(np.uint8)
             routes.append(RoutedExpertRoutes(indices.reshape(num_rows, len(MOE_LAYERS), 2), MOE_LAYERS))
         output["rollout_expert_indices"] = routes
@@ -936,9 +929,6 @@ def _batched_route_generate(rows_per_prompt=None, routes_override=None):
 async def test_generate_batched_captures_routes_from_the_first_prompt_token(
     mock_make, mock_tokenizer, mock_llm, mock_env, generator_cfg, mock_env_cfg
 ):
-    """Batched generation must ask for a capture window starting at token 0 and hand the
-    collator rows that are already aligned to the packed sequence, not a prefix it has to
-    guess at."""
     generator_cfg.batched = True
     generator_cfg.inference_engine.enable_return_routed_experts = True
     mock_make.return_value = mock_env
@@ -965,7 +955,6 @@ async def test_generate_batched_captures_routes_from_the_first_prompt_token(
         }
     )
 
-    # The window is stated per request, so the row alignment never depends on the server's default.
     assert captured["routed_experts_prompt_starts"] == [0, 0]
 
     prompt_token_ids = output["prompt_token_ids"]
@@ -976,8 +965,6 @@ async def test_generate_batched_captures_routes_from_the_first_prompt_token(
         assert sample_routes.layer_indices == MOE_LAYERS
         assert sample_routes.num_tokens == len(prompt_tokens) + len(response) - 1
 
-    # Consumer contract: the collator packs each trajectory's rows against prompt + response and
-    # dummy-fills only the final token, which predicts nothing.
     *_, packed, layer_indices, _ = convert_prompts_responses_to_batch_tensors(
         pad_token_id=0,
         prompts=prompt_token_ids,
@@ -1005,8 +992,6 @@ async def test_generate_batched_captures_routes_from_the_first_prompt_token(
 async def test_generate_batched_rejects_a_misaligned_route_capture(
     mock_make, mock_tokenizer, mock_llm, mock_env, generator_cfg, mock_env_cfg
 ):
-    """A window that opened one token late returns one row short. The collator would accept it
-    as a left-aligned prefix and dummy-pad the shortfall, so the generator has to reject it."""
     generator_cfg.batched = True
     generator_cfg.inference_engine.enable_return_routed_experts = True
     mock_make.return_value = mock_env
@@ -1037,9 +1022,6 @@ async def test_generate_batched_rejects_a_misaligned_route_capture(
 async def test_generate_batched_truncates_routes_to_the_trained_response(
     mock_make, mock_tokenizer, mock_llm, mock_env, generator_cfg, mock_env_cfg
 ):
-    """The engine captures the response it generated, which max_generate_length then cuts down.
-    The row count is checked against the generated response and the rows are cut to the trained
-    one, whose final token does have a captured route."""
     generator_cfg.batched = True
     generator_cfg.inference_engine.enable_return_routed_experts = True
     generator_cfg.sampling_params.max_generate_length = 2  # < len(MOCK_LLM_OUTPUT_IDS) == 4
@@ -1070,8 +1052,6 @@ async def test_generate_batched_truncates_routes_to_the_trained_response(
     routes = output["rollout_expert_indices"][0]
     assert routes.num_tokens == len(prompt_tokens) + len(response)
 
-    # Consumer contract: every token of the trained sequence carries a captured route, so the
-    # collator writes the segment with no dummy tail at all.
     *_, packed, _, _ = convert_prompts_responses_to_batch_tensors(
         pad_token_id=0,
         prompts=[prompt_tokens],
@@ -1091,8 +1071,6 @@ async def test_generate_batched_truncates_routes_to_the_trained_response(
 async def test_generate_batched_requires_routes_when_capture_is_enabled(
     mock_make, mock_tokenizer, mock_llm, mock_env, generator_cfg, mock_env_cfg, routes_override
 ):
-    """An engine that silently drops the side channel must fail the step, not train on a
-    batch with no routes."""
     generator_cfg.batched = True
     generator_cfg.inference_engine.enable_return_routed_experts = True
     mock_make.return_value = mock_env

@@ -28,7 +28,6 @@ from skyrl.train.dataset.preprocess import (
 
 
 def routes_for(indices, layer_indices=None) -> RoutedExpertRoutes:
-    """Pair one trajectory's route values with the layers they were captured from."""
     if layer_indices is None:
         return RoutedExpertRoutes.covering_all_layers(indices)
     return RoutedExpertRoutes(indices, layer_indices)
@@ -170,7 +169,6 @@ def test_routed_expert_tensor_accepts_read_only_arrays(tokenizer):
 
 
 def test_routed_expert_tensor_rejects_bare_arrays(tokenizer):
-    """Routes must arrive paired with their layers; a bare array names no layers at all."""
     with pytest.raises(TypeError, match="RoutedExpertRoutes"):
         convert_prompts_responses_to_batch_tensors(
             tokenizer.pad_token_id,

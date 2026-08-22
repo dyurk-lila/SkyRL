@@ -8,7 +8,6 @@ from skyrl.backends.skyrl_train.utils.routed_experts import (
     validate_moe_layer_indices,
 )
 
-# Interleaved MoE layers, as a hybrid Mamba-MoE model reports them.
 MOE_LAYERS = (1, 3)
 
 
@@ -143,7 +142,6 @@ def test_routes_keep_the_captured_layer_mapping():
 
 
 def test_routes_covering_all_layers_names_every_slot():
-    """vLLM captures the whole stack, so the identity mapping is all a server can name."""
     routes = RoutedExpertRoutes.covering_all_layers(np.zeros((2, 4, 2), dtype=np.uint8))
 
     assert routes.layer_indices == (0, 1, 2, 3)
@@ -161,7 +159,6 @@ def test_routes_reject_non_3d_indices(indices):
 
 
 def test_routes_compare_by_value():
-    """The generated dataclass __eq__ would raise on the ndarray comparison instead."""
     left = RoutedExpertRoutes(np.zeros((1, 2, 2), dtype=np.uint8), MOE_LAYERS)
 
     assert left == RoutedExpertRoutes(np.zeros((1, 2, 2), dtype=np.uint8), MOE_LAYERS)
@@ -177,13 +174,11 @@ def test_trace_carries_the_captured_layers_to_the_finalized_routes():
 
     result = trace.finalize(token_count=9, loss_mask=[0, 0, 0, 1, 1, 0, 0, 1, 1])
 
-    # Only the 8 captured rows come back; the layers ride along with them.
     assert result.indices.shape == (8, 2, 2) and result.indices.dtype == np.uint8
     assert result.layer_indices == MOE_LAYERS
 
 
 def test_trace_rejects_layer_indices_changing_midtrajectory():
-    """Every turn of one trajectory is served by the same model, so the layers cannot move."""
     trace = RoutedExpertTrace()
     trace.record_generation(prompt_token_count=3, generated_token_count=2, routed_experts=_trace_routes(4))
 
