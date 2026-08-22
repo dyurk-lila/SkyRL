@@ -1,11 +1,4 @@
-"""Batch operations on ``PackedRaggedTensor`` must move both ragged levels together.
-
-The outer level is ``PackedTensor``'s, so the interesting failures are the ones where an operation
-addresses it correctly and leaves the inner offsets describing the rows it used to have. Every
-case here states the expected member lists per batch entry independently of the offsets algebra.
-
-uv run --isolated --extra dev pytest tests/backends/skyrl_train/utils/test_packed_ragged_tensor.py
-"""
+"""Tests for two-level ragged batch operations."""
 
 import pytest
 import torch
@@ -21,8 +14,6 @@ from skyrl.backends.skyrl_train.utils.packed_tensor import (
 )
 
 PADDING = -1
-# Batch entry 0 holds three rows, entry 1 one row, entry 2 two rows. The lengths inside each entry
-# vary, and row 3 is empty, so nothing here is recoverable from the outer level alone.
 MEMBERS: list[list[list[int]]] = [
     [[7, 8, 9], [4], [1, 2]],
     [[]],
@@ -41,7 +32,6 @@ def _build(members=MEMBERS) -> PackedRaggedTensor:
 
 
 def _read(packed: PackedRaggedTensor) -> list[list[list[int]]]:
-    """Read the batch back as nested member lists, addressing only the public surface."""
     entries = []
     row = 0
     for length in packed.sequence_lengths.tolist():
@@ -51,17 +41,11 @@ def _read(packed: PackedRaggedTensor) -> list[list[list[int]]]:
 
 
 def _padded(members=MEMBERS, *, width=4) -> PackedTensor:
-    """The same batch in the fixed-width form the trainer receives it in."""
     rows = [row + [PADDING] * (width - len(row)) for entry in members for row in entry]
     return PackedTensor(
         torch.tensor(rows, dtype=torch.int32),
         cu_seqlens_from_lengths([len(entry) for entry in members]),
     )
-
-
-# ---------------------------------------------------------------------------
-# Compressing the fixed-width form
-# ---------------------------------------------------------------------------
 
 
 def test_compressing_fixed_width_rows_keeps_the_members_and_the_segmentation():
@@ -75,10 +59,6 @@ def test_compressing_fixed_width_rows_keeps_the_members_and_the_segmentation():
 
 
 def test_an_all_padding_row_compresses_to_length_zero():
-    """The larger of the two wins: one such row per observation token and per appended EOS.
-
-    In the fixed-width form each costs ``top_k`` sentinels; here it costs one offset entry.
-    """
     padded = _padded([[[1, 2]], [[], []]], width=64)
 
     ragged = PackedRaggedTensor.from_padded_rows(padded, padding_value=PADDING)
@@ -90,7 +70,6 @@ def test_an_all_padding_row_compresses_to_length_zero():
 
 
 def test_compressing_rejects_padding_that_is_not_trailing():
-    """The wire establishes the trailing-padding invariant; a violation would drop real members."""
     padded = PackedTensor(torch.tensor([[1, PADDING, 3]], dtype=torch.int32), cu_seqlens_from_lengths([1]))
 
     with pytest.raises(ValueError, match="after every member"):
@@ -105,7 +84,6 @@ def test_compressing_rejects_rows_that_are_not_a_matrix():
 
 
 def test_a_row_count_of_zero_survives_the_round_trip():
-    """A synthetic batch row generates nothing, so its segment holds no rows at all."""
     padded = PackedTensor(torch.empty((0, 4), dtype=torch.int32), cu_seqlens_from_lengths([0]))
 
     ragged = PackedRaggedTensor.from_padded_rows(padded, padding_value=PADDING)
@@ -116,14 +94,7 @@ def test_a_row_count_of_zero_survives_the_round_trip():
     assert _read(ragged) == [[]]
 
 
-# ---------------------------------------------------------------------------
-# Container surface
-# ---------------------------------------------------------------------------
-
-
 def test_the_outer_offsets_mean_what_they_mean_on_packed_tensor():
-    """Both forms share one batch field, so both must answer ``len`` and ``sequence_lengths``
-    with the batch and its per-entry ROW counts -- never with members."""
     ragged = _build()
     padded = _padded()
 
@@ -214,7 +185,6 @@ def test_to_contiguous_and_equality_preserve_both_levels():
 
 
 def test_equality_sees_a_regrouping_that_leaves_the_members_alone():
-    """The failure mode this class exists to prevent: same buffer, wrong offsets."""
     regrouped = _build([[[7, 8, 9], [4]], [[1, 2], []], [[5, 6, 7, 8], [3, 4]]])
 
     assert torch.equal(regrouped.values, _build().values)
@@ -223,11 +193,6 @@ def test_equality_sees_a_regrouping_that_leaves_the_members_alone():
 
 def test_repr_names_the_batch_the_rows_and_the_members():
     assert repr(_build()) == "PackedRaggedTensor(batch=3, rows=6, members=12, dtype=torch.int32)"
-
-
-# ---------------------------------------------------------------------------
-# Construction guards
-# ---------------------------------------------------------------------------
 
 
 def test_rejects_values_that_are_not_a_flat_member_buffer():
@@ -261,13 +226,7 @@ def test_rejects_offsets_that_do_not_span_their_level():
         PackedRaggedTensor(values, cu_seqlens_from_lengths([2, 2]), cu_seqlens_from_lengths([1]))
 
 
-# ---------------------------------------------------------------------------
-# Aliasing contract
-# ---------------------------------------------------------------------------
-
-
 def test_contiguous_slices_view_the_member_buffer():
-    """Alignment walks every segment per micro-batch, so reading one must not copy."""
     ragged = _build()
 
     # Batch entry 0 spends the first six members, and row 1 the fourth.
@@ -295,11 +254,6 @@ def test_reordering_operations_allocate_rather_than_alias(operation):
     produced.values[:] = -9
 
     assert torch.equal(ragged.values, original)
-
-
-# ---------------------------------------------------------------------------
-# Padding segments
-# ---------------------------------------------------------------------------
 
 
 def test_padding_segments_hold_the_requested_rows_with_no_members():

@@ -151,9 +151,7 @@ class TensorList:
         return TensorList([t for tl in lists for t in tl.tensors])
 
 
-# Value types a batch field may hold: a dense tensor, a ragged list of tensors, or a ragged
-# token-aligned field packed to one buffer plus offsets -- with a second offsets array when the
-# rows are themselves ragged. All of them index by batch position.
+# All batch field types index by batch position.
 PACKED_BATCH_FIELD_TYPES = (PackedTensor, PackedRaggedTensor)
 BATCH_FIELD_TYPES = (torch.Tensor, TensorList, *PACKED_BATCH_FIELD_TYPES)
 BatchField = Union[torch.Tensor, TensorList, PackedTensor, PackedRaggedTensor]
@@ -334,8 +332,6 @@ class TensorBatch(dict, Generic[DictType]):
                 batch_dict[key] = {
                     "format": TensorFormat.PACKED_RAGGED_TENSOR,
                     "values": _serialize_tensor(value.values, zero_copy=zero_copy),
-                    # `row_offsets` is [rows + 1]: it scales with the tokens, not the members, and
-                    # the ragged form exists to make the member buffer the small one.
                     "row_offsets": _serialize_tensor(value.row_offsets, zero_copy=zero_copy),
                     "cu_seqlens": _serialize_tensor(value.cu_seqlens),
                 }
@@ -567,9 +563,7 @@ class TrainingInput(TypedDict, total=False):
     # cu_seqlens. `metadata[ROUTED_EXPERT_LAYER_INDICES_KEY]` names the layer each slot holds.
     rollout_expert_indices: Optional[PackedTensor]
     router_padding_mask: Optional[Bool[torch.Tensor, "batch_size seq_len"]]  # True = no captured route (skip in replay)
-    # Sampler support, packed to RESPONSE tokens: values [sum(response_len_i), top_k] + cu_seqlens,
-    # or the same rows with a ragged inner level (a flat member buffer + row_offsets) instead of a
-    # fixed top_k width. One field either way: consumers read the form, never a second field.
+    # Sampler support packed to response tokens, with fixed-width or ragged rows.
     rollout_sample_support: Optional[Union[PackedTensor, PackedRaggedTensor]]
     pixel_values: Optional[TensorList]  # list of `batch_size` [num_patches_i, dim] tensors
     image_grid_thw: Optional[TensorList]  # list of `batch_size` [num_images_i, 3] tensors
@@ -610,8 +604,6 @@ PACKED_FIELD_PADDING: Dict[str, PackedFieldPadding] = {
     SAMPLE_SUPPORT_FIELD: PackedFieldPadding(
         fill=lambda field: SAMPLE_SUPPORT_PADDING,
         dummy_row_length=0,
-        # An all-padding fixed-width row and an empty member list say the same thing: nothing was
-        # recorded for this token. The ragged form just stops paying `top_k` sentinels to say it.
         ragged_members=(),
     ),
 }

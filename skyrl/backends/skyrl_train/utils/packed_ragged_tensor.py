@@ -1,15 +1,4 @@
-"""Two-level packing for batch fields whose token rows are themselves ragged.
-
-``PackedTensor`` describes exactly one ragged level: a batch of fixed-width token rows. Sampler
-support needs a second one, because each generated token's recorded candidate set has its own
-length, so this adds the inner level as a second flat offsets array.
-
-It is a distinct class rather than an optional level on ``PackedTensor`` for two reasons. An
-optional inner level would leave that class's slice fast path, ``segment``, ``_gather``, ``cat``,
-``repeat`` and ``repeat_interleave`` addressing the outer level alone: each would return corrupt
-data while every dtype, device and batch-size check still passed. And ``PackedTensor`` is
-upstream code, while the inner level is not.
-"""
+"""Two-level packing for batches of ragged token rows."""
 
 from collections.abc import Sequence
 
@@ -27,16 +16,8 @@ from skyrl.backends.skyrl_train.utils.packed_tensor import (
 class PackedRaggedTensor:
     """A ragged batch of ragged token rows: one member buffer plus two offset arrays.
 
-    ``values`` is the ``[sum(row_lengths)]`` flat member buffer in canonical batch order,
-    ``row_offsets`` is the ``[rows + 1]`` exclusive prefix sum of the per-row member counts, and
-    ``cu_seqlens`` is the ``[batch + 1]`` exclusive prefix sum of the per-batch-entry ROW counts.
-
-    ``cu_seqlens`` means exactly what it means on ``PackedTensor`` -- rows per batch entry -- so
-    both forms answer every batch operation identically and share one batch field. A consumer
-    tells them apart by the inner level being present, never by which field they arrived in.
-
-    ``values`` stays a plain ``torch.Tensor``, so ``to``, ``contiguous`` and ``pin_memory`` are
-    ordinary tensor calls and the per-buffer zero-copy plasma encoding still applies to it.
+    ``row_offsets`` partitions ``values`` into rows, and ``cu_seqlens`` partitions those rows
+    into batch entries.
     """
 
     def __init__(self, values: torch.Tensor, row_offsets: torch.Tensor, cu_seqlens: torch.Tensor):
@@ -70,13 +51,7 @@ class PackedRaggedTensor:
 
     @classmethod
     def from_padded_rows(cls, padded: PackedTensor, *, padding_value: int) -> "PackedRaggedTensor":
-        """Compress a fixed-width ``[rows, width]`` packed field, keeping its outer segmentation.
-
-        Rows are right-padded, so a row's members are its leading run and a boolean select in
-        row-major order already concatenates them in packed row order. A row that is padding all
-        the way across becomes a row of length zero: the offsets array is the only trace it
-        leaves, which is what makes an observation token or a synthetic EOS free here.
-        """
+        """Compress right-padded rows while preserving their outer segmentation."""
         if padded.values.ndim != 2:
             raise ValueError(f"padded rows must be [rows, width], got shape {tuple(padded.values.shape)}")
         members = padded.values != padding_value
@@ -135,11 +110,7 @@ class PackedRaggedTensor:
         return self.segment(index)
 
     def segment(self, index: int) -> "PackedRaggedTensor":
-        """Return one batch entry as a single-entry ragged batch.
-
-        ``PackedTensor.segment`` can hand back a bare row block because its rows are uniform;
-        here the row lengths are part of the answer, so the inner level comes along.
-        """
+        """Return one batch entry as a single-entry ragged batch."""
         position = index + len(self) if index < 0 else index
         if not 0 <= position < len(self):
             raise IndexError(f"segment {index} is out of range for a packed batch of {len(self)}")
@@ -153,12 +124,7 @@ class PackedRaggedTensor:
         return self.values[int(self.row_offsets[position]) : int(self.row_offsets[position + 1])]
 
     def _gather(self, indices: Sequence[int]) -> "PackedRaggedTensor":
-        """Select batch entries in the requested order into freshly allocated buffers.
-
-        Both levels are rebuilt: the outer index picks whole row runs, and the inner index then
-        picks each selected row's members. ``row_index_from_offsets`` does both walks, because
-        "lay these (start, length) runs down back to back" is the same problem twice.
-        """
+        """Select batch entries in order and rebuild both offset levels."""
         selected = torch.as_tensor(list(indices), dtype=torch.long, device=self.values.device)
         row_counts = self.sequence_lengths.to(torch.long)[selected]
         row_index = row_index_from_offsets(self.cu_seqlens[:-1].to(torch.long)[selected], row_counts)
@@ -222,11 +188,7 @@ def packed_ragged_padding_segments(
     segment_lengths: Sequence[int],
     members: Sequence[int],
 ) -> PackedRaggedTensor:
-    """Return padding segments of ``segment_lengths`` rows each, every row holding ``members``.
-
-    An empty ``members`` is the common case: a field whose padding row means "nothing recorded"
-    spends only its offset entry, not a row of sentinels.
-    """
+    """Return padding segments whose rows each hold ``members``."""
     row_count = sum(segment_lengths)
     return PackedRaggedTensor(
         torch.tensor(list(members) * row_count, dtype=reference.dtype, device=reference.device),

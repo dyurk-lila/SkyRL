@@ -261,15 +261,7 @@ def sample_support_scores(
 
 
 def _invert_row_ids(row_ids: torch.Tensor, num_rows: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return each support row's model position, and the row id every position names.
-
-    The fixed-width scorer joins the other way round -- it gathers a ``[top_k]`` row per position
-    -- which tolerates two positions naming one row. Scoring the members in place cannot: the row
-    is projected against exactly one position's hidden state, so a second claimant would be scored
-    from the first one's. ``align_packed_token_metadata`` lays a segment's rows down as ``arange``,
-    which makes the map injective by construction, so a duplicate is a bug and is refused. Reading
-    that costs one host sync per microbatch, the same one the synthetic-EOS guard already pays.
-    """
+    """Map support rows to model positions and reject duplicate row claims."""
     flat_rows = row_ids.reshape(-1).long()
     named = (flat_rows >= 0) & (flat_rows < num_rows)
     # One slot past the last row absorbs every position that names none, so the scatters below
@@ -304,25 +296,9 @@ def sample_support_csr_scores(
     temperature: float = 1.0,
     chunk_size: int | None = None,
 ) -> SampleSupportScores:
-    """Renormalize over each token's own recorded members, scoring the ragged support in place.
+    """Renormalize over each token's recorded members without padding to a fixed width.
 
-    Same statistics as :func:`sample_support_scores`, reduced over a member list rather than over a
-    fixed ``[rows, top_k]`` matrix. Nothing is gathered into that matrix, so the empty columns a
-    ``top_k`` wide enough to contain the nucleus must carry are not projected, not summed, and not
-    stored as an fp32 intermediate.
-
-    Two consequences follow from working per row instead of per model position. The reductions run
-    over support rows -- response tokens -- rather than over every position in the microbatch, so
-    the tensor-parallel payload shrinks with them. And a row of one member needs no projection at
-    all: renormalizing over a single candidate gives probability 1, hence logprob 0.0 and entropy
-    0.0.
-
-    Both rest on the two properties capture establishes: a row's members are DISTINCT, because they
-    are a top-k set, and they CONTAIN the sampled token, because vLLM drew it from them and the
-    capture path re-inserts it when its approximate pivot leaves it out. The numerator is read off
-    the member equal to the sampled token, which is free because that member is already projected;
-    a duplicated member would be summed twice, and a sampled token outside the row would leave the
-    numerator at zero rather than falling back to the vocabulary. Neither shape can be recorded.
+    Each support row must contain distinct members, including the sampled token.
     """
     if logits_or_hidden.shape[:-1] != sampled_ids.shape or row_ids.shape != sampled_ids.shape:
         raise ValueError(

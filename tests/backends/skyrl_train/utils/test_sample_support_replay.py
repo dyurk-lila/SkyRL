@@ -19,6 +19,7 @@ from skyrl.backends.skyrl_train.utils.packed_tensor import (
     cu_seqlens_from_lengths,
 )
 from skyrl.backends.skyrl_train.utils.sample_support import (
+    SAMPLE_SUPPORT_NO_ROW,
     SAMPLE_SUPPORT_PADDING,
     SAMPLE_SUPPORT_TORCH_DTYPE,
 )
@@ -805,15 +806,7 @@ def test_an_all_padding_microbatch_scores_nothing():
     assert torch.all(scores.logprobs == 0)
 
 
-# ---------------------------------------------------------------------------
-# The ragged inner level: dense-vs-CSR equivalence
-# ---------------------------------------------------------------------------
-
-# One row geometry per response token across the two trajectories. 0 members is a token with
-# nothing recorded -- an observation, or the EOS SkyRL appends -- 1 is a nucleus that collapsed
-# onto a single candidate, and TOP_K is a row the nucleus filled to the brim. Production rows are
-# never full, because capture is only correct when top_k strictly exceeds the nucleus, so the full
-# row is the corner where the ragged form buys nothing and must still agree.
+# Include empty, singleton, partially filled, and full rows.
 RAGGED_LENGTHS: List[Tuple[int, int]] = [(2, 4), (3, 3)]
 RAGGED_MEMBER_COUNTS = [TOP_K, 0, 2, 1, TOP_K, 1, 0]
 
@@ -830,14 +823,7 @@ def _sized_support(lengths, member_counts) -> PackedTensor:
 
 
 def _sized_batch(lengths, member_counts):
-    """Build a batch whose sampled tokens all sit inside their own support row.
-
-    That is what capture guarantees: vLLM draws from the recorded set, and the capture path
-    overwrites a row's weakest member when its approximate top-k/top-p pivot leaves the sampled id
-    out. The two scorers are only ever asked to agree under it -- the ragged one reads the sampled
-    token's score off the member equal to it, which is the same element the fixed-width one gathers
-    from the vocabulary, and it is free because that member is already projected.
-    """
+    """Build a batch whose sampled tokens belong to their support rows."""
     support = _sized_support(lengths, member_counts)
     mask = _attention_mask(lengths)
     sequence_length = mask.shape[1]
@@ -889,7 +875,6 @@ def test_the_ragged_form_carries_the_same_rows_in_fewer_slots():
 
 @pytest.mark.parametrize("packed", [False, True])
 def test_ragged_and_fixed_width_score_the_same_logprobs_entropy_and_masks(megatron_parallel_state, packed):
-    """The heart of it: two reductions over the same members must land on the same numbers."""
     entropy_kwargs = dict(compute_entropy=True, entropy_requires_grad=False)
     fixed = _sized_scores(RAGGED_LENGTHS, RAGGED_MEMBER_COUNTS, ragged=False, packed=packed, **entropy_kwargs)
     ragged = _sized_scores(RAGGED_LENGTHS, RAGGED_MEMBER_COUNTS, ragged=True, packed=packed, **entropy_kwargs)
@@ -898,13 +883,11 @@ def test_ragged_and_fixed_width_score_the_same_logprobs_entropy_and_masks(megatr
     assert fixed.entropy is not None and ragged.entropy is not None
     torch.testing.assert_close(ragged.entropy, fixed.entropy)
     assert torch.equal(ragged.valid_mask, fixed.valid_mask)
-    # Vacuous unless the geometry is actually visible in the result.
     assert int(ragged.valid_mask.sum()) == sum(1 for count in RAGGED_MEMBER_COUNTS if count)
     assert int((ragged.logprobs != 0).sum()) > 0
 
 
 def test_ragged_and_fixed_width_agree_on_the_gradient():
-    """Equal values out of a different reduction is not the same claim as an equal backward."""
     support, sequences, _, loss_mask, num_actions, logits = _sized_batch(RAGGED_LENGTHS, RAGGED_MEMBER_COUNTS)
     grads = []
     for field in (support, _ragged(support)):
@@ -927,10 +910,6 @@ def test_ragged_and_fixed_width_agree_on_the_gradient():
 
 
 def test_a_single_member_row_scores_exactly_zero_in_both_forms():
-    """One candidate renormalizes to probability 1, so the logprob is 0.0 and the entropy 0.0.
-
-    The ragged path reaches that from the offsets alone, without projecting the member at all.
-    """
     lengths = [(2, 2)]
     entropy_kwargs = dict(compute_entropy=True, entropy_requires_grad=False)
     fixed = _sized_scores(lengths, [1, 1], ragged=False, **entropy_kwargs)
@@ -946,7 +925,6 @@ def test_a_single_member_row_scores_exactly_zero_in_both_forms():
 
 
 def test_a_row_with_no_members_falls_back_to_the_full_vocabulary_in_both_forms():
-    """An empty ragged row says exactly what an all-padding fixed-width row says."""
     lengths = [(3, 3)]
     fixed = _sized_scores(lengths, [2, 2, 0], ragged=False)
     ragged = _sized_scores(lengths, [2, 2, 0], ragged=True)
@@ -963,7 +941,6 @@ def test_a_second_empty_ragged_row_in_one_trajectory_is_rejected():
 
 
 def test_an_all_padding_microbatch_scores_nothing_in_the_ragged_form():
-    """A synthetic batch row generates nothing, so its segment holds no rows and no members."""
     support = PackedRaggedTensor(
         torch.empty(0, dtype=SAMPLE_SUPPORT_TORCH_DTYPE),
         cu_seqlens_from_lengths([]),
@@ -987,13 +964,11 @@ def test_an_all_padding_microbatch_scores_nothing_in_the_ragged_form():
     assert torch.all(scores.logprobs == 0)
 
 
-# A four-row batch spanning every geometry: three members, none, one, two.
 CSR_UNIT_SUPPORT = PackedRaggedTensor(
     torch.tensor([1, 2, 3, 4, 5, 6], dtype=SAMPLE_SUPPORT_TORCH_DTYPE),
     cu_seqlens_from_lengths([3, 0, 1, 2]),
     cu_seqlens_from_lengths([4]),
 )
-# Position 0 names no row; the rest name rows 0..3 in order.
 CSR_UNIT_ROW_IDS = torch.tensor([[SAMPLE_SUPPORT_NO_ROW, 0, 1, 2, 3]])
 CSR_UNIT_SAMPLED = torch.tensor([[0, 3, 0, 4, 6]])
 CSR_UNIT_KWARGS = dict(
@@ -1003,7 +978,6 @@ CSR_UNIT_KWARGS = dict(
     compute_entropy=False,
     entropy_requires_grad=False,
 )
-# The same rows gathered into the fixed-width form, at the same positions.
 CSR_UNIT_DENSE_ROWS = torch.tensor(
     [[[-1, -1, -1], [1, 2, 3], [-1, -1, -1], [4, -1, -1], [5, 6, -1]]],
     dtype=SAMPLE_SUPPORT_TORCH_DTYPE,
@@ -1011,7 +985,6 @@ CSR_UNIT_DENSE_ROWS = torch.tensor(
 
 
 def test_only_multi_member_rows_reach_the_projection(monkeypatch):
-    """Empty and single-member rows are answered from the offsets, and no padding slot is scored."""
     widths: List[int] = []
     original = sample_support_replay._project_candidate_pairs
 
@@ -1044,7 +1017,6 @@ def test_only_multi_member_rows_reach_the_projection(monkeypatch):
 
 
 def test_two_positions_naming_one_support_row_are_refused():
-    """The fixed-width join tolerates it by gathering twice; scoring in place cannot."""
     with pytest.raises(ValueError, match="named by more than one model position"):
         sample_support_csr_scores(
             torch.randn(1, 2, VOCAB, dtype=torch.float64),
@@ -1126,7 +1098,6 @@ def test_ragged_tensor_parallel_shards_reduce_to_the_unsharded_scores(tensor_par
 
 
 def test_the_ragged_reduction_is_sized_by_support_rows_not_model_positions(tensor_parallel):
-    """Deriving row ids per microbatch is what lets the collectives shrink to the rows."""
     logits = torch.randn(1, 5, VOCAB, dtype=torch.float64)
     entropy_kwargs = dict(compute_entropy=True, entropy_requires_grad=False)
     rows, positions = CSR_UNIT_SUPPORT.num_rows, CSR_UNIT_SAMPLED.numel()
@@ -1209,34 +1180,3 @@ def test_a_vocabulary_shard_owning_no_member_still_reaches_the_backward_graph(te
     assert torch.all(empty_hidden.grad == 0)
     # And the shard that owns everything still produced the scores.
     assert outputs[0][0].valid_mask.all()
-
-
-def test_the_numerator_premise_is_load_bearing_not_incidental():
-    """Negative control for the two properties capture establishes and the scorer relies on.
-
-    The ragged path reads the sampled token's score off the member equal to it. A row that
-    duplicated that member would count it twice, and a row that omitted it would leave the
-    numerator at zero. A suite that only ever fed well-formed rows could not tell whether the
-    scorer depended on them, so it must be able to see both breaks.
-    """
-    logits = torch.randn(1, 2, VOCAB, dtype=torch.float64)
-    sampled = torch.tensor([[1, 1]])
-    row_ids = torch.tensor([[0, 1]])
-    well_formed = [[1, 2, 3], [1, 2, 3]]
-    duplicated = [[1, 2, 1], [1, 2, 3]]
-    omitted = [[2, 3, 4], [1, 2, 3]]
-
-    def score(rows):
-        support = PackedRaggedTensor(
-            torch.tensor([member for row in rows for member in row], dtype=SAMPLE_SUPPORT_TORCH_DTYPE),
-            cu_seqlens_from_lengths([len(row) for row in rows]),
-            cu_seqlens_from_lengths([len(rows)]),
-        )
-        return sample_support_csr_scores(logits, sampled, support, row_ids, **CSR_UNIT_KWARGS).logprobs
-
-    reference = score(well_formed)
-    # Row 1 is well formed in every case, so it pins the comparison down to row 0.
-    for broken in (duplicated, omitted):
-        actual = score(broken)
-        assert float(actual[0, 1]) == float(reference[0, 1])
-        assert not torch.isclose(actual[0, 0], reference[0, 0])

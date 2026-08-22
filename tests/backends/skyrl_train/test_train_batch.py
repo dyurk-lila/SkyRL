@@ -961,14 +961,11 @@ def test_packed_field_padding_refuses_an_unregistered_field():
         make_packed_field_padding("unregistered", _ZERO_COPY_PAYLOADS[ROUTE_KEY](), segment_lengths=[1])
 
 
-# ── the ragged inner level ───────────────────────────────────────────────────
-
 _RAGGED_ROW_LENGTHS = [3, 0, 1, 0, 2]
 _RAGGED_SEGMENT_LENGTHS = [2, 3]
 
 
 def _ragged_support() -> PackedRaggedTensor:
-    """Two batch entries whose rows include empty ones, so the offsets carry the shape."""
     return PackedRaggedTensor(
         torch.arange(sum(_RAGGED_ROW_LENGTHS), dtype=SAMPLE_SUPPORT_TORCH_DTYPE),
         cu_seqlens_from_lengths(_RAGGED_ROW_LENGTHS),
@@ -977,7 +974,6 @@ def _ragged_support() -> PackedRaggedTensor:
 
 
 def test_a_ragged_packed_field_is_a_batch_field_of_its_batch_size():
-    """One field carries either form, so the batch must size itself off the outer offsets."""
     field = _ragged_support()
 
     batch = TrainingInputBatch(
@@ -992,7 +988,6 @@ def test_a_ragged_packed_field_is_a_batch_field_of_its_batch_size():
 
 
 def test_a_ragged_packed_field_round_trips_out_of_band(oob_round_trip):
-    """Both the members and the per-row offsets scale with the tokens, so both take the buffer path."""
     field = _ragged_support()
     batch = TrainingInputBatch(
         {"advantages": torch.randn(len(_RAGGED_SEGMENT_LENGTHS), 8), SAMPLE_SUPPORT_FIELD: field}
@@ -1019,7 +1014,6 @@ def test_chunking_and_catting_a_ragged_field_moves_both_levels():
 
 
 def test_padding_a_ragged_field_appends_rows_that_hold_no_members():
-    """An all-padding fixed-width row and an empty member list say the same thing."""
     field = _ragged_support()
     batch = TrainingInputBatch(
         {
@@ -1038,7 +1032,6 @@ def test_padding_a_ragged_field_appends_rows_that_hold_no_members():
 
 
 def test_a_field_without_a_ragged_padding_rule_refuses_to_be_padded():
-    """Routes need `topk` distinct experts per padding row, which an empty member list is not."""
     routes = PackedRaggedTensor(
         torch.arange(4, dtype=torch.int16),
         cu_seqlens_from_lengths([2, 2]),

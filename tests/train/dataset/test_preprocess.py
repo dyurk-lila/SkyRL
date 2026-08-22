@@ -24,6 +24,7 @@ from skyrl.backends.skyrl_train.utils.sample_support import (
 from skyrl.train.dataset import parallel_fill
 from skyrl.train.dataset.preprocess import (
     ROUTED_EXPERT_TORCH_DTYPES,
+    build_sample_support,
     convert_prompts_responses_to_batch_tensors,
     make_router_padding_mask,
 )
@@ -758,12 +759,9 @@ def test_routed_expert_tensor_rejects_disagreeing_layer_indices(tokenizer):
 
 
 def test_build_sample_support_ragged_rows_drops_every_padding_slot():
-    """The trainer boundary is where the fixed width stops being free, so it compresses here."""
     rows = np.full((3, 4), SAMPLE_SUPPORT_PADDING, dtype=SAMPLE_SUPPORT_DTYPE)
     rows[0, :4] = [5, 6, 7, 8]
     rows[1, :1] = [9]
-    # Row 2 stays all padding: an observation token, or the EOS SkyRL appends after generation.
-
     fixed = build_sample_support([rows], np.asarray([3]))
     ragged = build_sample_support([rows], np.asarray([3]), ragged_rows=True)
 
