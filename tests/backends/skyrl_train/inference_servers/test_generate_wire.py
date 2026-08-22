@@ -47,7 +47,6 @@ def _routes(indices, layer_indices=None) -> RoutedExpertRoutes:
 
 
 def _routes_from_capture(capture, moe_layer_indices=None) -> RoutedExpertRoutes:
-    """The exact expression /skyrl/v1/generate builds its payload from."""
     host_capture = capture_to_host_array(capture)
     if moe_layer_indices is None:
         moe_layer_indices = range(np.shape(host_capture)[1])

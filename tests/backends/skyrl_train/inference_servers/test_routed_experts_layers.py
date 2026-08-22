@@ -16,8 +16,6 @@ from skyrl.backends.skyrl_train.inference_servers.routed_experts_layers import (
 
 
 class _Engine:
-    """Stand-in for the vLLM engine's ``collective_rpc`` fan-out over TP/PP workers."""
-
     def __init__(self, per_worker):
         self._per_worker = per_worker
         self.calls = 0
@@ -34,7 +32,6 @@ def _resolver(layer_indices):
 
 
 def _capture(num_layers, written_layers, *, tokens=4, topk=2):
-    """A vLLM capture buffer: zeroed everywhere except the layers that own a router."""
     buffer = np.zeros((tokens, num_layers, topk), dtype=np.int32)
     for layer in written_layers:
         buffer[:, layer, :] = np.arange(1, topk + 1)
@@ -43,7 +40,6 @@ def _capture(num_layers, written_layers, *, tokens=4, topk=2):
 
 @pytest.mark.asyncio
 async def test_resolve_reports_the_agreed_layers_once():
-    """The layer structure is fixed at model load, so this must cost one RPC per server."""
     engine = _Engine([[1, 3, 5], [1, 3, 5]])
     resolver = MoELayerIndexResolver(engine)
 
@@ -54,7 +50,6 @@ async def test_resolve_reports_the_agreed_layers_once():
 
 @pytest.mark.asyncio
 async def test_resolve_raises_when_workers_disagree():
-    """TP/PP shards of one model must report identical layer structure."""
     resolver = MoELayerIndexResolver(_Engine([[1, 3], [1, 3, 5]]))
 
     with pytest.raises(RuntimeError, match="disagree on which layers are MoE"):
@@ -64,7 +59,6 @@ async def test_resolve_raises_when_workers_disagree():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("per_worker", [[], [[]]])
 async def test_resolve_raises_without_routed_moe_layers(per_worker):
-    """A dense model cannot serve R3, and an empty layer list would drop every route."""
     resolver = MoELayerIndexResolver(_Engine(per_worker))
 
     with pytest.raises(RuntimeError):
@@ -79,7 +73,6 @@ def test_crosscheck_passes_when_written_layers_match():
 
 
 def test_crosscheck_raises_when_a_dropped_layer_carries_routes():
-    """A layer we would drop that vLLM actually wrote means the registry disagrees with reality."""
     resolver = _resolver((1, 3))
 
     with pytest.raises(RuntimeError, match=r"captured routes for layers \[4\]"):
@@ -87,17 +80,12 @@ def test_crosscheck_raises_when_a_dropped_layer_carries_routes():
 
 
 def test_crosscheck_allows_an_all_zero_selected_layer():
-    """Expert 0 across a whole capture is legitimate: a masking router, or a short capture.
-
-    Only the reverse direction is an error, so this must not raise.
-    """
     resolver = _resolver((1, 3))
 
     resolver.crosscheck_against_capture(_capture(6, (1,)))
 
 
 def test_crosscheck_runs_once_and_then_stops_scanning():
-    """The layer structure is fixed at model load, so this must not cost a scan per request."""
     resolver = _resolver((1, 3))
     resolver.crosscheck_against_capture(_capture(6, (1, 3)))
 
@@ -114,13 +102,7 @@ def test_crosscheck_is_inert_before_layers_resolve():
 
 
 def test_vllm_moe_registry_api_contract():
-    """``collect_moe_layer_indices`` reads vLLM internals, so pin the shapes it depends on.
-
-    None of them is an import error: ``FusedMoE`` stopped being a class between 0.23 and 0.26
-    (it is now a factory returning ``MoERunner``), so importing it still succeeds and the
-    ``isinstance`` against it raises ``TypeError`` inside a worker on the first R3 request of
-    a run. Asserting the shapes here moves that to the CPU suite of any vLLM-installed env.
-    """
+    """Pin the vLLM interfaces used by ``collect_moe_layer_indices``."""
     pytest.importorskip("vllm")
     from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
     from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
@@ -133,13 +115,6 @@ def test_vllm_moe_registry_api_contract():
 
 
 def test_collect_moe_layer_indices_selects_only_capturable_moe_layers():
-    """The registry holds every layer, so selection is the whole job.
-
-    Attention and mamba layers register alongside the MoE runners, and a runner whose router
-    is not a ``BaseRouter`` has no ``set_capture_fn`` and so is never written. Both must be
-    dropped, and the surviving global layer ids returned ascending and deduplicated -- one
-    ``MoERunner`` per MoE layer, but TP/EP shards of a layer can register more than one.
-    """
     pytest.importorskip("vllm")
     from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
     from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
@@ -160,9 +135,7 @@ def test_collect_moe_layer_indices_selects_only_capturable_moe_layers():
                     "layers.0.self_attn": MagicMock(),
                     "layers.3.mlp": moe_runner(3),
                     "layers.1.mlp": moe_runner(1),
-                    # A second shard of an MoE layer already selected.
                     "layers.3.mlp.shard": moe_runner(3),
-                    # Capture hooks bind through BaseRouter.set_capture_fn, which this lacks.
                     "layers.5.mlp": moe_runner(5, router_spec=FusedMoERouter),
                 }
             )

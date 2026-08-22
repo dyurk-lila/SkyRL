@@ -77,16 +77,7 @@ def select_moe_layer_routes(
     capture: RoutedExpertIndices,
     moe_layer_indices: Sequence[int],
 ) -> RoutedExpertRoutes:
-    """Keep only the routed-MoE layers of one vLLM ``[tokens, all_layers, topk]`` capture.
-
-    vLLM sizes its capture buffer by ``num_hidden_layers`` and writes only the layers that own
-    a router, so mamba, attention and dense slots arrive as zeros that Megatron
-    ``index_select``s away as the first thing it does on device. Dropping them here keeps them
-    off the wire, out of collation and out of the trainer's host memory: on
-    Nemotron-3-Super-120B that is 40 of 88 layers, and on Nemotron-3-Ultra-550B 48 of 108.
-
-    All-MoE stacks (Qwen3-MoE, GLM) select every layer and are returned untouched.
-    """
+    """Keep routed-MoE layers from a vLLM ``[tokens, all_layers, topk]`` capture."""
     canonical_layer_indices = validate_moe_layer_indices(moe_layer_indices)
     _validate_routed_expert_shape(capture)
     num_layers = capture.shape[1]
@@ -95,9 +86,7 @@ def select_moe_layer_routes(
             f"MoE layer indices {canonical_layer_indices} exceed the {num_layers} layers reported by the engine"
         )
     if len(canonical_layer_indices) == num_layers:
-        # Every layer is selected, so the fancy index would only copy the payload.
         return RoutedExpertRoutes(capture, canonical_layer_indices)
-    # The layer list is carried as a tuple everywhere else; only this gather wants an array.
     layer_index = np.asarray(canonical_layer_indices, dtype=ROUTED_EXPERT_LAYER_INDEX_DTYPE)
     return RoutedExpertRoutes(capture[:, layer_index, :], canonical_layer_indices)
 

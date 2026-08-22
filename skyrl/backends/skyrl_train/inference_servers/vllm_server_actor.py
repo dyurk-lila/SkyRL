@@ -525,8 +525,6 @@ class VLLMServerActor(ServerActorProtocol):
                 "lora_int_id": lora_int_id,
             }
 
-        # Resolved on the first capture and reused: the served model's layer structure is fixed
-        # at load, so weight sync cannot move its MoE layers.
         moe_layer_resolver = MoELayerIndexResolver(engine)
 
         # NOTE (sumanthrh): We use a custom generate endpoint /skyrl/v1/generate because the native
@@ -596,10 +594,7 @@ class VLLMServerActor(ServerActorProtocol):
 
             routed_experts = None
             if resp.routed_experts is not None:
-                # vLLM's capture buffer spans every transformer layer but only the MoE ones
-                # carry routes, so drop the rest before they reach the wire. The surviving
-                # layers travel with the routes: the trainer maps its own MoE layers onto the
-                # layer dimension by looking them up, never by position.
+                # Drop expert-free layer slots and retain global indices for trainer lookup.
                 capture = capture_to_host_array(resp.routed_experts)
                 moe_layer_indices = await moe_layer_resolver.get()
                 moe_layer_resolver.crosscheck_against_capture(capture)

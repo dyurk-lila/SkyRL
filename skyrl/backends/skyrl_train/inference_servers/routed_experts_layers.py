@@ -1,13 +1,4 @@
-"""Resolve which transformer layers of a served model own an MoE router.
-
-vLLM's routed-expert capturer sizes its buffer by ``num_hidden_layers`` and writes only the
-layers that own a router, so hybrid architectures (Nemotron-3's interleaved mamba / attention
-/ MoE stack) leave the majority of that layer dimension untouched, and DeepSeek V3-style
-leading dense layers leave the head of it untouched. Resolving the MoE positions from the live
-model instance -- the same ``static_forward_context`` vLLM binds its capture hooks to -- lets
-the server drop those slots before packing, and gives the trainer an authoritative layer
-mapping to match its own routers against.
-"""
+"""Resolve the routed-MoE layers of a served model."""
 
 import asyncio
 from typing import Any
@@ -16,24 +7,8 @@ from typing import Any
 def collect_moe_layer_indices(worker: Any) -> list[int]:
     """Return the global layer indices of this worker's routed-MoE layers, ascending.
 
-    Runs inside a vLLM worker process via ``collective_rpc``. ``MoERunner`` is what
-    ``register_layer_for_moe_forward_op`` puts in ``static_forward_context``, and its
-    ``layer_id`` is the transformer-layer index parsed from the registered layer name --
-    exactly the ``layer_id`` the capturer indexes its buffer with. ``FusedMoE`` is not the
-    type to test: as of vLLM 0.26 it is a factory *function* returning ``MoERunner``, and
-    ``isinstance`` against a function raises ``TypeError`` -- from inside a worker, on the
-    first R3 request, long after the import that would have named the problem succeeded.
-
-    The router must be a ``BaseRouter``: that is the layer of the hierarchy which owns the
-    concrete ``set_capture_fn``, so a runner whose router is some other ``FusedMoERouter``
-    cannot be captured and its slots are never written.
-
-    ``isinstance(module, MoERunner) and isinstance(module.router, BaseRouter)`` is not a
-    guess at the capture set -- it is character for character the predicate
-    ``GPUModelRunner._bind_routed_experts_capturer`` selects on, reading ``module.layer_id``
-    for the same purpose. The set is therefore the capture set by construction, and
-    ``MoELayerIndexResolver.crosscheck_against_capture`` re-derives it from one real capture
-    to check that reasoning rather than trust it.
+    The predicate mirrors vLLM's routed-expert capture binding: ``MoERunner`` identifies
+    MoE layers and ``BaseRouter`` identifies routers that support capture hooks.
     """
     from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
     from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
@@ -69,20 +44,10 @@ class MoELayerIndexResolver:
         return self._layer_indices
 
     def crosscheck_against_capture(self, capture: Any) -> None:
-        """Confirm the resolved layers are the ones vLLM actually wrote, once per server.
+        """Check once that no layer omitted by the resolver contains captured routes.
 
-        ``collect_moe_layer_indices`` reads the same registry vLLM binds its capture hooks to,
-        so the two cannot disagree by construction. This re-derives the answer from the data as
-        an independent check on that reasoning: the capturer zeroes its buffer every step and
-        writes only routed layers, so an unwritten layer is entirely zero.
-
-        A layer we selected may still be all-zero for legitimate reasons -- a router that masks
-        slots to expert 0, or a single short capture -- so only the reverse direction is an
-        error: a layer we dropped that carries nonzero routes was real data. That asymmetry is
-        also why the all-zero pattern cannot be used to derive the layer set in the first place.
-
-        Costs one scan of one capture (measured 71 ms on a 120B/32k buffer) and nothing
-        thereafter, so it stays off the per-request path.
+        Selected layers may legitimately contain only expert zero, so the check is
+        intentionally one-way.
         """
         if self._crosschecked or self._layer_indices is None:
             return
