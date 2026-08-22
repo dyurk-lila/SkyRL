@@ -1280,8 +1280,7 @@ class MegatronModelWrapper:
 
         replay_enabled = any(batch["rollout_expert_indices"] is not None for batch in micro_batches)
         if not forward_only:
-            # Training runs the policy, so the policy section holds this pass's replay
-            # config. Forward-only passes legitimately carry no routes.
+            # Forward-only passes may legitimately carry no routes.
             warn_if_training_without_replay(
                 self.cfg.policy.megatron_config.moe_enable_routing_replay,
                 sum(1 for batch in micro_batches if batch["rollout_expert_indices"] is None),

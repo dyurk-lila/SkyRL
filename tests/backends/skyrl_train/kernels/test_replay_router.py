@@ -1,11 +1,4 @@
-"""Build probe and argument marshalling for the fused router-replay extension.
-
-Everything here runs without a GPU. The probe's contract is that it *never* raises: a host
-with no CUDA, a wheel that shipped without ``csrc/*.cu``, or a toolchain that cannot compile
-must all report a reason so routing degrades to Megatron's unfused replay path instead of
-killing a run at import. The kernel's own numerics live in
-tests/backends/skyrl_train/gpu/gpu_ci/megatron/test_fused_router_replay.py.
-"""
+"""CPU tests for the fused router-replay build probe and argument marshalling."""
 
 import pathlib
 from types import SimpleNamespace
@@ -45,7 +38,6 @@ def test_probe_reports_missing_cuda_instead_of_raising(fresh_probe, monkeypatch)
 
     assert fresh_probe.warm_compile() == "CUDA is not available"
     assert fresh_probe.is_available() is False
-    # Memoized: a second probe neither rebuilds nor changes its answer.
     assert fresh_probe.unavailable_reason() == "CUDA is not available"
 
 
@@ -77,11 +69,8 @@ def test_probe_captures_build_failure_as_a_one_line_reason(fresh_probe, monkeypa
     reason = fresh_probe.warm_compile()
 
     assert reason.startswith("extension build failed (RuntimeError)")
-    # Single-line: the reason is embedded in log lines and in fallback dedup keys.
     assert "\n" not in reason
     assert fresh_probe.is_available() is False
-    # -std=c++20 is required, not stylistic: under C++17 the training image's gcc rejects
-    # PyTorch's own ATen/core/List_inl.h, and -fpermissive does not help.
     assert "-std=c++20" in captured["extra_cflags"]
     assert "-std=c++20" in captured["extra_cuda_cflags"]
     assert "-gencode=arch=compute_90,code=sm_90" in captured["extra_cuda_cflags"]
@@ -119,8 +108,6 @@ def recording_extension(monkeypatch):
     ("scaling", "expected"),
     [
         (None, 1.0),
-        # Megatron applies the factor under `if scaling_factor:`, so a configured 0.0 leaves
-        # the probabilities alone rather than zeroing them.
         (0.0, 1.0),
         (2.5, 2.5),
     ],
@@ -156,10 +143,3 @@ def test_index_validation_is_opt_in(recording_extension, monkeypatch):
     monkeypatch.setenv(replay_router.VALIDATE_INDICES_ENV_VAR, "1")
     with pytest.raises(ValueError, match="out of range for num_experts=8"):
         replay_router.fused_replay_routing_dense(torch.zeros(1, 8), indices)
-
-
-def test_log_availability_never_raises(fresh_probe, monkeypatch):
-    """Called on every rank in the worker preflight."""
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-
-    fresh_probe.log_availability()

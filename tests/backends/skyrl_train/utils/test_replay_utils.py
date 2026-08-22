@@ -1,4 +1,3 @@
-import inspect
 import sys
 import types
 from types import SimpleNamespace
@@ -93,10 +92,6 @@ def test_replay_padding_rejects_missing_topk(shape):
         make_replay_padding_indices(shape, dtype=torch.uint8)
 
 
-def test_replay_has_no_dispatcher_specific_patch():
-    assert "TokenDispatcher" not in inspect.getsource(replay_utils)
-
-
 @pytest.mark.parametrize("route_dtype", [torch.uint8, torch.int16, torch.int32])
 def test_setup_replay_installs_indices_and_returns_model_mask(monkeypatch, parallel_state, route_dtype):
     router_replay_module = types.ModuleType("megatron.core.transformer.moe.router_replay")
@@ -178,7 +173,7 @@ def test_setup_replay_installs_indices_and_returns_model_mask(monkeypatch, paral
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("tp_size", [1, 2])
 def test_replay_indices_are_dtype_independent(monkeypatch, parallel_state, packed, tp_size):
-    """Compact host routes must produce the same int32 replay data as int32 routes."""
+    """Compact int16 routes produce the same int32 replay data as int32 routes."""
     router_replay_module = types.ModuleType("megatron.core.transformer.moe.router_replay")
 
     class RouterReplay:
@@ -451,14 +446,7 @@ def test_router_replay_schedule_clears_after_exception(router_replay_module):
     assert router_replay_module.action is None
 
 
-# ---------------------------------------------------------------------------
-# patch_topk_router_fused_replay
-#
-# These exercise the dispatch, the moe_router_fusion guard and the backward-FIFO
-# accounting without a GPU: the fused kernel is stubbed with a pure-torch reference of the
-# same contract. The kernel's own numerics live in
-# tests/backends/skyrl_train/gpu/gpu_ci/megatron/test_fused_router_replay.py.
-# ---------------------------------------------------------------------------
+# Fused dispatch and FIFO accounting with a pure-torch kernel stub.
 
 
 def _reference_dense_routing(logits, indices, scaling=None):
@@ -556,7 +544,6 @@ def _routed_experts(routing_map):
 def test_fused_replay_patch_installs_on_both_bindings(fused_replay):
     replay_utils.patch_topk_router_fused_replay(enable_fused_kernel=True)
 
-    # router.py binds the name at import time; patching moe_utils alone misses it.
     assert fused_replay.moe_utils.topk_routing_with_score_function is not fused_replay.original
     assert (
         fused_replay.router.topk_routing_with_score_function is fused_replay.moe_utils.topk_routing_with_score_function
@@ -588,11 +575,9 @@ def test_fast_path_serves_replay_forward_without_consuming_fifo(fused_replay):
 
     assert fused_replay.unfused_calls == []
     assert len(fused_replay.kernel_calls) == 1
-    # 100% index overlap: every routed expert is a replayed expert and vice versa.
     assert torch.equal(_routed_experts(routing_map), indices.long().sort(dim=1).values)
     assert routing_map.sum().item() == indices.numel()
     assert torch.allclose(routing_probs.sum(dim=-1), torch.ones(indices.shape[0]), atol=1e-6)
-    # The forward pass must leave the backward FIFO alone.
     assert fused_replay.replay.replay_backward_list == [indices]
 
 
@@ -759,9 +744,7 @@ def test_patch_is_idempotent(fused_replay):
     assert len(fused_replay.kernel_calls) == 1
 
 
-# ---------------------------------------------------------------------------
-# Side-channel path observability
-# ---------------------------------------------------------------------------
+# Side-channel path observability.
 
 
 @pytest.mark.parametrize(

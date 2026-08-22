@@ -1,27 +1,11 @@
-// Fused MoE router-replay kernels for R3 (rollout routing replay).
+// Fused normalized-sigmoid routing from precomputed expert indices. One warp handles
+// each token and one lane handles each expert slot, requiring topk <= 32.
 //
-// Under replay the top-k expert indices are supplied by the rollout, so the router
-// reduces to gather -> sigmoid -> normalize -> scatter. Megatron's unfused replay path
-// spends 16 launches and a dense [num_tokens, num_experts] sigmoid on that; TE's fused
-// router cannot be used at all because it has no parameter that accepts precomputed
-// indices.
-//
-// One warp per token: topk <= 32, so each lane owns one expert slot and the
-// normalization is a single warp-shuffle reduction. The dense kernel writes every
-// [num_tokens, num_experts] element exactly once in a single launch (no memset pass, no
-// separate scatter) and uses 2 KB of shared memory per block versus TE's
-// num_experts * tokens_per_block * 4 bytes (~17.8 KB at num_experts=512), so occupancy
-// is bounded by warps rather than shared memory.
-//
-// Contract: identical to megatron.core.transformer.moe.moe_utils
-// .topk_routing_with_score_function(score_function="sigmoid", dense_output=False), i.e.
+// Matches topk_routing_with_score_function(score_function="sigmoid", dense_output=False):
 //   routing_probs[t, e] = scaling * sigmoid(logits[t, e]) / (sum_k sigmoid(...) + 1e-20)
 //                         for e in indices[t], else 0
 //   routing_map[t, e]   = e in indices[t]
-// expert_bias is deliberately ignored: it only ever perturbs top-k *selection*, which
-// replay replaces outright, and Megatron gathers the unbiased scores back before
-// normalizing. Expert-bias load accounting stays in TopKRouter._apply_expert_bias, which
-// consumes the routing_map returned here.
+// Expert bias affects selection only, which replay replaces.
 
 #include <torch/extension.h>
 

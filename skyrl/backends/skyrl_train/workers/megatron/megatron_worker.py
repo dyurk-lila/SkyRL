@@ -1036,15 +1036,7 @@ class MegatronWorker:
             data["pixel_values"] = None
 
     def _warm_compile_fused_replay_kernel(self) -> None:
-        """Build the fused router-replay extension before any forward runs.
-
-        Local rank 0 compiles first and the rest of the node then loads from its cache, so
-        a node pays one nvcc invocation instead of one per GPU and no two ranks write the
-        same JIT target concurrently. The build directory is node-local and keyed on the
-        torch version (see kernels/replay_router.py), so this is the same
-        first-use-compile hazard the image already avoids for Triton -- not a shared
-        filesystem stampede.
-        """
+        """Compile once per node before the first forward."""
         from skyrl.backends.skyrl_train.kernels import replay_router
 
         distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
@@ -1052,7 +1044,6 @@ class MegatronWorker:
             replay_router.warm_compile()
         if distributed:
             torch.distributed.barrier()
-        # One line from rank 0 when it worked, and from every rank that could not build it.
         if self._rank == 0 or not replay_router.is_available():
             replay_router.log_availability()
 
@@ -1148,8 +1139,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
             patch_topk_router_expert_bias_padding_mask()
             patch_topk_router_layer_number()
-            # Installed whenever replay is on: it also guards against moe_router_fusion
-            # silently discarding the replayed indices. The kernel itself is opt-in.
+            # Also prevents TransformerEngine fusion from discarding replay indices.
             patch_topk_router_fused_replay(enable_fused_kernel=self.cfg.policy.megatron_config.moe_fused_routing_replay)
             if self.cfg.policy.megatron_config.moe_fused_routing_replay:
                 self._warm_compile_fused_replay_kernel()

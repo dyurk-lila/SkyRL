@@ -1,37 +1,7 @@
-"""Fused router replay on real sharded Megatron meshes, through SkyRL's own worker.
+"""Fused router replay across TP, PP, CP, and EP Megatron meshes.
 
-Everything the single-GPU test cannot reach runs here: ``setup_per_microbatch_replay_forward``'s
-context-parallel ``2*cp_size`` front/back chunk split, its tensor-parallel sequence slice, the
-pipeline layer-offset mapping, ``scatter_router_padding_mask_for_model``'s sequence-parallel
-branch, the alltoall dispatcher under expert parallelism, and the backward-replay FIFO under a
-genuine multi-stage pipeline schedule. The full patch set the worker installs is live --
-``patch_topk_router_layer_number``, ``patch_topk_router_expert_bias_padding_mask`` and
-``patch_topk_router_fused_replay`` -- and the test asserts all three are present in every
-worker process.
-
-Three independent properties per mesh, because none alone is sufficient:
-
-* **100% index overlap** between the experts the router actually dispatched to and the replay
-  indices installed on that rank, per layer, per microbatch, in both REPLAY_FORWARD and the
-  REPLAY_BACKWARD recompute. A layout bug shows up here and nowhere else -- probabilities stay
-  perfectly plausible while the wrong tokens get the wrong routes, and enabling
-  ``moe_router_fusion`` alongside replay lands at chance-level overlap (measured 4.408% at
-  E=512/topk=22) with no other symptom at all.
-* **Layer provenance.** Overlap alone compares the router against whatever routes were
-  installed in *its* ``RouterReplay``, so it cannot see routes installed into the wrong
-  layer's router. Each captured layer therefore draws its experts from a disjoint block of
-  the expert space, and every dispatched expert must fall in its own layer's block. This
-  model's MoE layers happen to be contiguous and zero-based; the non-contiguous case (Moonlight,
-  whose layer 0 is dense so the capture names layers 1..26) is covered by test_router_replay.py.
-* **Kernel-on vs kernel-off equivalence** of routing probabilities, logprobs and the
-  optimizer's grad norm, with the layout code shared between the two runs so it cancels out
-  and only the kernel is under test.
-
-Needs 8 GPUs. Not wired into ci/gpu_ci_run_h100.sh, which provisions 4.
-
-Run with:
-uv run --isolated --extra dev --extra megatron pytest -s \
-  tests/backends/skyrl_train/gpu/gpu_ci/megatron/test_fused_router_replay_sharded.py
+The tests require eight GPUs and verify route overlap, layer provenance, backward replay,
+and fused-versus-unfused numerical agreement through SkyRL workers.
 """
 
 import pytest
@@ -56,27 +26,15 @@ from skyrl.train.utils.utils import validate_cfg
 from tests.backends.skyrl_train.gpu.gpu_ci.conftest import ray_init
 from tests.backends.skyrl_train.gpu.utils import init_worker_with_type
 
-# Tiny Qwen3-MoE: 2 layers, both MoE (decoder_sparse_step=1), 8 experts, topk=2.
-# Already exercised at pp2_cp2 and tp2_ep2 by test_megatron_models.py, so the layout
-# machinery is known to work for it -- which is what lets a failure here be read as a
-# replay/kernel problem rather than a model problem.
+# Tiny Qwen3-MoE: two MoE layers, eight experts, topk two.
 MOE_MODEL_NAME = "eatang/qwen3-moe-tiny-random"
 NUM_EXPERTS = 8
 TOPK = 2
 NUM_SAMPLES = 8
 
-# The router itself is fp32, so kernel-on and kernel-off routing probabilities must agree to
-# fp32 noise wherever the router's *input* is bit-identical between the two runs -- which is
-# the case on the first pipeline stage, whose logits come straight from the embedding. This is
-# the assertion that actually pins the kernel.
 PROB_ATOL = 1e-6
 
-# Downstream is a different matter: every activation is bf16, so a sub-1e-7 change in a
-# routing probability can flip a bf16 rounding and then propagate. The right yardstick is
-# therefore the bf16 unit-in-last-place at the logprob magnitude, not an absolute constant --
-# bf16 keeps 8 mantissa bits, so one ULP at |logprob| ~ 10 is already 0.0625. The bound below
-# allows a few composed roundings across layers; for reference, test_megatron_models.py
-# accepts 2e-1 for this model against vLLM.
+# Bound downstream bf16 propagation in units in the last place.
 LOGPROB_ULP_TOLERANCE = 4.0
 GRAD_NORM_RTOL = 5e-2
 
@@ -98,14 +56,7 @@ MESHES = [
 
 
 def captured_moe_layer_indices() -> tuple[int, ...]:
-    """The global transformer layers this checkpoint actually routes with.
-
-    Derived from the HF config the way Qwen3-MoE builds its decoder rather than hardcoded:
-    the layer dimension of ``rollout_expert_indices`` covers captured MoE layers only, and
-    ``rollout_expert_layer_indices`` is the sole record of which layer each slot holds. A
-    checkpoint change that made the MoE layers sparse must move this test with it, not
-    silently re-point slot 0 at another layer.
-    """
+    """Derive the checkpoint's global MoE layer indices from its config."""
     config = AutoConfig.from_pretrained(MOE_MODEL_NAME, trust_remote_code=True)
     mlp_only_layers = set(getattr(config, "mlp_only_layers", None) or ())
     sparse_step = config.decoder_sparse_step
@@ -127,11 +78,7 @@ def expert_block(slot: int, num_captured_layers: int) -> range:
 
 
 def allowed_experts_by_layer(captured_layer_indices: tuple[int, ...]) -> dict[int, set[int]]:
-    """Experts each *global* layer may legitimately dispatch to.
-
-    The padding row is ``arange(topk)`` -- topk distinct experts, as Megatron's dropless
-    ``tokens * topk`` dispatcher requires -- so it is allowed everywhere regardless of block.
-    """
+    """Return each global layer's expert block plus padding experts."""
     padding_experts = set(replay_padding_row(TOPK, dtype=torch.int32).tolist())
     return {
         layer_index: set(expert_block(slot, len(captured_layer_indices))) | padding_experts
@@ -144,33 +91,20 @@ def get_test_actor_config(tp, pp, cp, ep, etp, *, fused: bool, score_function: s
     cfg.trainer.strategy = "megatron"
     cfg.trainer.logger = "console"
     cfg.trainer.policy.model.path = MOE_MODEL_NAME
-    # One sample per microbatch: with dp=1 that is NUM_SAMPLES microbatches through the
-    # pipeline, which is what makes the backward FIFO interleaving real.
+    # One sample per microbatch exercises backward FIFO interleaving.
     cfg.trainer.micro_forward_batch_size_per_gpu = 1
     cfg.trainer.micro_train_batch_size_per_gpu = 1
-    # Required for context parallelism.
     cfg.trainer.remove_microbatch_padding = True
     cfg.generator.inference_engine.enable_return_routed_experts = True
-    # validate_inference_engine_cfg requires this pairing; no engine is started here.
     cfg.generator.inference_engine.distributed_executor_backend = "mp"
 
     megatron_config = cfg.trainer.policy.megatron_config
     megatron_config.moe_enable_routing_replay = True
     megatron_config.moe_fused_routing_replay = fused
-    # The tiny model routes with softmax natively. The fused kernel implements Megatron's
-    # sigmoid contract, so force sigmoid to put the kernel on the fast path; this test never
-    # compares against vLLM, so overriding the score function is sound. The native softmax
-    # case is covered by test_fallback_on_sharded_mesh below.
     megatron_config.moe_router_score_function = score_function
-    # Left at the model's native value: expert bias has no HF counterpart in the Qwen3-MoE
-    # bridge, and the kernel ignores it by construction (it only perturbs top-k selection,
-    # which replay replaces). The production expert-bias path is covered by
-    # test_router_replay.py on Moonlight.
     megatron_config.moe_router_enable_expert_bias = None
     megatron_config.moe_router_dtype = "fp32"
-    # Recompute the MoE layers so backward re-runs the routers and drains the replay FIFO.
-    # Megatron rejects recompute_method/recompute_num_layers with selective granularity, and
-    # SkyRL's DEFAULT_TRANSFORMER_CONFIG_KWARGS set both for the "full" default.
+    # Recompute MoE layers so backward drains the replay FIFO.
     megatron_config.transformer_config_kwargs.update(
         {
             "recompute_granularity": "selective",
@@ -194,13 +128,7 @@ def packed_layer_blocked_routes(
     attention_mask: torch.Tensor,
     num_captured_layers: int,
 ) -> PackedTensor:
-    """Routes packed to real tokens, with every captured layer in its own expert block.
-
-    Routes vary per (sample, token, layer) so a cross-token or cross-layer mixup changes the
-    dispatched experts rather than landing on a coincidentally identical set, and the
-    per-layer blocks are disjoint so a slot-to-layer mismatch is visible from the experts
-    alone -- which is the one thing an overlap check against the installed indices cannot see.
-    """
+    """Pack distinct per-token routes from disjoint per-layer expert blocks."""
     route_offsets = torch.arange(TOPK, dtype=torch.int32)
     segments = []
     for real_tokens in attention_mask.sum(dim=1).tolist():
@@ -215,11 +143,7 @@ def packed_layer_blocked_routes(
 
 
 def build_training_input(tokenizer, captured_layer_indices: tuple[int, ...]) -> TrainingInputBatch:
-    """Variable-length samples with per-(sample, token, layer) distinguishable routes.
-
-    Lengths deliberately differ so a mispaired replay changes the token count instead of
-    silently reusing a same-shaped tensor.
-    """
+    """Build variable-length samples with distinguishable routes."""
     prompts, responses, rewards, loss_masks = [], [], [], []
     for i, filler in enumerate([1, 5, 2, 9, 3, 13, 4, 7][:NUM_SAMPLES]):
         prompt_ids = tokenizer.encode("Question: " + ("token " * filler) + f"what is {i}+{i}?")
@@ -270,12 +194,7 @@ def build_training_input(tokenizer, captured_layer_indices: tuple[int, ...]) -> 
 
 
 def _install_router_probe(worker):
-    """Run inside each worker process: record dispatched-vs-replayed overlap per routing call.
-
-    Wraps ``TopKRouter.routing``, so it sees the routing map the dispatcher will actually
-    consume -- after the patched ``topk_routing_with_score_function``, after token dropping
-    and after expert-bias accounting.
-    """
+    """Record dispatched-versus-replayed overlap inside each worker."""
     import torch as torch_
     from megatron.core.transformer.moe import moe_utils
     from megatron.core.transformer.moe.router import TopKRouter
@@ -287,12 +206,9 @@ def _install_router_probe(worker):
         return
     original_routing = TopKRouter.routing
 
-    # Signature-agnostic: TopKRouter.routing's optional arguments differ across
-    # megatron-core versions.
     def probed_routing(router, logits, *args, **kwargs):
         replay = router.router_replay
         action = replay.router_replay_action if replay is not None else None
-        # Peek, never pop: REPLAY_BACKWARD's pop belongs to the routing call itself.
         if action == RouterReplayAction.REPLAY_FORWARD:
             expected = replay.target_topk_idx
         elif action == RouterReplayAction.REPLAY_BACKWARD and replay.replay_backward_list:
@@ -315,12 +231,7 @@ def _install_router_probe(worker):
                     "overlap": intersection / max(1, int(replayed.sum())),
                     "routed_count": int(routing_map.sum()),
                     "replayed_count": int(replayed.sum()),
-                    # Which experts this layer dispatched to at all, for the provenance
-                    # check: routes installed into the wrong layer's router still show 100%
-                    # overlap against themselves.
                     "routed_experts": sorted({int(expert) for expert in routing_map.nonzero()[:, 1].unique()}),
-                    # Kept so the kernel-on and kernel-off runs can be compared at the
-                    # router itself, before bf16 activations carry a rounding downstream.
                     "probs": probs.detach().float().cpu(),
                 }
             )
@@ -353,11 +264,7 @@ def _collect_probe(worker):
 
 
 def _run_mesh(cfg, training_input):
-    """Build the worker group, probe it, run forward + forward_backward + optim_step.
-
-    One Ray session per run: ``init_worker_with_type`` creates a placement group it never
-    removes, so a second 8-GPU group in the same session cannot be scheduled.
-    """
+    """Run forward, backward, and optimizer steps in a fresh Ray session."""
     with ray_init():
         return _run_mesh_in_session(cfg, training_input)
 
@@ -365,8 +272,6 @@ def _run_mesh(cfg, training_input):
 def _run_mesh_in_session(cfg, training_input):
     actor_group = init_worker_with_type("policy", num_gpus_per_node=8, cfg=cfg)
     try:
-        # __ray_call__ runs a callable inside the actor process with the actor as its
-        # first argument -- the only way to instrument code that lives behind Ray.
         ray.get([actor.__ray_call__.remote(_install_router_probe) for actor in actor_group._actor_handlers])
 
         forward_out = WorkerOutput.cat(
@@ -409,8 +314,6 @@ def _assert_total_overlap(probes, allowed_experts, mesh_id, expect_backward_repl
                 f"{mesh_id} rank{rank}: router saw {record['num_tokens']} tokens but the "
                 f"replay slice holds {record['expected_tokens']} -- layout desync"
             )
-            # layer_number is Megatron's 1-based global position; the capture names layers
-            # 0-based, and nothing here may assume the two sets coincide.
             layer_index = record["layer_number"] - 1
             assert layer_index in allowed_experts, (
                 f"{mesh_id} rank{rank}: replay ran on layer {layer_index}, which the rollout "
@@ -440,13 +343,7 @@ def _assert_total_overlap(probes, allowed_experts, mesh_id, expect_backward_repl
 
 
 def _first_stage_prob_delta(probes_off, probes_on):
-    """max|delta| of routing probabilities where the router's input is run-invariant.
-
-    Only the first pipeline stage qualifies: its router logits come from the embedding, so
-    they are bit-identical in both runs and any difference in the output is the router's own.
-    Later stages consume bf16 activations that have already absorbed a rounding difference,
-    so a difference there is propagation, not a router discrepancy.
-    """
+    """Compare routing probabilities on the run-invariant first pipeline stage."""
     first_layer = min(
         (record["layer_number"] for probe in probes_off for record in probe["records"]),
         default=None,
@@ -494,7 +391,6 @@ def test_fused_replay_on_sharded_mesh(tp, pp, cp, ep, etp):
             f"own expert block"
         )
 
-    # The flag must actually change which path served the routing.
     on_reasons = {reason for probe in results[True]["probes"] for reason in probe["fallback_reasons"]}
     off_reasons = {reason for probe in results[False]["probes"] for reason in probe["fallback_reasons"]}
     assert all(probe["kernel_available"] for probe in results[True]["probes"]), [
@@ -503,13 +399,10 @@ def test_fused_replay_on_sharded_mesh(tp, pp, cp, ep, etp):
     assert not on_reasons, f"{mesh_id}: fused kernel fell back: {sorted(on_reasons)}"
     assert off_reasons == {"moe_fused_routing_replay=False"}, f"{mesh_id}: unexpected reasons {off_reasons}"
 
-    # Every rank reports the layer count the path log would have named.
     for fused, result in results.items():
         for rank, probe in enumerate(result["probes"]):
             assert probe["replayed_layer_count"], f"{mesh_id} fused={fused} rank{rank}: no layers replayed"
 
-    # The decisive numerical check: routing probabilities on the pipeline stage whose router
-    # input is bit-identical between the two runs must agree to fp32 noise.
     prob_delta, compared = _first_stage_prob_delta(results[False]["probes"], results[True]["probes"])
     print(f"{mesh_id}: max|delta routing probs| = {prob_delta:.3e} over {compared} first-stage routing calls")
     assert compared > 0, f"{mesh_id}: no first-stage routing calls to compare"
@@ -517,7 +410,6 @@ def test_fused_replay_on_sharded_mesh(tp, pp, cp, ep, etp):
 
     logprobs_off, logprobs_on = results[False]["logprobs"], results[True]["logprobs"]
     logprob_delta = (logprobs_on - logprobs_off).abs().max().item()
-    # bf16 keeps 8 mantissa bits; one ULP at the largest |logprob| present.
     scale = max(logprobs_off.abs().max().item(), 1e-6)
     bf16_ulp = 2.0 ** (torch.tensor(scale).log2().floor().item() - 7)
     grad_norm_on, grad_norm_off = results[True]["grad_norm"], results[False]["grad_norm"]
@@ -532,11 +424,7 @@ def test_fused_replay_on_sharded_mesh(tp, pp, cp, ep, etp):
 
 
 def test_fallback_on_sharded_mesh():
-    """The tiny model's native softmax routing must fall back, still at 100% overlap.
-
-    Proves the guard/fallback path is correct on a sharded mesh too, not just that the
-    kernel is.
-    """
+    """Fall back for softmax routing while preserving replay overlap."""
     tp, pp, cp, ep, etp = 2, 2, 2, 2, 1
     captured_layer_indices = captured_moe_layer_indices()
     allowed_experts = allowed_experts_by_layer(captured_layer_indices)

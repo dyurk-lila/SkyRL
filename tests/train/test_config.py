@@ -1322,25 +1322,21 @@ class TestMegatronRouterReplayValidation:
         validate_megatron_cfg(cfg)
 
     def test_routing_replay_refuses_router_fusion(self):
-        """Megatron's fused router drops the replayed indices, so the pair mis-trains
-        silently: measured index overlap with the rollout is chance level."""
         cfg = self._cfg()
         cfg.trainer.policy.megatron_config.transformer_config_kwargs["moe_router_fusion"] = True
 
         with pytest.raises(AssertionError, match="moe_router_fusion"):
             validate_megatron_cfg(cfg)
 
-    def test_fused_routing_replay_requires_routing_replay(self):
+    @pytest.mark.parametrize("replay_enabled", [False, True])
+    def test_fused_routing_replay_requires_routing_replay(self, replay_enabled):
         cfg = self._cfg()
-        cfg.trainer.policy.megatron_config.moe_enable_routing_replay = False
-        cfg.generator.inference_engine.enable_return_routed_experts = False
+        cfg.trainer.policy.megatron_config.moe_enable_routing_replay = replay_enabled
+        cfg.generator.inference_engine.enable_return_routed_experts = replay_enabled
         cfg.trainer.policy.megatron_config.moe_fused_routing_replay = True
 
-        with pytest.raises(AssertionError, match="moe_fused_routing_replay"):
+        if replay_enabled:
             validate_megatron_cfg(cfg)
-
-    def test_fused_routing_replay_allowed_with_routing_replay(self):
-        cfg = self._cfg()
-        cfg.trainer.policy.megatron_config.moe_fused_routing_replay = True
-
-        validate_megatron_cfg(cfg)
+        else:
+            with pytest.raises(AssertionError, match="moe_fused_routing_replay"):
+                validate_megatron_cfg(cfg)

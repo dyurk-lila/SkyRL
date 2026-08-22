@@ -211,11 +211,7 @@ include-package-data = true
 # alone does not cover them
 [tool.setuptools.package-data]
 "*" = ["*.patch"]
-# CUDA sources are compiled at runtime by torch.utils.cpp_extension, so they must ship in
-# the wheel. Declared rather than left to `include-package-data`'s implicit discovery,
-# which varies by setuptools version and by whether a VCS plugin is installed: a wheel
-# that silently drops them fails the availability probe inside the training image, where
-# the only symptom is routing quietly falling back to the unfused path.
+# Ship sources compiled at runtime by torch.utils.cpp_extension.
 "skyrl.backends.skyrl_train.kernels" = ["csrc/*.cu"]
 
 [tool.setuptools.dynamic]

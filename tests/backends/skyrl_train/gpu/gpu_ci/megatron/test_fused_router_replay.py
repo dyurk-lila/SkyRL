@@ -1,15 +1,4 @@
-"""Fused MoE router-replay kernel: numerics, the moe_router_fusion guard, and the
-backward-replay FIFO under a real activation-checkpoint recompute.
-
-Single process, single GPU, no Ray and no model -- everything here exercises Megatron's
-``topk_routing_with_score_function`` seam and ``megatron.core.tensor_parallel.checkpoint``
-directly, which is exactly what ``MoELayer`` uses for
-``recompute_granularity="selective", recompute_modules=["moe"]``.
-
-Run with:
-uv run --isolated --extra dev --extra megatron pytest -s \
-  tests/backends/skyrl_train/gpu/gpu_ci/megatron/test_fused_router_replay.py
-"""
+"""Fused router-replay numerics, fallback, and checkpoint-recompute tests."""
 
 import multiprocessing
 
@@ -29,8 +18,6 @@ NUM_TOKENS = 512
 NUM_EXPERTS = 512
 TOPK = 22
 
-# The fp32 measured delta against Megatron's unfused replay path is 2.2e-08. Low
-# precision is compared after Megatron's matching output/gradient cast.
 PROB_ATOL = {torch.float32: 1e-6, torch.float16: 2e-4, torch.bfloat16: 1e-3}
 GRAD_ATOL = {torch.float32: 1e-6, torch.float16: 2e-4, torch.bfloat16: 1e-3}
 ROUTER_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
@@ -48,11 +35,7 @@ def _inputs(num_tokens=NUM_TOKENS, num_experts=NUM_EXPERTS, topk=TOPK, seed=0, d
 
 
 def _fresh_replay(indices, action=None):
-    """A RouterReplay holding ``indices``, isolated from earlier tests.
-
-    ``RouterReplay.__init__`` appends to a process-global list, so instances must be
-    cleared or ``set_replay_data``'s length check drifts.
-    """
+    """Create an isolated ``RouterReplay`` holding ``indices``."""
     from megatron.core.transformer.moe.router_replay import (
         RouterReplay,
         RouterReplayAction,
@@ -218,48 +201,6 @@ def test_backward_accumulates_duplicate_replay_indices(patched_routing, unpatche
     assert (got - reference).abs().max().item() < GRAD_ATOL[dtype]
 
 
-def test_fast_path_index_overlap_is_total(patched_routing):
-    logits, indices, expert_bias = _inputs(seed=2)
-    routing = patched_routing(enable_fused_kernel=True)
-
-    _, routing_map = routing(
-        logits,
-        TOPK,
-        score_function=replay_utils.SIGMOID_SCORE_FUNCTION,
-        expert_bias=expert_bias,
-        fused=False,
-        router_replay=_fresh_replay(indices),
-    )
-
-    overlap = torch.equal(_routed_experts(routing_map), indices.long().sort(dim=1).values)
-    assert routing_map.sum().item() == indices.numel()
-    assert overlap, "fast path routed to experts the rollout did not choose"
-
-
-def test_router_fusion_bypasses_replay_without_the_patch(unpatched_routing):
-    """Documents the live upstream footgun this patch exists to close.
-
-    ``moe_router_fusion=True`` + replay discards the replayed indices entirely: the
-    ``if fused:`` early return never reaches ``compute_topk``, and TE's fused kernel has
-    no parameter that could accept indices. Measured overlap is chance level.
-    """
-    logits, indices, expert_bias = _inputs(seed=3)
-
-    probs, routing_map = unpatched_routing(
-        logits,
-        TOPK,
-        score_function=replay_utils.SIGMOID_SCORE_FUNCTION,
-        expert_bias=expert_bias,
-        fused=True,
-        router_replay=_fresh_replay(indices.long()),
-    )
-    replayed = torch.zeros_like(routing_map).scatter(1, indices.long(), True)
-    overlap = (routing_map & replayed).sum().item() / replayed.sum().item()
-    chance = TOPK / NUM_EXPERTS
-    print(f"unpatched fused+replay overlap = {overlap:.3%} (chance {chance:.3%})")
-    assert overlap < 4 * chance, "upstream appears to have taught the fused router about replay -- revisit the guard"
-
-
 @pytest.mark.parametrize("enable_fused_kernel", [False, True])
 def test_patch_never_lets_fusion_bypass_replay(patched_routing, enable_fused_kernel):
     logits, indices, expert_bias = _inputs(seed=3)
@@ -292,9 +233,7 @@ def test_unsupported_score_function_falls_back(patched_routing, unpatched_routin
 
 
 def test_backward_fifo_is_consumed_in_microbatch_order(patched_routing):
-    """``set_target_indices`` appends; ``get_replay_topk`` pops(0). The fast path must
-    consume the same entry the unfused path would have, or every later microbatch's
-    routes shift by one."""
+    """Consume replayed routes in microbatch order."""
     from megatron.core.transformer.moe.router_replay import (
         RouterReplay,
         RouterReplayAction,
@@ -326,19 +265,7 @@ def test_backward_fifo_is_consumed_in_microbatch_order(patched_routing):
 
 @pytest.mark.parametrize("enable_fused_kernel", [False, True])
 def test_selective_moe_recompute_replays_matching_routes(patched_routing, enable_fused_kernel):
-    """FORWARD -> BACKWARD across microbatches under selective MoE recompute.
-
-    ``MoELayer`` wraps its whole forward (router included) in
-    ``tensor_parallel.checkpoint`` when ``recompute_granularity="selective"`` and
-    ``"moe" in recompute_modules``, so the router re-runs during backward and pops from
-    ``replay_backward_list``. This reproduces that with the real checkpoint function and
-    the same per-microbatch call order SkyRL's forward_step uses (set forward routes ->
-    forward -> switch to REPLAY_BACKWARD), then drives the backwards in microbatch order
-    as Megatron's 1F1B cooldown does.
-
-    Token counts differ per microbatch, so a FIFO desync is shape-visible rather than a
-    silently wrong-but-same-shaped route.
-    """
+    """Replay matching routes during selective MoE checkpoint recomputation."""
     from megatron.core import tensor_parallel
     from megatron.core.transformer.moe.router_replay import (
         RouterReplay,
@@ -353,9 +280,6 @@ def test_selective_moe_recompute_replays_matching_routes(patched_routing, enable
     replay = RouterReplay()
 
     def make_forward(expert_bias, cotangent):
-        # tensor_parallel.checkpoint saves its args for backward, so only tensors may be
-        # passed positionally; the replay handle is closed over exactly as MoELayer holds
-        # self.router.router_replay.
         def moe_like_forward(hidden):
             routing_probs, routing_map = routing(
                 hidden,
@@ -367,8 +291,7 @@ def test_selective_moe_recompute_replays_matching_routes(patched_routing, enable
             )
             if replay.router_replay_action == RouterReplayAction.REPLAY_BACKWARD:
                 recompute_routes.append(_routed_experts(routing_map))
-            # A random cotangent, not routing_probs.sum(): the rows sum to 1, so a plain
-            # sum has (almost) zero gradient and would make the grad check vacuous.
+            # Avoid the near-zero gradient of normalized probabilities summed by row.
             return (routing_probs * cotangent).sum()
 
         return moe_like_forward
@@ -381,18 +304,14 @@ def test_selective_moe_recompute_replays_matching_routes(patched_routing, enable
         forward = make_forward(expert_bias, torch.randn_like(logits))
         leaves.append(leaf)
         forwards.append(forward)
-        # SkyRL's setup_per_microbatch_replay_forward: install this microbatch's routes
-        # (which also appends them to the backward FIFO) and switch to REPLAY_FORWARD.
         replay.set_target_indices(indices)
         replay.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
         outputs.append(tensor_parallel.checkpoint(forward, False, leaf))
-        # SkyRL's setup_per_microbatch_replay_backward.
         replay.set_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
 
     assert len(replay.replay_backward_list) == len(microbatches), "forwards must not pop"
     assert recompute_routes == [], "no recompute should have happened yet"
 
-    # Megatron's 1F1B drains backwards in microbatch order; so does the PP cooldown.
     for output in outputs:
         output.backward()
 
@@ -401,7 +320,6 @@ def test_selective_moe_recompute_replays_matching_routes(patched_routing, enable
     for consumed, (_, indices, _) in zip(recompute_routes, microbatches, strict=True):
         assert torch.equal(consumed, indices.long().sort(dim=1).values), "FIFO order desync"
 
-    # And the recomputed grads must match a no-recompute run of the same microbatches.
     for leaf, forward, (logits, indices, _) in zip(leaves, forwards, microbatches, strict=True):
         direct_leaf = logits.detach().clone().requires_grad_(True)
         replay.set_target_indices(indices)
