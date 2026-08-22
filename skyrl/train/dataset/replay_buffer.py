@@ -24,8 +24,6 @@ from skyrl.backends.skyrl_train.utils.sample_support import PackedSampleSupport
 BasicType = Union[int, float, str, bool]
 
 
-# Anything that is not one of these falls through unmoved, so a packed form missing here would
-# reach the worker on the host and fail as a device mismatch, or silently stay off the GPU.
 _MOVABLE = (torch.Tensor, *PACKED_BATCH_FIELD_TYPES)
 
 

@@ -11,7 +11,7 @@ code, so this benchmark takes it as input rather than assuming one. Every line i
 where its distribution came from: ``ASSUMED`` unless ``--histogram`` supplied a measured one.
 
 A histogram file is one ``<support size> <token count>`` pair per line, comments with ``#``; size
-0 rows are the observation tokens and appended EOS that carry no support at all.
+0 rows are masked observation tokens that carry no support.
 
 CUDA (a 24k-token microbatch at top_k=256, the shape the fp32 intermediates were sized against)::
 
@@ -151,7 +151,7 @@ def _saved_activation_bytes(fn, inputs) -> int:
       the slots are occupied -- the part that scales with ``top_k``;
     * in the unfused logits arm, the flattened source itself, because ``gather`` retains its input
       and the ragged path's advanced index does not. That part is ``top_k``-independent, and it
-      does not arise in the fused-LM-head arm the 120B runs take.
+      does not arise when the fused LM-head path is used.
 
     ``inputs`` and views of them are excluded: the forward that produced the hidden states holds
     them either way, so counting them would swamp what replay adds.
@@ -212,12 +212,8 @@ def _run_case(args, top_k: int, chunk_size: int, device: torch.device, sizes, we
     response_len = args.sequence_length - 1
     segment_lengths = [response_len] * args.batch_size
     drawn = _row_sizes(sum(segment_lengths), sizes, weights, top_k, args.seed).reshape(args.batch_size, response_len)
-    # The EOS SkyRL appends is loss-bearing and has no recorded support -- exactly one per
-    # trajectory, which is what the fallback's capacity permits. Every other empty row is an
-    # observation or tool result, which is loss-masked. The ragged form frees both.
-    drawn[:, -1] = 0
+    # Every loss-active token must have recorded support, as required by upstream replay.
     loss_bearing = drawn > 0
-    loss_bearing[:, -1] = True
     row_sizes = drawn.reshape(-1)
     fixed_cpu = _fixed_width_support(row_sizes, segment_lengths, top_k, args.vocab_size)
     sequences = _sampled_sequences(fixed_cpu, row_sizes, segment_lengths, args.sequence_length).to(device)
@@ -266,11 +262,9 @@ def _run_case(args, top_k: int, chunk_size: int, device: torch.device, sizes, we
             vocab_start_index=0,
             vocab_end_index=args.vocab_size,
             tp_group=None,
-            inference_only=False,
             lm_head_weight=lm_head_weight,
             temperature=args.temperature,
             chunk_size=chunk_size,
-            fused_backend="torch",
             compute_entropy=args.compute_entropy,
             entropy_requires_grad=False,
         ).logprobs

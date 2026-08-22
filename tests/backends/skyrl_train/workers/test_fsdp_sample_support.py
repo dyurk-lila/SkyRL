@@ -326,16 +326,17 @@ def test_sequence_parallel_slice_pads_row_ids_with_a_sentinel(monkeypatch):
 
     assert tail.row_ids.tolist() == [[2, SAMPLE_SUPPORT_NO_ROW]]
     assert tail.loss_mask.tolist() == [[True, False]]
+
+
 # ── the ragged inner level, through the real forward ─────────────────────────
 
 
 @pytest.mark.parametrize("packed", [False, True])
 def test_the_ragged_support_form_scores_the_same_through_the_forward(packed):
-    unsupported_rows = ()
     """Same field, either inner level: the wrapper places row ids and never the rows themselves,
     so the whole unpad / roll / next-token path is shared and only the scorer differs."""
     sequences, attention_mask = _ragged_batch()
-    fixed = _ragged_support(sequences, unsupported_rows=unsupported_rows)
+    fixed = _ragged_support(sequences)
     ragged = PackedRaggedTensor.from_padded_rows(fixed, padding_value=SAMPLE_SUPPORT_PADDING)
     fixed_model = _TokenIndexedLM()
     ragged_model = _TokenIndexedLM()
@@ -349,19 +350,16 @@ def test_the_ragged_support_form_scores_the_same_through_the_forward(packed):
     torch.testing.assert_close(ragged_scores, _reference(fixed_model.table.detach(), sequences, fixed, 2))
     torch.testing.assert_close(ragged_scores, fixed_scores)
     torch.testing.assert_close(ragged_model.table.grad, fixed_model.table.grad)
-    assert ragged.row_lengths.tolist() == ([2, 2, 0] if unsupported_rows else [2, 2, 2])
+    assert ragged.row_lengths.tolist() == [2, 2, 2]
 
 
-def test_the_ragged_forward_reports_the_same_entropy_and_mask(monkeypatch):
+def test_the_ragged_forward_reports_the_same_entropy():
     sequences, attention_mask = _ragged_batch()
-    fixed = _ragged_support(sequences, unsupported_rows=())
+    fixed = _ragged_support(sequences)
     ragged = PackedRaggedTensor.from_padded_rows(fixed, padding_value=SAMPLE_SUPPORT_PADDING)
     model = _TokenIndexedLM()
 
-    fixed_entropy, fixed_mask = _forward_entropy(_wrapper(model), sequences, attention_mask, fixed, [2, 1], 2)
-    ragged_entropy, ragged_mask = _forward_entropy(_wrapper(model), sequences, attention_mask, ragged, [2, 1], 2)
+    fixed_entropy = _forward_entropy(_wrapper(model), sequences, attention_mask, fixed, [2, 1], 2)
+    ragged_entropy = _forward_entropy(_wrapper(model), sequences, attention_mask, ragged, [2, 1], 2)
 
     torch.testing.assert_close(ragged_entropy, fixed_entropy)
-    assert torch.equal(ragged_mask, fixed_mask)
-    # The emptied row is outside the mask, so the comparison is not over a constant.
-    assert ragged_mask.any()
