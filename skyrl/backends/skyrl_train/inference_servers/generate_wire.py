@@ -51,7 +51,7 @@ class PackedField(StrEnum):
 
 
 class RoutedExpertsWireKey(StrEnum):
-    """Sidecar fields the routed-experts envelope carries beside ``PackedArrayKey``."""
+    """Routed-expert envelope sidecar fields."""
 
     LAYER_INDICES = "layer_indices"
 
@@ -183,20 +183,12 @@ def unpack_ndarray(
 
 
 def routes_from_capture(routed_experts: Any) -> RoutedExpertRoutes:
-    """Name the layers of one vLLM routed-expert capture.
-
-    vLLM sizes its capture buffer by ``num_hidden_layers`` and exposes no knob to restrict
-    which layers it writes, so a capture's layer dimension is the whole stack, in order.
-    """
+    """Pair a full-stack vLLM capture with its layer indices."""
     return RoutedExpertRoutes.covering_all_layers(_to_host_array(routed_experts))
 
 
 def pack_routed_experts(routes: RoutedExpertRoutes) -> dict[str, Any]:
-    """Serialize routes plus the global transformer layer each captured layer came from.
-
-    The layer list rides as a sidecar field rather than its own envelope: it is one small int
-    per captured layer, and ``data`` has to stay first for the client's byte-offset splice.
-    """
+    """Serialize routes and their global transformer layer indices."""
     compact = compact_routed_expert_indices(routes.indices)
     return pack_ndarray(
         compact,
@@ -217,11 +209,7 @@ def decode_packed_routed_experts(payload: dict[str, Any]) -> RoutedExpertRoutes:
 
 
 def _decode_layer_indices(sidecar: Mapping[str, Any]) -> tuple[int, ...]:
-    """Read the captured layer list off a packed routed-experts envelope.
-
-    A capture whose layer dimension the sender did not name is unusable: the trainer would
-    have to guess which model layer each slot holds, which is what carrying them prevents.
-    """
+    """Decode the captured layer list from a routed-experts envelope."""
     if RoutedExpertsWireKey.LAYER_INDICES not in sidecar:
         raise ValueError(f"packed routed_experts carries no {RoutedExpertsWireKey.LAYER_INDICES}")
     layer_indices = sidecar[RoutedExpertsWireKey.LAYER_INDICES]

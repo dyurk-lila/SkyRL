@@ -11,13 +11,10 @@ from skyrl.backends.skyrl_train.distributed.megatron.token_metadata import (
 RoutedExpertIndices: TypeAlias = np.ndarray
 ROUTED_EXPERT_DTYPES = frozenset({np.dtype(np.uint8), np.dtype(np.int16), np.dtype(np.int32)})
 
-# Global transformer-layer positions are carried as int32-ranged integers. No stack comes close
-# to that depth, so an index that does not fit names no layer of any real model.
+# Global transformer-layer positions are stored as int32-ranged integers.
 ROUTED_EXPERT_LAYER_INDEX_DTYPE = np.dtype(np.int32)
 
-# ``TrainingInputBatch.metadata`` key naming the global transformer layer that each slot of
-# ``rollout_expert_indices``' layer dimension holds. Consumers map their own layers onto that
-# dimension by looking them up here, never by assuming it spans every layer in order.
+# ``TrainingInputBatch.metadata`` key for the route tensor's global layer indices.
 ROUTED_EXPERT_LAYER_INDICES_KEY = "rollout_expert_layer_indices"
 
 
@@ -42,19 +39,12 @@ def _validate_routed_expert_shape(indices: RoutedExpertIndices) -> None:
         raise ValueError(f"routed expert indices must be a [tokens, layers, topk] array, got shape {indices.shape}")
 
 
-# eq=False: the generated __eq__ would compare `indices` with `==`, whose array result has no
-# truth value, so every comparison would raise instead of answering.
+# NumPy arrays require a value-based custom equality implementation.
 @dataclass(frozen=True, eq=False)
 class RoutedExpertRoutes:
-    """Captured MoE routes plus the global transformer layer each captured layer came from.
+    """Captured MoE routes and the global indices of their layer dimension.
 
-    ``indices`` is ``[tokens, len(layer_indices), topk]``. Its layer dimension covers only the
-    layers the inference server captured, so ``layer_indices`` is the single source of truth
-    for which transformer layer a slot belongs to: every consumer maps by lookup rather than
-    by assuming a contiguous zero-based ordering.
-
-    Expert-id dtype and range remain the business of ``compact_routed_expert_indices`` and the
-    wire decoder, so pairing routes with their layers never rescans the payload.
+    ``indices`` has shape ``[tokens, len(layer_indices), topk]``.
     """
 
     indices: RoutedExpertIndices

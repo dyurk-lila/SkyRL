@@ -123,7 +123,6 @@ def test_packed_routed_experts_round_trip(indices, expected_dtype):
 
 
 def test_packed_routed_experts_carries_interleaved_layer_indices():
-    """A hybrid stack's MoE layers are not contiguous, so the list must survive verbatim."""
     layer_indices = (1, 3, 5, 7, 9)
     payload = _routed_experts_envelope(np.arange(2 * 5 * 3).reshape(2, 5, 3), layer_indices)
 
@@ -145,8 +144,6 @@ def test_pack_rejects_invalid_routes(indices):
 
 
 def test_pack_rejects_nested_lists():
-    # The coercion in routes_from_capture must not turn the old nested-list
-    # format into a valid payload.
     with pytest.raises(TypeError, match="NumPy array"):
         routes_from_capture([[[1, 2]]])
 
@@ -158,7 +155,6 @@ def test_pack_accepts_torch_tensors():
 
     assert decoded.indices.dtype == np.uint8
     assert np.array_equal(decoded.indices, routes.numpy())
-    # A capture spans every transformer layer, so the identity mapping is what a server can name.
     assert decoded.layer_indices == (0, 1)
 
 
@@ -236,7 +232,6 @@ def test_decode_rejects_malformed_payloads(payload):
     ],
 )
 def test_decode_rejects_bad_layer_indices(layer_indices):
-    """The whole point of carrying the layers is that the trainer never has to guess them."""
     payload = {"data": "AQID", "shape": [1, 2, 1], "dtype": "uint8"}
     if layer_indices is not None:
         payload["layer_indices"] = layer_indices
@@ -318,7 +313,6 @@ def test_packed_envelope_leads_with_data():
 
 
 def test_pack_routed_experts_is_byte_identical_to_the_hand_built_envelope():
-    """`data` leads and every key is a plain str: orjson rejects StrEnum dict keys outright."""
     envelope = _routed_experts_envelope(np.arange(12).reshape(3, 2, 2))
 
     assert all(type(key) is str for key in envelope)
