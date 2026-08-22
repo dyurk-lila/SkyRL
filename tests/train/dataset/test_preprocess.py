@@ -702,6 +702,8 @@ def test_sample_support_none_when_not_provided(tokenizer):
         loss_masks=[[1]],
     )
     assert packed is None
+
+
 def test_routed_expert_tensor_carries_interleaved_layer_indices(tokenizer):
     moe_layers = (1, 3)
     routes = [

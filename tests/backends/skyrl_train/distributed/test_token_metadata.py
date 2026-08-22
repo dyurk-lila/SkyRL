@@ -190,13 +190,15 @@ def test_routed_expert_trace_tracks_multiturn_suffix_and_terminal_gap() -> None:
 def test_routed_expert_trace_widens_when_a_later_turn_routes_to_a_high_expert() -> None:
     trace = RoutedExpertTrace()
     trace.record_generation(prompt_token_count=3, generated_token_count=2, routed_experts=routes(4))
-    high = routes(4).copy()
+    high = routes(4).indices.copy()
     high[0, 0, 0] = 300
-    trace.record_generation(prompt_token_count=7, generated_token_count=2, routed_experts=high)
+    trace.record_generation(
+        prompt_token_count=7, generated_token_count=2, routed_experts=RoutedExpertRoutes(high, (1, 3))
+    )
 
-    result = trace.finalize(token_count=9, loss_mask=[0, 0, 0, 1, 1, 0, 0, 1, 1])
+    result = trace.finalize(token_count=9, loss_mask=[0, 0, 0, 1, 1, 0, 0, 1, 1]).indices
     assert result.dtype == np.int16
-    assert np.array_equal(result[:4], routes(4))
+    assert np.array_equal(result[:4], routes(4).indices)
     assert result[4, 0, 0] == 300
     assert np.array_equal(result[-1, 0], [4, 5])
 
