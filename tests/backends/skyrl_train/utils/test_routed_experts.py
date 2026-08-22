@@ -178,7 +178,6 @@ def test_select_drops_expert_free_layers():
 
 
 def test_select_keeps_a_leading_dense_layer_out_of_the_capture():
-    """DeepSeek V3 / Moonlight layer 0 is dense: the surviving list is not zero-based."""
     capture = np.arange(2 * 4 * 3, dtype=np.int32).reshape(2, 4, 3)
 
     routes = select_moe_layer_routes(capture, (1, 2, 3))
@@ -188,7 +187,6 @@ def test_select_keeps_a_leading_dense_layer_out_of_the_capture():
 
 
 def test_select_is_identity_for_an_all_moe_model():
-    """Qwen3-MoE/GLM select every layer, so the payload must not be copied at all."""
     capture = np.arange(2 * 4 * 3, dtype=np.int32).reshape(2, 4, 3)
 
     routes = select_moe_layer_routes(capture, range(4))
