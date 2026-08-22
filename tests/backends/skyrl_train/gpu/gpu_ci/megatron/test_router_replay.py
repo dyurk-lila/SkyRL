@@ -39,9 +39,7 @@ from tests.backends.skyrl_train.gpu.utils import (
 )
 
 MOE_MODEL_NAME = "moonshotai/Moonlight-16B-A3B-Instruct"
-# Run the whole file against the fused router-replay kernel instead of Megatron's unfused
-# replay path. An env switch rather than a parametrization so the default CI cost is
-# unchanged: the meaning of every assertion below is identical either way.
+# Opt into the fused path without doubling the default CI matrix.
 FUSED_ROUTING_REPLAY = os.environ.get("SKYRL_TEST_FUSED_ROUTING_REPLAY", "0") == "1"
 NUM_PROMPTS = 10
 N_SAMPLES_PER_PROMPT = 4

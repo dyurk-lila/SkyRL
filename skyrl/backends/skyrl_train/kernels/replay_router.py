@@ -1,17 +1,7 @@
-"""Fused MoE router-replay CUDA kernel: build, availability probe and autograd wiring.
+"""Build and autograd wiring for the fused MoE router-replay CUDA kernel.
 
-The extension is compiled with ``torch.utils.cpp_extension.load`` (JIT). Two things make
-that safe enough to ship, and both matter:
-
-* ``build_directory`` defaults to a **node-local** path, not the shared filesystem, for
-  the same reason the training image moves ``TRITON_CACHE_DIR`` to ``/tmp``: a first-use
-  compile from many ranks against one NFS cache serializes and can corrupt.
-* ``warm_compile()`` is called once from the worker preflight so the compile happens
-  before any forward, and every failure mode degrades to "kernel unavailable" with a
-  logged reason instead of an exception inside the pipeline schedule.
-
-Prebuilding into the training image removes the JIT entirely; see
-``SKYRL_REPLAY_ROUTER_BUILD_DIR``.
+The extension compiles before the first forward in a node-local directory. Build failures
+make the kernel unavailable so callers can fall back to unfused replay.
 """
 
 from __future__ import annotations
@@ -60,10 +50,7 @@ def _build() -> None:
         from torch.utils.cpp_extension import load
 
         build_dir.mkdir(parents=True, exist_ok=True)
-        # -std=c++20 is required, not stylistic: under C++17 the training image's gcc 12.2
-        # rejects PyTorch 2.11's own ATen/core/List_inl.h ("need 'typename' before
-        # decltype(...)::difference_type"), which C++20 (P0634) made legal. -fpermissive
-        # and -ccbin g++-12 do not help.
+        # PyTorch 2.11 headers require C++20 with the training image's compiler.
         _extension = load(
             name="skyrl_replay_router",
             sources=[str(_SOURCE)],
@@ -82,11 +69,7 @@ def _build() -> None:
 
 
 def warm_compile() -> Optional[str]:
-    """Build the extension now. Returns ``None`` on success or the failure reason.
-
-    Call this from the worker preflight so the compile is not paid inside a pipeline
-    schedule, and so an unusable toolchain is reported once at startup.
-    """
+    """Build the extension, returning ``None`` or the failure reason."""
     with _lock:
         if _extension is None and _unavailable_reason is None:
             _build()
@@ -138,8 +121,7 @@ def fused_replay_routing_dense(
     Args:
         logits: ``[num_tokens, num_experts]`` fp32, fp16, or bf16 router logits.
         indices: ``[num_tokens, topk]`` replayed expert indices (any integer dtype).
-        scaling: ``moe_router_topk_scaling_factor``. Megatron gates this on ``if
-            scaling_factor:``, so ``None`` *and* ``0.0`` both mean "do not scale".
+        scaling: ``moe_router_topk_scaling_factor``; falsy values disable scaling.
 
     Returns:
         ``(routing_probs[num_tokens, num_experts] logits.dtype, routing_map[...] bool)``.
@@ -149,8 +131,7 @@ def fused_replay_routing_dense(
 
     indices = indices.to(device=logits.device, dtype=torch.int32).contiguous()
     if os.environ.get(VALIDATE_INDICES_ENV_VAR):
-        # Device-to-host sync; debugging only. The kernel has a device assertion too, but
-        # this produces a clear ValueError without poisoning the CUDA context.
+        # Debug-only host validation provides a clear error before the device assertion.
         num_experts = logits.shape[1]
         if indices.numel():
             min_index, max_index = int(indices.min()), int(indices.max())
@@ -158,9 +139,7 @@ def fused_replay_routing_dense(
                 raise ValueError(
                     f"replay indices out of range for num_experts={num_experts}: [{min_index}, {max_index}]"
                 )
-    # Falsy, not just None: topk_routing_with_score_function applies the factor under
-    # `if scaling_factor:`, so a configured 0.0 leaves the probabilities alone there and
-    # must not zero them here.
+    # Match Megatron's falsy scaling-factor gate, including 0.0.
     resolved_scaling = 1.0 if not scaling else scaling
     return _FusedReplayRoutingDense.apply(logits.contiguous(), indices, float(resolved_scaling))
 
