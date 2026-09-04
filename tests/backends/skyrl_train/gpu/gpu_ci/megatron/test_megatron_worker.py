@@ -16,6 +16,7 @@ from skyrl.backends.skyrl_train.inference_servers.engine_utils import (
     get_sampling_params_for_backend,
 )
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
+from skyrl.backends.skyrl_train.utils.ppo_utils import PolicyLossType
 from skyrl.backends.skyrl_train.utils.torch_utils import logprobs_from_logits
 from skyrl.train.config import (
     SkyRLLoraConfig,
@@ -593,6 +594,9 @@ async def test_megatron_train(
     if fused_lm_head_backend is not None:
         cfg.trainer.fused_lm_head_logprob = True
         cfg.trainer.fused_lm_head_logprob_backend = fused_lm_head_backend
+        if fused_lm_head_backend == FusedLmHeadBackend.TRITON_BLOCK_SPARSE:
+            cfg.trainer.algorithm.policy_loss_type = PolicyLossType.ROLLOUT_IS
+            batch["action_log_probs"] = None
     if lora:
         cfg.trainer.policy.model.lora = SkyRLLoraConfig(rank=16, alpha=16)
 

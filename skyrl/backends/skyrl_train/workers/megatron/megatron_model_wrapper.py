@@ -716,6 +716,17 @@ class MegatronModelWrapper:
                 )
 
             action_log_probs = token_logprobs[:, -num_actions:]
+            if self._fused_lm_head_block_sparse and resolved_loss_name != PolicyLossType.CROSS_ENTROPY:
+                # Keep inactive operands finite for RL objectives that form
+                # ratios before applying the loss mask.
+                inactive = loss_mask <= 0
+                if old_action_log_probs is not None:
+                    old_action_log_probs = old_action_log_probs.masked_fill(inactive, 0.0)
+                advantages = advantages.masked_fill(inactive, 0.0)
+                if rollout_action_logprobs is not None:
+                    rollout_action_logprobs = rollout_action_logprobs.masked_fill(inactive, 0.0)
+                if base_action_log_probs is not None:
+                    base_action_log_probs = base_action_log_probs.masked_fill(inactive, 0.0)
 
             # policy loss should be calculated based on the selected token logprobs
             policy_loss, loss_metrics = current_loss_fn(
