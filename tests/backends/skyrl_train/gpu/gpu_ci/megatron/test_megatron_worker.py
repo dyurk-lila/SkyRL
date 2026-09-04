@@ -22,6 +22,7 @@ from skyrl.train.config import (
     SkyRLTrainConfig,
     TorchProfilerConfig,
 )
+from skyrl.train.fused_lm_head import FusedLmHeadBackend
 from skyrl.train.utils.utils import (
     print_mem,
     validate_cfg,
@@ -519,6 +520,20 @@ async def test_megatron_lora_forward(ray_init_fixture, tp, pp, cp, ep, etp, gpus
         ("policy", 2, 1, 2, 1, 1, 4, True, True, None, False, None),
         ("policy", 2, 1, 2, 1, 1, 4, True, True, "torch", False, None),
         ("policy", 2, 1, 2, 1, 1, 4, True, True, "triton", False, None),
+        (
+            "policy",
+            2,
+            1,
+            2,
+            1,
+            1,
+            4,
+            True,
+            True,
+            FusedLmHeadBackend.TRITON_BLOCK_SPARSE,
+            False,
+            None,
+        ),
         ("policy", 2, 1, 2, 1, 1, 4, True, False, None, False, "a2a"),
         ("policy", 4, 1, 1, 4, 1, 4, True, False, None, False, None),
         ("policy", 4, 1, 1, 4, 1, 4, True, False, None, True, None),
@@ -532,6 +547,7 @@ async def test_megatron_lora_forward(ray_init_fixture, tp, pp, cp, ep, etp, gpus
         "tp2_cp2_policy_seq_packing_with_entropy_loss",
         "tp2_cp2_policy_seq_packing_fused_torch_entropy_loss",
         "tp2_cp2_policy_seq_packing_fused_triton_entropy_loss",
+        "tp2_cp2_policy_seq_packing_fused_triton_block_sparse_entropy_loss",
         "tp2_cp2_policy_seq_packing_no_entropy_loss_a2a",
         "tp4_pp1_cp1_ep4_etp1_policy_seq_packing",
         "tp4_pp1_cp1_ep4_etp1_policy_seq_packing_lora",
