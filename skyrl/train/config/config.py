@@ -963,6 +963,12 @@ class AlgorithmConfig(BaseConfig):
     enable_sample_support_replay: bool = False
     """Renormalize policy logprobs over the sampler's recorded bounded support. Requires
     ``generator.inference_engine.enable_return_sample_support_set`` to capture it."""
+    sample_support_ragged_rows: bool = False
+    """Carry the recorded support with a ragged inner level -- one member list per generated token
+    -- instead of a fixed ``top_k``-wide row. Capture is only correct when ``top_k`` strictly
+    exceeds the top-p nucleus, so every row is padded by construction and a token with nothing
+    recorded at all (an observation, the appended EOS) is a whole padding row. This drops both.
+    Requires ``enable_sample_support_replay``."""
     sapo: SAPOConfig = field(default_factory=SAPOConfig)
     """Only used when ``policy_loss_type="sapo"``."""
     value_clip: float = 0.2
@@ -1819,6 +1825,11 @@ class SkyRLTrainConfig(BaseConfig):
                 raise ValueError(
                     "sample-support replay requires trainer.strategy=megatron or fsdp, got " f"{self.trainer.strategy}"
                 )
+        elif self.trainer.algorithm.sample_support_ragged_rows:
+            raise ValueError(
+                "trainer.algorithm.sample_support_ragged_rows only changes how recorded support is "
+                "carried, so it requires trainer.algorithm.enable_sample_support_replay"
+            )
 
         # Eval requests opt out of capture and do not use these constraints.
         if self.generator.inference_engine.enable_return_sample_support_set:

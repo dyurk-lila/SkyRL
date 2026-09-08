@@ -2,6 +2,7 @@
 
 Rows contain top-k vocabulary IDs and use trailing ``SAMPLE_SUPPORT_PADDING``.
 Tokens without captured support use an all-padding row.
+Generation keeps a fixed width; the trainer may use a ragged inner level.
 """
 
 from typing import TypeAlias
@@ -14,9 +15,13 @@ from skyrl.backends.skyrl_train.distributed.megatron.token_metadata import (
     TokenMetadataTrace,
     align_packed_token_metadata,
 )
+from skyrl.backends.skyrl_train.utils.packed_ragged_tensor import PackedRaggedTensor
 from skyrl.backends.skyrl_train.utils.packed_tensor import PackedTensor
 
 SampleSupport: TypeAlias = np.ndarray
+# One batch field carries both forms. They share the outer ``cu_seqlens`` -- one segment of rows
+# per trajectory -- and differ only in whether an inner offsets array names each row's members.
+PackedSampleSupport: TypeAlias = PackedTensor | PackedRaggedTensor
 SAMPLE_SUPPORT_DTYPE = np.dtype(np.int32)
 SAMPLE_SUPPORT_TORCH_DTYPE = torch.int32
 SAMPLE_SUPPORT_DTYPES = frozenset({SAMPLE_SUPPORT_DTYPE})
@@ -45,7 +50,7 @@ def validate_sample_support(sample_support: SampleSupport) -> SampleSupport:
 
 
 def align_sample_support_row_ids(
-    sample_support: PackedTensor,
+    sample_support: PackedSampleSupport,
     layout: TokenMetadataLayout,
 ) -> torch.Tensor:
     """Map model positions to packed support rows.
@@ -53,6 +58,7 @@ def align_sample_support_row_ids(
     Support for response tokens occupies ``[prompt_len - 1, sequence_len - 1)`` because
     position ``t`` predicts token ``t + 1``. Derive IDs per micro-batch because slicing and
     padding rebase the packed row space.
+    Both packed forms share these outer row offsets.
     """
     segment_lengths = sample_support.sequence_lengths.to(torch.long)
     if segment_lengths.numel() != len(layout.sequence_lengths):
@@ -74,7 +80,7 @@ def align_sample_support_row_ids(
             f"trajectories {trajectory_lengths.tolist()}"
         )
     row_ids = PackedTensor(
-        torch.arange(sample_support.values.shape[0], dtype=torch.long, device=sample_support.device),
+        torch.arange(int(sample_support.cu_seqlens[-1]), dtype=torch.long, device=sample_support.device),
         sample_support.cu_seqlens,
     )
     return align_packed_token_metadata(

@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from jaxtyping import Bool, Float
 
+from skyrl.backends.skyrl_train.utils.packed_ragged_tensor import PackedRaggedTensor
 from skyrl.backends.skyrl_train.utils.packed_tensor import (
     PackedTensor,
     cu_seqlens_from_lengths,
@@ -17,7 +18,9 @@ from skyrl.backends.skyrl_train.utils.routed_experts import (
 )
 from skyrl.backends.skyrl_train.utils.sample_support import (
     SAMPLE_SUPPORT_DTYPES,
+    SAMPLE_SUPPORT_PADDING,
     SAMPLE_SUPPORT_TORCH_DTYPE,
+    PackedSampleSupport,
     SampleSupport,
 )
 from skyrl.train.dataset.parallel_fill import fill_batch_rows
@@ -213,8 +216,13 @@ def _fill_sample_support_segment(
 def build_sample_support(
     rollout_sample_support: List[SampleSupport],
     response_lens: np.ndarray,
-) -> PackedTensor:
-    """Pack one response-token support segment per trajectory."""
+    *,
+    ragged_rows: bool = False,
+) -> PackedSampleSupport:
+    """Pack one response-token support segment per trajectory.
+
+    ``ragged_rows`` compresses the inner support dimension after the parallel fill.
+    """
     num_samples = len(rollout_sample_support)
     for sample_index, rows in enumerate(rollout_sample_support):
         if not isinstance(rows, np.ndarray):
@@ -255,7 +263,10 @@ def build_sample_support(
         functools.partial(_fill_sample_support_segment, packed, cu_seqlens, rollout_sample_support),
         num_samples,
     )
-    return PackedTensor(packed, cu_seqlens)
+    fixed_width = PackedTensor(packed, cu_seqlens)
+    if not ragged_rows:
+        return fixed_width
+    return PackedRaggedTensor.from_padded_rows(fixed_width, padding_value=SAMPLE_SUPPORT_PADDING)
 
 
 def convert_prompts_responses_to_batch_tensors(
@@ -268,6 +279,7 @@ def convert_prompts_responses_to_batch_tensors(
     rollout_expert_indices: Optional[List[RoutedExpertRoutes]] = None,
     rollout_sample_support: Optional[List[SampleSupport]] = None,
     max_seq_len: Optional[int] = None,
+    sample_support_ragged_rows: bool = False,
 ) -> Tuple[
     Float[torch.Tensor, "batch seq_len"],
     Float[torch.Tensor, "batch seq_len"],
@@ -277,7 +289,7 @@ def convert_prompts_responses_to_batch_tensors(
     Optional[Float[torch.Tensor, "batch response_len"]],
     Optional[PackedTensor],
     Optional[Tuple[int, ...]],
-    Optional[PackedTensor],
+    Optional[PackedSampleSupport],
 ]:
     """
     Convert prompts and responses to batch tensors for training.
@@ -431,7 +443,9 @@ def convert_prompts_responses_to_batch_tensors(
         if len(rollout_sample_support) != num_samples:
             raise ValueError("rollout_sample_support must contain support for every trajectory")
 
-        sample_support_tensor = build_sample_support(rollout_sample_support, response_lens)
+        sample_support_tensor = build_sample_support(
+            rollout_sample_support, response_lens, ragged_rows=sample_support_ragged_rows
+        )
 
     return (
         sequences,

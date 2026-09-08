@@ -12,6 +12,10 @@ import numpy as np
 import torch
 from jaxtyping import Bool, Float, Integer
 
+from skyrl.backends.skyrl_train.utils.packed_ragged_tensor import (
+    PackedRaggedTensor,
+    packed_ragged_padding_segments,
+)
 from skyrl.backends.skyrl_train.utils.packed_tensor import (
     PackedTensor,
     packed_padding_segments,
@@ -33,6 +37,7 @@ class TensorFormat(StrEnum):
     TORCH = "torch"
     TENSOR_LIST = "tensor_list"
     PACKED_TENSOR = "packed_tensor"
+    PACKED_RAGGED_TENSOR = "packed_ragged_tensor"
 
 
 def _serialize_tensor(value: torch.Tensor, *, zero_copy: bool = False) -> dict:
@@ -146,11 +151,13 @@ class TensorList:
         return TensorList([t for tl in lists for t in tl.tensors])
 
 
-# Value types a batch field may hold: a dense tensor, a ragged list of tensors, or a ragged
-# token-aligned field packed to one buffer plus offsets. All three index by batch position.
-BATCH_FIELD_TYPES = (torch.Tensor, TensorList, PackedTensor)
-BatchField = Union[torch.Tensor, TensorList, PackedTensor]
-_BATCH_FIELD_ERROR = f"must be a tensor, {TensorList.__name__}, or {PackedTensor.__name__}"
+# All batch field types index by batch position.
+PACKED_BATCH_FIELD_TYPES = (PackedTensor, PackedRaggedTensor)
+BATCH_FIELD_TYPES = (torch.Tensor, TensorList, *PACKED_BATCH_FIELD_TYPES)
+BatchField = Union[torch.Tensor, TensorList, PackedTensor, PackedRaggedTensor]
+_BATCH_FIELD_ERROR = (
+    f"must be a tensor, {TensorList.__name__}, {PackedTensor.__name__}, or {PackedRaggedTensor.__name__}"
+)
 
 
 def _rebuild_tensor_batch(cls, state: Dict[str, Any]):
@@ -321,6 +328,13 @@ class TensorBatch(dict, Generic[DictType]):
                     # Offsets are too small to benefit from an out-of-band buffer.
                     "cu_seqlens": _serialize_tensor(value.cu_seqlens),
                 }
+            elif isinstance(value, PackedRaggedTensor):
+                batch_dict[key] = {
+                    "format": TensorFormat.PACKED_RAGGED_TENSOR,
+                    "values": _serialize_tensor(value.values, zero_copy=zero_copy),
+                    "row_offsets": _serialize_tensor(value.row_offsets, zero_copy=zero_copy),
+                    "cu_seqlens": _serialize_tensor(value.cu_seqlens),
+                }
             else:
                 batch_dict[key] = _serialize_tensor(value, zero_copy=zero_copy)
 
@@ -344,6 +358,12 @@ class TensorBatch(dict, Generic[DictType]):
             elif value.get("format") == TensorFormat.PACKED_TENSOR:
                 self[key] = PackedTensor(
                     _deserialize_tensor(value["values"]),
+                    _deserialize_tensor(value["cu_seqlens"]),
+                )
+            elif value.get("format") == TensorFormat.PACKED_RAGGED_TENSOR:
+                self[key] = PackedRaggedTensor(
+                    _deserialize_tensor(value["values"]),
+                    _deserialize_tensor(value["row_offsets"]),
                     _deserialize_tensor(value["cu_seqlens"]),
                 )
             else:
@@ -472,6 +492,8 @@ class TensorBatch(dict, Generic[DictType]):
                     cat_data[key] = TensorList.cat([shard[key] for shard in shards])
                 elif isinstance(value, PackedTensor):
                     cat_data[key] = PackedTensor.cat([shard[key] for shard in shards])
+                elif isinstance(value, PackedRaggedTensor):
+                    cat_data[key] = PackedRaggedTensor.cat([shard[key] for shard in shards])
                 elif isinstance(value, torch.Tensor):
                     cat_data[key] = torch.cat([shard[key] for shard in shards])
                 else:
@@ -541,8 +563,8 @@ class TrainingInput(TypedDict, total=False):
     # cu_seqlens. `metadata[ROUTED_EXPERT_LAYER_INDICES_KEY]` names the layer each slot holds.
     rollout_expert_indices: Optional[PackedTensor]
     router_padding_mask: Optional[Bool[torch.Tensor, "batch_size seq_len"]]  # True = no captured route (skip in replay)
-    # Sampler support, packed to RESPONSE tokens: values [sum(response_len_i), top_k] + cu_seqlens
-    rollout_sample_support: Optional[PackedTensor]
+    # Sampler support packed to response tokens, with fixed-width or ragged rows.
+    rollout_sample_support: Optional[Union[PackedTensor, PackedRaggedTensor]]
     pixel_values: Optional[TensorList]  # list of `batch_size` [num_patches_i, dim] tensors
     image_grid_thw: Optional[TensorList]  # list of `batch_size` [num_images_i, 3] tensors
 
@@ -564,10 +586,12 @@ class PackedFieldPadding:
     """Padding rule for a packed ``TrainingInput`` field.
 
     ``dummy_row_length`` is its segment length for a synthetic one-token batch row.
+    ``ragged_members`` supplies the equivalent member list for a ragged row.
     """
 
     fill: Callable[[PackedTensor], Union[torch.Tensor, int]]
     dummy_row_length: int
+    ragged_members: Optional[Sequence[int]] = None
 
 
 # Every packed batch field needs a padding rule.
@@ -580,6 +604,7 @@ PACKED_FIELD_PADDING: Dict[str, PackedFieldPadding] = {
     SAMPLE_SUPPORT_FIELD: PackedFieldPadding(
         fill=lambda field: SAMPLE_SUPPORT_PADDING,
         dummy_row_length=0,
+        ragged_members=(),
     ),
 }
 
@@ -590,15 +615,22 @@ def _packed_field_padding_rule(key: str) -> PackedFieldPadding:
     return PACKED_FIELD_PADDING[key]
 
 
-def make_packed_field_padding(key: str, field: PackedTensor, *, segment_lengths: Sequence[int]) -> PackedTensor:
+def make_packed_field_padding(key: str, field: BatchField, *, segment_lengths: Sequence[int]) -> BatchField:
     """Return padding segments for one packed batch field, filled by that field's own rule."""
     rule = _packed_field_padding_rule(key)
+    if isinstance(field, PackedRaggedTensor):
+        if rule.ragged_members is None:
+            raise ValueError(f"Packed batch field {key!r} has no padding rule for its ragged form")
+        return packed_ragged_padding_segments(field, segment_lengths=segment_lengths, members=rule.ragged_members)
     return packed_padding_segments(field, segment_lengths=segment_lengths, fill=rule.fill(field))
 
 
-def append_packed_field_padding(key: str, field: PackedTensor, *, segment_lengths: Sequence[int]) -> PackedTensor:
+def append_packed_field_padding(key: str, field: BatchField, *, segment_lengths: Sequence[int]) -> BatchField:
     """Extend ``field`` with one padding segment per appended batch row."""
-    return PackedTensor.cat([field, make_packed_field_padding(key, field, segment_lengths=segment_lengths)])
+    padding = make_packed_field_padding(key, field, segment_lengths=segment_lengths)
+    if isinstance(field, PackedRaggedTensor):
+        return PackedRaggedTensor.cat([field, padding])
+    return PackedTensor.cat([field, padding])
 
 
 def packed_dummy_row_segments(key: str, count: int) -> List[int]:
@@ -633,10 +665,10 @@ def pad_training_input_batch(unpadded_batch: TrainingInputBatch, pad_size: int) 
             assert len(tensor) > 0, f"Cannot pad empty TensorList field {key!r}"
             padding = TensorList([tensor[0].clone() for _ in range(pad_size)])
             new_tensors[key] = TensorList.cat([tensor, padding])
-        elif isinstance(tensor, PackedTensor):
-            # Padded rows copy row 0, including its segment length.
+        elif isinstance(tensor, PACKED_BATCH_FIELD_TYPES):
+            # Padded rows copy row 0, including its outer segment length.
             new_tensors[key] = append_packed_field_padding(
-                key, tensor, segment_lengths=[len(tensor.segment(0))] * pad_size
+                key, tensor, segment_lengths=[int(tensor.sequence_lengths[0])] * pad_size
             )
         elif key == "loss_mask":
             # Ensures that padding tensors don't count towards the loss

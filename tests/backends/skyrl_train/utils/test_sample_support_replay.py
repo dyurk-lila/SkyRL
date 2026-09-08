@@ -13,11 +13,13 @@ from skyrl.backends.skyrl_train.distributed.megatron.token_metadata import (
     TokenMetadataLayout,
 )
 from skyrl.backends.skyrl_train.utils import sample_support_replay
+from skyrl.backends.skyrl_train.utils.packed_ragged_tensor import PackedRaggedTensor
 from skyrl.backends.skyrl_train.utils.packed_tensor import (
     PackedTensor,
     cu_seqlens_from_lengths,
 )
 from skyrl.backends.skyrl_train.utils.sample_support import (
+    SAMPLE_SUPPORT_NO_ROW,
     SAMPLE_SUPPORT_PADDING,
     SAMPLE_SUPPORT_TORCH_DTYPE,
 )
@@ -25,6 +27,7 @@ from skyrl.backends.skyrl_train.utils.sample_support_replay import (
     SampleSupportScores,
     compute_sample_support_scores,
     reject_unsupported_sample_support_packing,
+    sample_support_csr_scores,
     sample_support_scores,
     synthetic_eos_logprobs,
 )
@@ -641,20 +644,30 @@ def _reference_from_canonical_positions(logits, sequences, lengths, support: Pac
     return expected
 
 
-def _dense_scores(lengths, *, packed=False, support=None, **overrides):
+def _ragged(support: PackedTensor) -> PackedRaggedTensor:
+    return PackedRaggedTensor.from_padded_rows(support, padding_value=SAMPLE_SUPPORT_PADDING)
+
+
+def _scores(lengths, *, ragged, packed=False, support=None, **overrides):
+    """Score one batch through whichever support form is asked for; the inputs are seeded alike."""
     sequences, mask, loss_mask, num_actions, logits = _batch_tensors(lengths)
     if packed:
         logits = torch.cat([logits[row, mask[row]] for row in range(logits.shape[0])], dim=0).unsqueeze(0)
+    field = _support(lengths) if support is None else support
     return compute_sample_support_scores(
         logits,
         sequences,
         loss_mask,
-        _support(lengths) if support is None else support,
+        _ragged(field) if ragged else field,
         num_actions,
         packed=packed,
         metadata_layout=_layout(lengths, packed=packed),
         **{**DENSE_SCORER_KWARGS, **overrides},
     )
+
+
+def _dense_scores(lengths, *, packed=False, support=None, **overrides):
+    return _scores(lengths, ragged=False, packed=packed, support=support, **overrides)
 
 
 def test_row_id_join_scores_the_response_suffix_domain():
@@ -791,3 +804,379 @@ def test_an_all_padding_microbatch_scores_nothing():
 
     assert not scores.valid_mask.any()
     assert torch.all(scores.logprobs == 0)
+
+
+# Include empty, singleton, partially filled, and full rows.
+RAGGED_LENGTHS: List[Tuple[int, int]] = [(2, 4), (3, 3)]
+RAGGED_MEMBER_COUNTS = [TOP_K, 0, 2, 1, TOP_K, 1, 0]
+
+
+def _sized_support(lengths, member_counts) -> PackedTensor:
+    """Fixed-width rows with the stated member counts and a distinct member set per row."""
+    response_lens = [response for _, response in lengths]
+    assert len(member_counts) == sum(response_lens)
+    rows = torch.full((sum(response_lens), TOP_K), SAMPLE_SUPPORT_PADDING, dtype=SAMPLE_SUPPORT_TORCH_DTYPE)
+    for row_index, count in enumerate(member_counts):
+        for slot in range(count):
+            rows[row_index, slot] = (row_index * TOP_K + slot) % VOCAB
+    return PackedTensor(rows, cu_seqlens_from_lengths(response_lens))
+
+
+def _sized_batch(lengths, member_counts):
+    """Build a batch whose sampled tokens belong to their support rows."""
+    support = _sized_support(lengths, member_counts)
+    mask = _attention_mask(lengths)
+    sequence_length = mask.shape[1]
+    generator = torch.Generator().manual_seed(7)
+    sequences = torch.randint(0, VOCAB, mask.shape, generator=generator)
+    logits = torch.randn((*mask.shape, VOCAB), dtype=torch.float64, generator=generator)
+    num_actions = max(response for _, response in lengths)
+    loss_mask = torch.zeros((mask.shape[0], num_actions), dtype=torch.bool)
+    row = 0
+    for index, (_, response) in enumerate(lengths):
+        loss_mask[index, num_actions - response :] = True
+        for offset in range(response):
+            members = support.values[row][support.values[row] >= 0]
+            if members.numel():
+                # The weakest member, so the sampled token is not also the row's maximum.
+                sequences[index, sequence_length - response + offset] = int(members[-1])
+            row += 1
+    return support, sequences, mask, loss_mask, num_actions, logits
+
+
+def _sized_scores(lengths, member_counts, *, ragged, packed=False, **overrides):
+    support, sequences, mask, loss_mask, num_actions, logits = _sized_batch(lengths, member_counts)
+    if packed:
+        logits = torch.cat([logits[row, mask[row]] for row in range(logits.shape[0])], dim=0).unsqueeze(0)
+    return compute_sample_support_scores(
+        logits,
+        sequences,
+        loss_mask,
+        _ragged(support) if ragged else support,
+        num_actions,
+        packed=packed,
+        metadata_layout=_layout(lengths, packed=packed),
+        **{**DENSE_SCORER_KWARGS, **overrides},
+    )
+
+
+def test_the_ragged_form_carries_the_same_rows_in_fewer_slots():
+    support = _sized_support(RAGGED_LENGTHS, RAGGED_MEMBER_COUNTS)
+
+    ragged = _ragged(support)
+
+    assert ragged.row_lengths.tolist() == RAGGED_MEMBER_COUNTS
+    assert len(ragged) == len(support)
+    assert ragged.sequence_lengths.tolist() == support.sequence_lengths.tolist()
+    for row in range(support.values.shape[0]):
+        assert torch.equal(ragged.row(row), support.values[row][support.values[row] >= 0])
+    assert ragged.values.numel() == sum(RAGGED_MEMBER_COUNTS) < support.values.numel()
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_ragged_and_fixed_width_score_the_same_logprobs_entropy_and_masks(megatron_parallel_state, packed):
+    entropy_kwargs = dict(compute_entropy=True, entropy_requires_grad=False)
+    fixed = _sized_scores(RAGGED_LENGTHS, RAGGED_MEMBER_COUNTS, ragged=False, packed=packed, **entropy_kwargs)
+    ragged = _sized_scores(RAGGED_LENGTHS, RAGGED_MEMBER_COUNTS, ragged=True, packed=packed, **entropy_kwargs)
+
+    torch.testing.assert_close(ragged.logprobs, fixed.logprobs)
+    assert fixed.entropy is not None and ragged.entropy is not None
+    torch.testing.assert_close(ragged.entropy, fixed.entropy)
+    assert torch.equal(ragged.valid_mask, fixed.valid_mask)
+    assert int(ragged.valid_mask.sum()) == sum(1 for count in RAGGED_MEMBER_COUNTS if count)
+    assert int((ragged.logprobs != 0).sum()) > 0
+
+
+def test_ragged_and_fixed_width_agree_on_the_gradient():
+    support, sequences, _, loss_mask, num_actions, logits = _sized_batch(RAGGED_LENGTHS, RAGGED_MEMBER_COUNTS)
+    grads = []
+    for field in (support, _ragged(support)):
+        source = logits.detach().clone().requires_grad_(True)
+        scores = compute_sample_support_scores(
+            source,
+            sequences,
+            loss_mask,
+            field,
+            num_actions,
+            packed=False,
+            metadata_layout=_layout(RAGGED_LENGTHS),
+            **{**DENSE_SCORER_KWARGS, "compute_entropy": True, "entropy_requires_grad": True},
+        )
+        (scores.logprobs + scores.entropy).sum().backward()
+        grads.append(source.grad)
+
+    assert float(grads[0].abs().sum()) > 0
+    torch.testing.assert_close(grads[1], grads[0])
+
+
+def test_a_single_member_row_scores_exactly_zero_in_both_forms():
+    lengths = [(2, 2)]
+    entropy_kwargs = dict(compute_entropy=True, entropy_requires_grad=False)
+    fixed = _sized_scores(lengths, [1, 1], ragged=False, **entropy_kwargs)
+    ragged = _sized_scores(lengths, [1, 1], ragged=True, **entropy_kwargs)
+
+    scored = fixed.valid_mask
+    assert int(scored.sum()) == 2
+    assert torch.equal(ragged.valid_mask, scored)
+    assert torch.all(fixed.logprobs[scored] == 0.0)
+    assert torch.all(ragged.logprobs[scored] == 0.0)
+    assert torch.all(ragged.entropy[scored] == 0.0)
+    assert torch.all(fixed.entropy[scored] == 0.0)
+
+
+def test_a_row_with_no_members_falls_back_to_the_full_vocabulary_in_both_forms():
+    lengths = [(3, 3)]
+    fixed = _sized_scores(lengths, [2, 2, 0], ragged=False)
+    ragged = _sized_scores(lengths, [2, 2, 0], ragged=True)
+
+    eos_position = _attention_mask(lengths).shape[1] - 2
+    assert not fixed.valid_mask[0, eos_position] and not ragged.valid_mask[0, eos_position]
+    assert fixed.logprobs[0, eos_position] != 0
+    torch.testing.assert_close(ragged.logprobs, fixed.logprobs)
+
+
+def test_a_second_empty_ragged_row_in_one_trajectory_is_rejected():
+    with pytest.raises(ValueError, match="at most one loss-bearing token"):
+        _sized_scores([(3, 3)], [2, 0, 0], ragged=True)
+
+
+def test_an_all_padding_microbatch_scores_nothing_in_the_ragged_form():
+    support = PackedRaggedTensor(
+        torch.empty(0, dtype=SAMPLE_SUPPORT_TORCH_DTYPE),
+        cu_seqlens_from_lengths([]),
+        cu_seqlens_from_lengths([0]),
+    )
+    mask = torch.zeros((1, 4), dtype=torch.bool)
+    mask[0, 0] = True
+
+    scores = compute_sample_support_scores(
+        torch.randn((1, 4, VOCAB), dtype=torch.float64),
+        torch.zeros((1, 4), dtype=torch.long),
+        torch.zeros((1, 2), dtype=torch.bool),
+        support,
+        2,
+        packed=False,
+        metadata_layout=TokenMetadataLayout(attention_mask=mask, sequence_lengths=[1], aligned_sequence_length=4),
+        **DENSE_SCORER_KWARGS,
+    )
+
+    assert not scores.valid_mask.any()
+    assert torch.all(scores.logprobs == 0)
+
+
+CSR_UNIT_SUPPORT = PackedRaggedTensor(
+    torch.tensor([1, 2, 3, 4, 5, 6], dtype=SAMPLE_SUPPORT_TORCH_DTYPE),
+    cu_seqlens_from_lengths([3, 0, 1, 2]),
+    cu_seqlens_from_lengths([4]),
+)
+CSR_UNIT_ROW_IDS = torch.tensor([[SAMPLE_SUPPORT_NO_ROW, 0, 1, 2, 3]])
+CSR_UNIT_SAMPLED = torch.tensor([[0, 3, 0, 4, 6]])
+CSR_UNIT_KWARGS = dict(
+    vocab_start_index=0,
+    vocab_end_index=VOCAB,
+    tp_group=None,
+    compute_entropy=False,
+    entropy_requires_grad=False,
+)
+CSR_UNIT_DENSE_ROWS = torch.tensor(
+    [[[-1, -1, -1], [1, 2, 3], [-1, -1, -1], [4, -1, -1], [5, 6, -1]]],
+    dtype=SAMPLE_SUPPORT_TORCH_DTYPE,
+)
+
+
+def test_only_multi_member_rows_reach_the_projection(monkeypatch):
+    widths: List[int] = []
+    original = sample_support_replay._project_candidate_pairs
+
+    def spy(hidden, row_ids, token_ids, weight, temperature, chunk_size):
+        widths.append(int(token_ids.numel()))
+        return original(hidden, row_ids, token_ids, weight, temperature, chunk_size)
+
+    monkeypatch.setattr(sample_support_replay, "_project_candidate_pairs", spy)
+    hidden = torch.randn(1, 5, 3, dtype=torch.float64)
+    weight = torch.randn(VOCAB, 3, dtype=torch.float64)
+
+    ragged = sample_support_csr_scores(
+        hidden, CSR_UNIT_SAMPLED, CSR_UNIT_SUPPORT, CSR_UNIT_ROW_IDS, lm_head_weight=weight, **CSR_UNIT_KWARGS
+    )
+    # Rows 0 and 3 are the only ones with more than one member: 3 + 2 pairs, in one chunk.
+    assert widths == [5]
+
+    widths.clear()
+    fixed = sample_support_scores(
+        hidden, CSR_UNIT_SAMPLED, CSR_UNIT_DENSE_ROWS, lm_head_weight=weight, **CSR_UNIT_KWARGS
+    )
+    # The fixed-width path projects every slot of every position, occupied or not, plus one
+    # sampled pair per position -- 20 against 5 for a batch whose real support is 6 members.
+    assert sum(widths) == 5 * 3 + 5
+
+    assert ragged.valid_mask.tolist() == [[False, True, False, True, True]]
+    assert torch.equal(ragged.valid_mask, fixed.valid_mask)
+    torch.testing.assert_close(ragged.logprobs, fixed.logprobs, check_dtype=False)
+    assert float(ragged.logprobs[0, 3]) == 0.0
+
+
+def test_two_positions_naming_one_support_row_are_refused():
+    with pytest.raises(ValueError, match="named by more than one model position"):
+        sample_support_csr_scores(
+            torch.randn(1, 2, VOCAB, dtype=torch.float64),
+            torch.tensor([[1, 1]]),
+            CSR_UNIT_SUPPORT,
+            torch.tensor([[0, 0]]),
+            **CSR_UNIT_KWARGS,
+        )
+
+
+def test_ragged_support_ids_must_use_the_canonical_dtype():
+    support = PackedRaggedTensor(
+        torch.tensor([1, 2], dtype=torch.int64),
+        cu_seqlens_from_lengths([2]),
+        cu_seqlens_from_lengths([1]),
+    )
+
+    with pytest.raises(ValueError, match=str(SAMPLE_SUPPORT_TORCH_DTYPE)):
+        sample_support_csr_scores(
+            torch.randn(1, 1, VOCAB, dtype=torch.float64),
+            torch.tensor([[1]]),
+            support,
+            torch.tensor([[0]]),
+            **CSR_UNIT_KWARGS,
+        )
+
+
+def _tensor_parallel_csr_scores(fake, logits, sampled_ids, support, row_ids, **entropy_kwargs):
+    """Score the same rows on every vocabulary shard and return rank 0's result."""
+    width = VOCAB // fake.world_size
+    results: List[SampleSupportScores | None] = [None] * fake.world_size
+    errors: List[BaseException] = []
+
+    def run(rank: int) -> None:
+        fake.set_rank(rank)
+        start = rank * width
+        end = VOCAB if rank == fake.world_size - 1 else start + width
+        try:
+            results[rank] = sample_support_csr_scores(
+                logits[..., start:end],
+                sampled_ids,
+                support,
+                row_ids,
+                vocab_start_index=start,
+                vocab_end_index=end,
+                tp_group=object(),
+                **entropy_kwargs,
+            )
+        except BaseException as error:  # surface it instead of deadlocking the peers
+            errors.append(error)
+            fake._barrier.abort()
+
+    threads = [threading.Thread(target=run, args=(rank,)) for rank in range(fake.world_size)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    if errors:
+        raise errors[0]
+    scores = results[0]
+    assert scores is not None
+    return scores
+
+
+def test_ragged_tensor_parallel_shards_reduce_to_the_unsharded_scores(tensor_parallel):
+    logits = torch.randn(1, 5, VOCAB, dtype=torch.float64)
+    entropy_kwargs = dict(compute_entropy=True, entropy_requires_grad=False)
+
+    sharded = _tensor_parallel_csr_scores(
+        tensor_parallel, logits, CSR_UNIT_SAMPLED, CSR_UNIT_SUPPORT, CSR_UNIT_ROW_IDS, **entropy_kwargs
+    )
+
+    unsharded = sample_support_csr_scores(
+        logits, CSR_UNIT_SAMPLED, CSR_UNIT_SUPPORT, CSR_UNIT_ROW_IDS, **{**CSR_UNIT_KWARGS, **entropy_kwargs}
+    )
+    torch.testing.assert_close(sharded.logprobs, unsharded.logprobs)
+    torch.testing.assert_close(sharded.entropy, unsharded.entropy)
+    assert torch.equal(sharded.valid_mask, unsharded.valid_mask)
+
+
+def test_the_ragged_reduction_is_sized_by_support_rows_not_model_positions(tensor_parallel):
+    logits = torch.randn(1, 5, VOCAB, dtype=torch.float64)
+    entropy_kwargs = dict(compute_entropy=True, entropy_requires_grad=False)
+    rows, positions = CSR_UNIT_SUPPORT.num_rows, CSR_UNIT_SAMPLED.numel()
+    assert rows < positions
+
+    _tensor_parallel_csr_scores(
+        tensor_parallel, logits, CSR_UNIT_SAMPLED, CSR_UNIT_SUPPORT, CSR_UNIT_ROW_IDS, **entropy_kwargs
+    )
+    ragged_calls = list(tensor_parallel.calls)
+    tensor_parallel.calls.clear()
+    _tensor_parallel_scores(tensor_parallel, logits, CSR_UNIT_SAMPLED, CSR_UNIT_DENSE_ROWS, **entropy_kwargs)
+    fixed_calls = list(tensor_parallel.calls)
+
+    max_op, sum_op = torch.distributed.ReduceOp.MAX, torch.distributed.ReduceOp.SUM
+    assert Counter(ragged_calls) == Counter({(max_op, (rows,)): TP_SIZE, (sum_op, (3, rows)): TP_SIZE})
+    assert Counter(fixed_calls) == Counter({(max_op, (positions,)): TP_SIZE, (sum_op, (3, positions)): TP_SIZE})
+
+
+def _tensor_parallel_fused_csr(fake, hidden, weight, sampled_ids, support, row_ids):
+    """Run every vocabulary shard concurrently, keeping each rank's own differentiable inputs."""
+    width = VOCAB // fake.world_size
+    outputs: List[tuple | None] = [None] * fake.world_size
+    errors: List[BaseException] = []
+
+    def run(rank: int) -> None:
+        fake.set_rank(rank)
+        start = rank * width
+        end = VOCAB if rank == fake.world_size - 1 else start + width
+        shard_hidden = hidden.detach().clone().requires_grad_(True)
+        shard_weight = weight[start:end].detach().clone().requires_grad_(True)
+        try:
+            scores = sample_support_csr_scores(
+                shard_hidden,
+                sampled_ids,
+                support,
+                row_ids,
+                vocab_start_index=start,
+                vocab_end_index=end,
+                tp_group=object(),
+                compute_entropy=False,
+                entropy_requires_grad=False,
+                lm_head_weight=shard_weight,
+            )
+            outputs[rank] = (scores, shard_hidden, shard_weight)
+        except BaseException as error:
+            errors.append(error)
+            fake._barrier.abort()
+
+    threads = [threading.Thread(target=run, args=(rank,)) for rank in range(fake.world_size)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    if errors:
+        raise errors[0]
+    return outputs
+
+
+def test_a_vocabulary_shard_owning_no_member_still_reaches_the_backward_graph(tensor_parallel):
+    """The projection short-circuits an empty pair list, and every rank still needs a grad buffer."""
+    # Every member lands in the low shard, so the high shard owns none of them.
+    support = PackedRaggedTensor(
+        torch.tensor([0, 1, 2, 3], dtype=SAMPLE_SUPPORT_TORCH_DTYPE),
+        cu_seqlens_from_lengths([2, 2]),
+        cu_seqlens_from_lengths([2]),
+    )
+    hidden = torch.randn(1, 2, 3, dtype=torch.float64)
+    weight = torch.randn(VOCAB, 3, dtype=torch.float64)
+
+    outputs = _tensor_parallel_fused_csr(
+        tensor_parallel, hidden, weight, torch.tensor([[1, 3]]), support, torch.tensor([[0, 1]])
+    )
+
+    for scores, shard_hidden, shard_weight in outputs:
+        scores.logprobs.sum().backward()
+        assert shard_hidden.grad is not None
+        assert shard_weight.grad is not None
+    _, empty_hidden, empty_weight = outputs[1]
+    assert torch.all(empty_weight.grad == 0)
+    assert torch.all(empty_hidden.grad == 0)
+    # And the shard that owns everything still produced the scores.
+    assert outputs[0][0].valid_mask.all()

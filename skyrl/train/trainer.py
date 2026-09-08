@@ -917,6 +917,7 @@ class RayPPOTrainer:
             rollout_expert_indices,
             rollout_sample_support,
             max_seq_len=self.cfg.trainer.algorithm.max_seq_len,
+            sample_support_ragged_rows=self.cfg.trainer.algorithm.sample_support_ragged_rows,
         )
         router_padding_mask = None
         if rollout_expert_indices is not None:

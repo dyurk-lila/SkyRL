@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 from skyrl.backends.skyrl_train.distributed.ulysses import utils as ulysses_utils
+from skyrl.backends.skyrl_train.utils.packed_ragged_tensor import PackedRaggedTensor
 from skyrl.backends.skyrl_train.utils.packed_tensor import (
     PackedTensor,
     cu_seqlens_from_lengths,
@@ -441,3 +442,44 @@ def test_sequence_parallel_slice_pads_each_channel_with_its_own_sentinel(monkeyp
     assert tail.row_ids.tolist() == [[2, SAMPLE_SUPPORT_NO_ROW]]
     assert tail.loss_mask.tolist() == [[True, False]]
     assert tail.trajectory_ids.tolist() == [[0, _NO_TRAJECTORY]]
+
+
+# ── the ragged inner level, through the real forward ─────────────────────────
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("unsupported_rows", [(), (2,)], ids=["all_supported", "appended_eos"])
+def test_the_ragged_support_form_scores_the_same_through_the_forward(packed, unsupported_rows):
+    """Same field, either inner level: the wrapper places row ids and never the rows themselves,
+    so the whole unpad / roll / next-token path is shared and only the scorer differs."""
+    sequences, attention_mask = _ragged_batch()
+    fixed = _ragged_support(sequences, unsupported_rows=unsupported_rows)
+    ragged = PackedRaggedTensor.from_padded_rows(fixed, padding_value=SAMPLE_SUPPORT_PADDING)
+    fixed_model = _TokenIndexedLM()
+    ragged_model = _TokenIndexedLM()
+    ragged_model.table.data.copy_(fixed_model.table.data)
+
+    fixed_scores = _forward(_wrapper(fixed_model, packed=packed), sequences, attention_mask, fixed, [2, 1], 2)
+    ragged_scores = _forward(_wrapper(ragged_model, packed=packed), sequences, attention_mask, ragged, [2, 1], 2)
+    fixed_scores.sum().backward()
+    ragged_scores.sum().backward()
+
+    torch.testing.assert_close(ragged_scores, _reference(fixed_model.table.detach(), sequences, fixed, 2))
+    torch.testing.assert_close(ragged_scores, fixed_scores)
+    torch.testing.assert_close(ragged_model.table.grad, fixed_model.table.grad)
+    assert ragged.row_lengths.tolist() == ([2, 2, 0] if unsupported_rows else [2, 2, 2])
+
+
+def test_the_ragged_forward_reports_the_same_entropy_and_mask(monkeypatch):
+    sequences, attention_mask = _ragged_batch()
+    fixed = _ragged_support(sequences, unsupported_rows=(1,))
+    ragged = PackedRaggedTensor.from_padded_rows(fixed, padding_value=SAMPLE_SUPPORT_PADDING)
+    model = _TokenIndexedLM()
+
+    fixed_entropy, fixed_mask = _forward_entropy(_wrapper(model), sequences, attention_mask, fixed, [2, 1], 2)
+    ragged_entropy, ragged_mask = _forward_entropy(_wrapper(model), sequences, attention_mask, ragged, [2, 1], 2)
+
+    torch.testing.assert_close(ragged_entropy, fixed_entropy)
+    assert torch.equal(ragged_mask, fixed_mask)
+    # The emptied row is outside the mask, so the comparison is not over a constant.
+    assert not ragged_mask.all() and ragged_mask.any()

@@ -10,6 +10,8 @@ import numpy as np
 import pytest
 import torch
 
+from skyrl.backends.skyrl_train.utils.packed_ragged_tensor import PackedRaggedTensor
+from skyrl.backends.skyrl_train.utils.packed_tensor import PackedTensor
 from skyrl.backends.skyrl_train.utils.routed_experts import (
     ROUTED_EXPERT_DTYPES,
     RoutedExpertRoutes,
@@ -22,6 +24,7 @@ from skyrl.backends.skyrl_train.utils.sample_support import (
 from skyrl.train.dataset import parallel_fill
 from skyrl.train.dataset.preprocess import (
     ROUTED_EXPERT_TORCH_DTYPES,
+    build_sample_support,
     convert_prompts_responses_to_batch_tensors,
     make_router_padding_mask,
 )
@@ -753,3 +756,45 @@ def test_routed_expert_tensor_rejects_disagreeing_layer_indices(tokenizer):
             loss_masks=[[1, 1], [1, 1]],
             rollout_expert_indices=routes,
         )
+
+
+def test_build_sample_support_ragged_rows_drops_every_padding_slot():
+    rows = np.full((3, 4), SAMPLE_SUPPORT_PADDING, dtype=SAMPLE_SUPPORT_DTYPE)
+    rows[0, :4] = [5, 6, 7, 8]
+    rows[1, :1] = [9]
+    fixed = build_sample_support([rows], np.asarray([3]))
+    ragged = build_sample_support([rows], np.asarray([3]), ragged_rows=True)
+
+    assert isinstance(fixed, PackedTensor) and isinstance(ragged, PackedRaggedTensor)
+    assert ragged.sequence_lengths.tolist() == fixed.sequence_lengths.tolist() == [3]
+    assert ragged.row_lengths.tolist() == [4, 1, 0]
+    assert ragged.row(0).tolist() == [5, 6, 7, 8]
+    assert ragged.row(2).tolist() == []
+    assert ragged.dtype == SAMPLE_SUPPORT_TORCH_DTYPE
+    assert ragged.values.numel() == 5 < fixed.values.numel()
+
+
+def test_convert_batch_tensors_carries_the_support_form_it_is_asked_for(tokenizer):
+    support = [np.asarray([[1, 2, -1], [3, -1, -1]], dtype=SAMPLE_SUPPORT_DTYPE)] * 2
+
+    *_, fixed = convert_prompts_responses_to_batch_tensors(
+        tokenizer.pad_token_id,
+        prompts=[[10], [20]],
+        responses=[[11, 12], [21, 22]],
+        rewards=[[0.0, 0.0], [0.0, 0.0]],
+        loss_masks=[[1, 1], [1, 1]],
+        rollout_sample_support=support,
+    )
+    *_, ragged = convert_prompts_responses_to_batch_tensors(
+        tokenizer.pad_token_id,
+        prompts=[[10], [20]],
+        responses=[[11, 12], [21, 22]],
+        rewards=[[0.0, 0.0], [0.0, 0.0]],
+        loss_masks=[[1, 1], [1, 1]],
+        rollout_sample_support=support,
+        sample_support_ragged_rows=True,
+    )
+
+    assert isinstance(fixed, PackedTensor) and isinstance(ragged, PackedRaggedTensor)
+    assert ragged.row_lengths.tolist() == [2, 1, 2, 1]
+    assert ragged.sequence_lengths.tolist() == fixed.sequence_lengths.tolist()

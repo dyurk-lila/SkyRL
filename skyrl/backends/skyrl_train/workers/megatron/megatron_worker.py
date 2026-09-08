@@ -57,12 +57,12 @@ from skyrl.backends.skyrl_train.patches.te.patch_fa2_head_dim import (
     patch_fa2_head_dim_allowlist,
 )
 from skyrl.backends.skyrl_train.training_batch import (
+    PACKED_BATCH_FIELD_TYPES,
     TrainingInputBatch,
     TrainingOutputBatch,
     append_packed_field_padding,
     packed_dummy_row_segments,
 )
-from skyrl.backends.skyrl_train.utils.packed_tensor import PackedTensor
 from skyrl.backends.skyrl_train.utils.profiler import build_profiler_from_policy_cfg
 from skyrl.backends.skyrl_train.utils.routed_experts import (
     ROUTED_EXPERT_LAYER_INDICES_KEY,
@@ -977,7 +977,7 @@ class MegatronWorker:
             if value is None:
                 padded[key] = None
                 continue
-            if isinstance(value, PackedTensor):
+            if isinstance(value, PACKED_BATCH_FIELD_TYPES):
                 # Per-token fields cover the dummy attended token; response fields do not.
                 padded[key] = append_packed_field_padding(
                     key, value, segment_lengths=packed_dummy_row_segments(key, pad_count)
