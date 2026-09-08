@@ -44,6 +44,7 @@ from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
     build_logprobs_content,
     pack_routed_experts,
     pack_sample_support,
+    routes_from_capture,
 )
 from skyrl.backends.skyrl_train.inference_servers.protocols import ServerActorProtocol
 from skyrl.backends.skyrl_train.utils.sample_support import (
@@ -587,7 +588,9 @@ class VLLMServerActor(ServerActorProtocol):
 
             routed_experts = None
             if resp.routed_experts is not None:
-                routed_experts = pack_routed_experts(resp.routed_experts)
+                # The captured layers travel with the routes: the trainer maps its own MoE
+                # layers onto the layer dimension by looking them up, never by position.
+                routed_experts = pack_routed_experts(routes_from_capture(resp.routed_experts))
 
             payload = {
                 "choices": [

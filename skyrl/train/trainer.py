@@ -45,6 +45,9 @@ from skyrl.backends.skyrl_train.utils.ppo_utils import (
     compute_approx_kl,
     get_kl_controller,
 )
+from skyrl.backends.skyrl_train.utils.routed_experts import (
+    ROUTED_EXPERT_LAYER_INDICES_KEY,
+)
 from skyrl.backends.skyrl_train.utils.sample_support import SAMPLE_SUPPORT_FIELD
 from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
 from skyrl.backends.skyrl_train.workers.worker import PPORayActorGroup
@@ -902,6 +905,7 @@ class RayPPOTrainer:
             loss_masks_tensor,
             rollout_logprobs_tensor,
             rollout_expert_indices_tensor,
+            rollout_expert_layer_indices,
             rollout_sample_support_tensor,
         ) = convert_prompts_responses_to_batch_tensors(
             self.tokenizer.pad_token_id,
@@ -918,7 +922,7 @@ class RayPPOTrainer:
         if rollout_expert_indices is not None:
             router_padding_mask = make_router_padding_mask(
                 attention_masks_tensor,
-                [len(indices) for indices in rollout_expert_indices],
+                [routes.num_tokens for routes in rollout_expert_indices],
             )
 
         # sanity check for off_policy_correction
@@ -948,6 +952,8 @@ class RayPPOTrainer:
             },
         )
         training_input.metadata = {"uids": uids}
+        if rollout_expert_layer_indices is not None:
+            training_input.metadata[ROUTED_EXPERT_LAYER_INDICES_KEY] = rollout_expert_layer_indices
         if generator_output.get("is_last_step", None) is not None:
             training_input.metadata["is_last_step"] = generator_output["is_last_step"]
 
@@ -1334,8 +1340,10 @@ class RayPPOTrainer:
             - `["values"]`: Float[torch.Tensor, "batch_size response_len"]
         """
         fwd_keys = ["sequences", "attention_mask"]
+        fwd_metadata_keys = ["response_length"]
         if training_input.get("rollout_expert_indices") is not None:
             fwd_keys.append("rollout_expert_indices")
+            fwd_metadata_keys.append(ROUTED_EXPERT_LAYER_INDICES_KEY)
         if training_input.get("router_padding_mask") is not None:
             fwd_keys.append("router_padding_mask")
         if training_input.get(SAMPLE_SUPPORT_FIELD) is not None:
@@ -1346,7 +1354,7 @@ class RayPPOTrainer:
             fwd_keys.append("pixel_values")
         if training_input.get("image_grid_thw") is not None:
             fwd_keys.append("image_grid_thw")
-        data_fwd_pass = training_input.select(keys=fwd_keys, metadata_keys=["response_length"])
+        data_fwd_pass = training_input.select(keys=fwd_keys, metadata_keys=fwd_metadata_keys)
 
         values = None
         base_log_probs = None

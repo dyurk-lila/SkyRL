@@ -64,6 +64,9 @@ from skyrl.backends.skyrl_train.training_batch import (
 )
 from skyrl.backends.skyrl_train.utils.packed_tensor import PackedTensor
 from skyrl.backends.skyrl_train.utils.profiler import build_profiler_from_policy_cfg
+from skyrl.backends.skyrl_train.utils.routed_experts import (
+    ROUTED_EXPERT_LAYER_INDICES_KEY,
+)
 from skyrl.backends.skyrl_train.utils.sample_support import SAMPLE_SUPPORT_FIELD
 from skyrl.backends.skyrl_train.weight_sync import (
     LoraLoadRequest,
@@ -117,6 +120,17 @@ if TYPE_CHECKING:
         InferenceEngineInterface,
     )
     from skyrl.train.config.config import InferenceEngineConfig
+
+
+def _replay_layer_indices(metadata: Optional[Dict[str, Any]]) -> List[int]:
+    """Read the captured MoE layer indices that travel with a batch's replay routes."""
+    layer_indices = None if metadata is None else metadata.get(ROUTED_EXPERT_LAYER_INDICES_KEY)
+    if layer_indices is None:
+        raise ValueError(
+            f"router replay is enabled but the batch carries no {ROUTED_EXPERT_LAYER_INDICES_KEY}; "
+            "replay routes must name the layers they were captured from"
+        )
+    return [int(layer_index) for layer_index in layer_indices]
 
 
 class MegatronWeightExtractor(WeightExtractor):
@@ -846,6 +860,11 @@ class MegatronWorker:
                     "position_ids": position_ids,
                     "num_actions": micro.metadata["response_length"],
                     "rollout_expert_indices": (rollout_expert_indices if self.enable_router_replay else None),
+                    ROUTED_EXPERT_LAYER_INDICES_KEY: (
+                        _replay_layer_indices(micro.metadata)
+                        if self.enable_router_replay and rollout_expert_indices is not None
+                        else None
+                    ),
                     "router_padding_mask": micro.get("router_padding_mask") if self.enable_router_replay else None,
                     SAMPLE_SUPPORT_FIELD: (
                         micro.get(SAMPLE_SUPPORT_FIELD) if self.enable_sample_support_replay else None
@@ -930,8 +949,8 @@ class MegatronWorker:
         Padded samples have loss_mask/response_mask=0 so they don't contribute to the loss
         (forward micro-batches carry neither key, so this is inert there). This is needed
         because Megatron's forward_backward_func requires uniform micro_batch_size across all
-        microbatches (especially with PP > 1). Scalar keys (``num_actions``,
-        ``num_microbatches``, ``num_real_microbatches``) are passed through unchanged.
+        microbatches (especially with PP > 1). Keys that do not index by batch position are
+        passed through unchanged.
 
         Defined on the base worker so the shared ``_forward_logprobs`` path works for
         policy, ref, and critic workers alike.
@@ -945,7 +964,14 @@ class MegatronWorker:
 
         padded = {}
         for key, value in micro_dict.items():
-            if key in ("num_actions", "num_microbatches", "num_real_microbatches"):
+            # Batch-invariant fields: the captured layer mapping describes the layer
+            # dimension, not the batch dimension, so padding rows must not touch it.
+            if key in (
+                "num_actions",
+                "num_microbatches",
+                "num_real_microbatches",
+                ROUTED_EXPERT_LAYER_INDICES_KEY,
+            ):
                 padded[key] = value
                 continue
             if value is None:
@@ -1254,6 +1280,11 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                     "rollout_action_logprobs": experience.rollout_logprobs,
                     "response_mask": experience.response_mask,
                     "rollout_expert_indices": rollout_expert_indices if self.enable_router_replay else None,
+                    ROUTED_EXPERT_LAYER_INDICES_KEY: (
+                        _replay_layer_indices(experience.metadata)
+                        if self.enable_router_replay and rollout_expert_indices is not None
+                        else None
+                    ),
                     "router_padding_mask": experience.router_padding_mask if self.enable_router_replay else None,
                     SAMPLE_SUPPORT_FIELD: (
                         experience.rollout_sample_support if self.enable_sample_support_replay else None
@@ -1382,6 +1413,11 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                     "rollout_action_logprobs": experience.rollout_logprobs,
                     "response_mask": experience.response_mask,
                     "rollout_expert_indices": rollout_expert_indices if self.enable_router_replay else None,
+                    ROUTED_EXPERT_LAYER_INDICES_KEY: (
+                        _replay_layer_indices(experience.metadata)
+                        if self.enable_router_replay and rollout_expert_indices is not None
+                        else None
+                    ),
                     "router_padding_mask": experience.router_padding_mask if self.enable_router_replay else None,
                     SAMPLE_SUPPORT_FIELD: (
                         experience.rollout_sample_support if self.enable_sample_support_replay else None

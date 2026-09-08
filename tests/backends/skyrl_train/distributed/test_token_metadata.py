@@ -10,7 +10,10 @@ from skyrl.backends.skyrl_train.distributed.megatron.token_metadata import (
     TokenMetadataTrace,
 )
 from skyrl.backends.skyrl_train.utils.packed_tensor import PackedTensor
-from skyrl.backends.skyrl_train.utils.routed_experts import RoutedExpertTrace
+from skyrl.backends.skyrl_train.utils.routed_experts import (
+    RoutedExpertRoutes,
+    RoutedExpertTrace,
+)
 
 
 @pytest.fixture
@@ -126,8 +129,14 @@ def test_token_metadata_trace_rejects_invalid_chunks(rows, expected, match) -> N
         trace.append(rows, expected_rows=expected)
 
 
-def routes(rows: int) -> np.ndarray:
-    return np.arange(rows * 4, dtype=np.int32).reshape(rows, 2, 2) % 8
+def routes(rows: int) -> RoutedExpertRoutes:
+    """Captured routes now travel with the transformer layer each slot came from.
+
+    The layer indices are interleaved, as a hybrid Mamba-MoE model reports them, so a consumer
+    that assumed a contiguous zero-based ordering fails here rather than silently mis-mapping.
+    """
+    indices = np.arange(rows * 4, dtype=np.int32).reshape(rows, 2, 2) % 8
+    return RoutedExpertRoutes(indices, (1, 3))
 
 
 def test_routed_expert_trace_tracks_multiturn_suffix_and_terminal_gap() -> None:
@@ -142,9 +151,11 @@ def test_routed_expert_trace_tracks_multiturn_suffix_and_terminal_gap() -> None:
     # mark it so Megatron excludes it from router accounting.
     result = trace.finalize(token_count=9, loss_mask=[0, 0, 0, 1, 1, 0, 0, 1, 1])
     assert trace.prompt_start == 8
-    assert result.shape == (8, 2, 2) and result.dtype == np.uint8
+    assert result.indices.shape == (8, 2, 2) and result.indices.dtype == np.uint8
     # The last row is a real captured route now, not a dummy `arange(topk)` pad row.
-    assert np.array_equal(result[-1, 0], [4, 5])
+    assert np.array_equal(result.indices[-1, 0], [4, 5])
+    # The layer mapping survives the trace rather than being re-derived downstream.
+    assert result.layer_indices == (1, 3)
 
 
 @pytest.mark.parametrize("active", [False, True])
@@ -159,8 +170,8 @@ def test_routed_expert_trace_refuses_a_loss_active_target_without_a_row(active: 
         # A masked suffix is no longer dummy-padded up to `token_count`: the captured rows are
         # returned verbatim and the gap is filled during collation.
         result = trace.finalize(token_count=5, loss_mask=mask)
-        assert result.shape == (3, 2, 2)
-        assert np.array_equal(result, routes(3).astype(result.dtype))
+        assert result.indices.shape == (3, 2, 2)
+        assert np.array_equal(result.indices, routes(3).indices.astype(result.indices.dtype))
 
 
 @pytest.mark.parametrize("packed", [False, True])

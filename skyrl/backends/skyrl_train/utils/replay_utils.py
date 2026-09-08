@@ -2,6 +2,7 @@
 Utility functions for MoE Router Replay.
 """
 
+from collections.abc import Sequence
 from contextlib import contextmanager
 
 import torch
@@ -46,17 +47,9 @@ def make_replay_padding_indices(
 
 
 def patch_topk_router_layer_number():
-    """Monkey-patch TopKRouter.set_layer_number to propagate the global layer
-    number to the RouterReplay instance.
+    """Propagate each router's global layer number to its replay instance.
 
-    DeepSeek V3 (and similar) architectures have dense FFN layers before the MoE
-    layers.  vLLM reports routing indices for ALL transformer layers (including
-    dense), but Megatron only creates RouterReplay instances for MoE layers.
-    Storing the global layer_number on each RouterReplay instance lets us map
-    vLLM's per-layer data to the correct MoE router even when dense layers are
-    present.
-
-    Must be called BEFORE model creation (i.e. before make_megatron_module).
+    Must run before model creation.
     """
     try:
         from megatron.core.transformer.moe.router import TopKRouter
@@ -146,32 +139,50 @@ def _get_current_pp_stage_layer_range(model_config) -> tuple[int, int]:
     return offset, num_layers
 
 
-def _get_local_router_layer_indices(model_config, global_num_layers: int, instances: list) -> list[int]:
-    local_layer_offset, local_num_layers = _get_current_pp_stage_layer_range(model_config)
-    if local_num_layers == len(instances):
-        layer_indices = list(range(local_layer_offset, local_layer_offset + local_num_layers))
-    else:
-        # Dense-layer mismatch: map each MoE router to its global layer index.
-        # Prefer the patched layer_number; fall back to offset-based mapping
-        # (assumes dense layers precede MoE layers).
-        layer_indices = []
-        for local_router_index, router_instance in enumerate(instances):
-            layer_number = getattr(router_instance, "layer_number", None)
-            if layer_number is not None:
-                layer_index = layer_number - 1
-            else:
-                layer_index = local_layer_offset + local_router_index + (local_num_layers - len(instances))
-            layer_indices.append(layer_index)
+def _get_local_router_slot_indices(captured_layer_indices: Sequence[int], instances: list) -> list[int]:
+    """Map local routers to captured route slots in ``instances`` order."""
+    slot_by_layer_index = {layer_index: slot for slot, layer_index in enumerate(captured_layer_indices)}
+    if len(slot_by_layer_index) != len(captured_layer_indices):
+        raise ValueError(f"Captured routed-expert layer indices contain duplicates: {list(captured_layer_indices)}")
 
-    if any(layer_index < 0 or layer_index >= global_num_layers for layer_index in layer_indices):
+    slot_indices = []
+    for local_router_index, router_instance in enumerate(instances):
+        # The patch injects this instance attribute during model creation.
+        layer_number = getattr(router_instance, "layer_number", None)
+        if layer_number is None:
+            raise ValueError(
+                f"RouterReplay instance {local_router_index} has no layer_number; "
+                "patch_topk_router_layer_number must run before model creation so replay "
+                "routes can be matched to layers by index rather than by position"
+            )
+        layer_index = layer_number - 1
+        if layer_index not in slot_by_layer_index:
+            raise ValueError(
+                f"Megatron MoE layer {layer_index} has no captured rollout routes; the inference "
+                f"server captured layers {list(captured_layer_indices)}. Trainer and rollout model "
+                "structures disagree."
+            )
+        slot_indices.append(slot_by_layer_index[layer_index])
+    return slot_indices
+
+
+def _verify_captured_layers_cover_pp_stage(captured_layer_indices: Sequence[int], model_config) -> None:
+    """Fail if the rollout capture does not cover this pipeline stage."""
+    local_layer_offset, local_num_layers = _get_current_pp_stage_layer_range(model_config)
+    stage_range = range(local_layer_offset, local_layer_offset + local_num_layers)
+    uncaptured = sorted(set(stage_range) - set(captured_layer_indices))
+    if uncaptured:
         raise ValueError(
-            f"Router replay layer indices {layer_indices} out of range for data with {global_num_layers} layers"
+            f"This pipeline stage owns layers {local_layer_offset}.."
+            f"{local_layer_offset + local_num_layers - 1}, but the rollout captured no routes for "
+            f"layers {uncaptured} (it captured {list(captured_layer_indices)}). Trainer and rollout "
+            "model structures disagree."
         )
-    return layer_indices
 
 
 def setup_per_microbatch_replay_forward(
     rollout_expert_indices: PackedTensor,
+    rollout_expert_layer_indices: Sequence[int],
     router_padding_mask: torch.Tensor | None,
     attention_mask: torch.Tensor,
     model,
@@ -196,18 +207,12 @@ def setup_per_microbatch_replay_forward(
     Handles sequence parallelism: when TP > 1, the sequence is split across
     TP ranks, so each rank's MoE router only sees its local chunk of tokens.
 
-    Handles dense-layer mismatch: DeepSeek V3-style models have dense FFN
-    layers before the MoE layers. vLLM reports routing indices for ALL
-    transformer layers, but Megatron only has RouterReplay instances for MoE
-    layers. We use each instance's global layer_number (set by the patched
-    TopKRouter.set_layer_number) to index into the correct slice of the data.
+    ``rollout_expert_layer_indices`` maps local routers to captured slots, including for
+    models with dense or non-transformer layers interleaved with MoE layers.
 
     Handles pipeline parallelism: when PP > 1, transformer layers are split
-    across PP ranks, so each rank only sees its local RouterReplay instances. In cases
-    where the number of local RouterReplay instances does not match the local
-    layer count, indicating that the model has dense layers before MoE layers,
-    we use the global layer_number to index into the correct slice of the data.
-
+    across PP ranks, so each rank only sees its local RouterReplay instances and
+    selects just the captured layers it owns.
     """
     import megatron.core.parallel_state as mpu
     from megatron.core.transformer.moe.router_replay import (
@@ -220,6 +225,13 @@ def setup_per_microbatch_replay_forward(
     if len(rollout_expert_indices.row_shape) != 2:
         raise ValueError(f"Expected [tokens, layers, topk] replay indices, got {rollout_expert_indices!r}")
 
+    captured_layer_indices = [int(layer_index) for layer_index in rollout_expert_layer_indices]
+    if len(captured_layer_indices) != rollout_expert_indices.row_shape[0]:
+        raise ValueError(
+            f"Replay indices cover {rollout_expert_indices.row_shape[0]} layers but "
+            f"{len(captured_layer_indices)} captured layer indices were carried with them"
+        )
+
     if router_padding_mask.shape != attention_mask.shape:
         raise ValueError(
             f"router_padding_mask shape {router_padding_mask.shape} does not match "
@@ -228,14 +240,11 @@ def setup_per_microbatch_replay_forward(
     if router_padding_mask.device != rollout_expert_indices.device:
         raise ValueError("rollout_expert_indices and router_padding_mask must be on the same device")
 
-    num_captured_layers, topk = rollout_expert_indices.row_shape
+    topk = rollout_expert_indices.row_shape[1]
     instances = RouterReplay.global_router_replay_instances
-    local_layer_indices = _get_local_router_layer_indices(
-        model_config,
-        num_captured_layers,
-        instances,
-    )
-    layer_index = torch.tensor(local_layer_indices, dtype=torch.long, device=rollout_expert_indices.device)
+    local_slot_indices = _get_local_router_slot_indices(captured_layer_indices, instances)
+    _verify_captured_layers_cover_pp_stage(captured_layer_indices, model_config)
+    layer_index = torch.tensor(local_slot_indices, dtype=torch.long, device=rollout_expert_indices.device)
     local_rollout_expert_indices = PackedTensor(
         rollout_expert_indices.values.index_select(1, layer_index),
         rollout_expert_indices.cu_seqlens,

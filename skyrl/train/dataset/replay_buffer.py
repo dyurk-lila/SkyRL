@@ -68,7 +68,8 @@ class Experience:
     loss_mask: Optional[Integer[torch.LongTensor, "batch response_len"]]
     response_mask: Optional[Integer[torch.Tensor, "batch response_len"]]
     rollout_logprobs: Optional[Float[torch.Tensor, "batch response_len"]]
-    # Routes packed to real tokens: values [sum(seq_len_i), layer_num, topk] + cu_seqlens.
+    # Routes packed to real tokens: values [sum(seq_len_i), moe_layer_num, topk] + cu_seqlens.
+    # `metadata[ROUTED_EXPERT_LAYER_INDICES_KEY]` names the layer each slot holds.
     rollout_expert_indices: Optional[PackedTensor]
     num_actions: int
     info: Optional[dict]

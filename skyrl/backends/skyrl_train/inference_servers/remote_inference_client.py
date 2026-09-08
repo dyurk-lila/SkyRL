@@ -79,7 +79,7 @@ from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
     decode_packed_sample_support,
     load_packed_body,
 )
-from skyrl.backends.skyrl_train.utils.routed_experts import RoutedExpertIndices
+from skyrl.backends.skyrl_train.utils.routed_experts import RoutedExpertRoutes
 from skyrl.backends.skyrl_train.utils.sample_support import SampleSupport
 from skyrl.backends.utils import convert_vllm_prompt_logprobs
 from skyrl.env_vars import (
@@ -180,7 +180,7 @@ class RemoteGenerateResult:
     response_ids: List[int]
     response_logprobs: Optional[List[float]]
     stop_reason: str
-    routed_experts: Optional[RoutedExpertIndices]
+    routed_experts: Optional[RoutedExpertRoutes]
     sample_support: Optional[SampleSupport]
 
 

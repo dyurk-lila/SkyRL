@@ -17,6 +17,9 @@ from skyrl.backends.skyrl_train.inference_servers.engine_utils import (
 )
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
 from skyrl.backends.skyrl_train.utils.packed_tensor import PackedTensor
+from skyrl.backends.skyrl_train.utils.routed_experts import (
+    ROUTED_EXPERT_LAYER_INDICES_KEY,
+)
 from skyrl.train.config import SamplingParams, SkyRLTrainConfig
 from skyrl.train.dataset.preprocess import (
     convert_prompts_responses_to_batch_tensors,
@@ -37,8 +40,10 @@ MOE_MODEL_NAME = "moonshotai/Moonlight-16B-A3B-Instruct"
 NUM_PROMPTS = 10
 N_SAMPLES_PER_PROMPT = 4
 MAX_GENERATE_LENGTH = 128
-# Moonlight 16B: 27 MoE layers, top_k=6, 64 routed experts.
+# Moonlight 16B: 27 transformer layers (layer 0 dense), top_k=6, 64 routed experts. vLLM
+# captures every layer, so the captured layer dimension spans all 27.
 MOONLIGHT_NUM_LAYERS = 27
+MOONLIGHT_CAPTURED_LAYERS = tuple(range(MOONLIGHT_NUM_LAYERS))
 MOONLIGHT_TOPK = 6
 MOONLIGHT_NUM_EXPERTS = 64
 
@@ -128,7 +133,7 @@ def build_training_input_from_text_samples(
         rewards.append([0.0] * len(response_ids))
         loss_masks.append([1] * len(response_ids))
 
-    sequences, attention_mask, response_mask, rewards_t, loss_mask_t, _, _, _ = (
+    sequences, attention_mask, response_mask, rewards_t, loss_mask_t, _, _, _, _ = (
         convert_prompts_responses_to_batch_tensors(
             pad_token_id=tokenizer.pad_token_id,
             prompts=prompts,
@@ -239,7 +244,7 @@ async def test_logprobs(tp, pp, cp, ep, etp, extra_tf_kwargs):
         rewards = generator_output["rewards"]
         if rewards and not isinstance(rewards[0], list):
             rewards = [[r] * len(resp) for r, resp in zip(rewards, responses)]
-        sequences, attention_mask, response_mask, rewards_t, loss_mask_t, logprobs_t, rii_tensor, _ = (
+        sequences, attention_mask, response_mask, rewards_t, loss_mask_t, logprobs_t, rii_tensor, rii_layers, _ = (
             convert_prompts_responses_to_batch_tensors(
                 pad_token_id=tokenizer.pad_token_id,
                 prompts=generator_output["prompt_token_ids"],
@@ -252,7 +257,7 @@ async def test_logprobs(tp, pp, cp, ep, etp, extra_tf_kwargs):
         )
 
         assert rii_tensor is not None
-        router_padding_mask = make_router_padding_mask(attention_mask, [len(sample) for sample in indices])
+        router_padding_mask = make_router_padding_mask(attention_mask, [sample.num_tokens for sample in indices])
         num_actions = response_mask.shape[1]
         batch_size = sequences.shape[0]
         training_input = TrainingInputBatch(
@@ -274,7 +279,11 @@ async def test_logprobs(tp, pp, cp, ep, etp, extra_tf_kwargs):
                 "advantages": torch.zeros((batch_size, num_actions), dtype=torch.float32),
             }
         )
-        training_input.metadata = {"response_length": num_actions}
+        training_input.metadata = {
+            "response_length": num_actions,
+            # The layers the generator actually captured, not a hardcoded assumption.
+            ROUTED_EXPERT_LAYER_INDICES_KEY: rii_layers,
+        }
 
         cfg.trainer.placement.policy_num_gpus_per_node = 4
         if extra_tf_kwargs is not None:
@@ -364,7 +373,7 @@ def test_forward_backward(tp, pp, cp, ep, etp, extra_tf_kwargs):
             rewards.append([1.0] * len(response_ids))
             loss_masks.append([1] * len(response_ids))
 
-        sequences, attention_mask, response_mask, rewards_t, loss_mask_t, _, _, _ = (
+        sequences, attention_mask, response_mask, rewards_t, loss_mask_t, _, _, _, _ = (
             convert_prompts_responses_to_batch_tensors(
                 pad_token_id=tokenizer.pad_token_id,
                 prompts=prompts,
@@ -395,7 +404,10 @@ def test_forward_backward(tp, pp, cp, ep, etp, extra_tf_kwargs):
                 "advantages": torch.randn((batch_size, num_actions), generator=gen),
             }
         )
-        training_input.metadata = {"response_length": num_actions}
+        training_input.metadata = {
+            "response_length": num_actions,
+            ROUTED_EXPERT_LAYER_INDICES_KEY: MOONLIGHT_CAPTURED_LAYERS,
+        }
 
         cfg.trainer.placement.policy_num_gpus_per_node = 4
         if extra_tf_kwargs is not None:
@@ -487,7 +499,7 @@ def test_forward_backward_variable_length_full_recompute(tp, pp, cp, ep, etp, ex
             rewards.append([1.0] * len(response_ids))
             loss_masks.append([1] * len(response_ids))
 
-        sequences, attention_mask, response_mask, rewards_t, loss_mask_t, _, _, _ = (
+        sequences, attention_mask, response_mask, rewards_t, loss_mask_t, _, _, _, _ = (
             convert_prompts_responses_to_batch_tensors(
                 tokenizer=tokenizer,
                 prompts=prompts,
@@ -526,7 +538,10 @@ def test_forward_backward_variable_length_full_recompute(tp, pp, cp, ep, etp, ex
                 "action_mask": response_mask.to(dtype=torch.int64),
             }
         )
-        training_input.metadata = {"response_length": num_actions}
+        training_input.metadata = {
+            "response_length": num_actions,
+            ROUTED_EXPERT_LAYER_INDICES_KEY: MOONLIGHT_CAPTURED_LAYERS,
+        }
 
         cfg.trainer.placement.policy_num_gpus_per_node = 4
         if extra_tf_kwargs is not None:

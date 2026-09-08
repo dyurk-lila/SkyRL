@@ -775,7 +775,7 @@ def _validate_per_token_side_channels(generator_output: GeneratorOutput, step_wi
             assert sample_indices is not None, f"rollout_expert_indices[{i}] is None, expected captured routes"
             prompt_length = len(prompt_token_ids[i])
             sequence_length = prompt_length + len(response_ids[i])
-            captured_rows = len(sample_indices)
+            captured_rows = sample_indices.num_tokens
             assert 0 < captured_rows <= sequence_length, (
                 f"rollout_expert_indices[{i}] has {captured_rows} route rows for a "
                 f"{sequence_length}-token trajectory, expected a non-empty prefix of it"

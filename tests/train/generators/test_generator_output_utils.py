@@ -7,6 +7,7 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
+from skyrl.backends.skyrl_train.utils.routed_experts import RoutedExpertRoutes
 from skyrl.backends.skyrl_train.utils.sample_support import SAMPLE_SUPPORT_DTYPE
 from skyrl.train.generators.base import GeneratorOutput, TrajectoryID
 from skyrl.train.generators.utils import (
@@ -19,6 +20,10 @@ from skyrl.train.generators.utils import (
 )
 from skyrl.train.utils.utils import validate_cfg
 from tests.train.util import example_dummy_config
+
+
+def _routes(num_rows: int, fill: int) -> RoutedExpertRoutes:
+    return RoutedExpertRoutes.covering_all_layers(np.full((num_rows, 1, 2), fill, dtype=np.uint8))
 
 
 def test_generator_output_concatenation():
@@ -56,7 +61,10 @@ def test_generator_output_concatenation():
         "stop_reasons": ["stop", "stop"],
         "rollout_logprobs": [[0.1, 0.2], [0.3, 0.4]],
         # Routes cover every trained token.
-        "rollout_expert_indices": [np.zeros((3, 1, 2), dtype=np.uint8), np.ones((3, 1, 2), dtype=np.uint8)],
+        "rollout_expert_indices": [
+            _routes(3, 0),
+            _routes(3, 1),
+        ],
         "rollout_sample_support": [[[1, 2], [1, 2]], [[3, 4], [3, 4]]],
     }
 
@@ -67,7 +75,10 @@ def test_generator_output_concatenation():
         "loss_masks": [[1, 1, 1], [1]],
         "stop_reasons": ["stop", "stop"],
         "rollout_logprobs": [[0.5, 0.6, 0.7], [0.8]],
-        "rollout_expert_indices": [np.full((5, 1, 2), 2, dtype=np.uint8), np.full((1, 1, 2), 3, dtype=np.uint8)],
+        "rollout_expert_indices": [
+            _routes(5, 2),
+            _routes(1, 3),
+        ],
         "rollout_sample_support": [[[5, 6], [5, 6], [5, 6]], [[7, 8]]],
     }
 
@@ -81,10 +92,10 @@ def test_generator_output_concatenation():
     assert concatenated_output["stop_reasons"] == ["stop", "stop", "stop", "stop"]
     assert concatenated_output["rollout_logprobs"] == [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6, 0.7], [0.8]]
     assert [rows[0] for rows in concatenated_output["rollout_sample_support"]] == [[1, 2], [3, 4], [5, 6], [7, 8]]
-    assert [int(routes.flat[0]) for routes in concatenated_output["rollout_expert_indices"]] == [0, 1, 2, 3]
+    assert [int(routes.indices.flat[0]) for routes in concatenated_output["rollout_expert_indices"]] == [0, 1, 2, 3]
     reversed_output = concatenate_generator_outputs([generator_output_2, generator_output_1])
     assert [rows[0] for rows in reversed_output["rollout_sample_support"]] == [[5, 6], [7, 8], [1, 2], [3, 4]]
-    assert [int(routes.flat[0]) for routes in reversed_output["rollout_expert_indices"]] == [2, 3, 0, 1]
+    assert [int(routes.indices.flat[0]) for routes in reversed_output["rollout_expert_indices"]] == [2, 3, 0, 1]
 
     # Validate rollout metrics
     expected_rollout_metrics = {
@@ -121,7 +132,7 @@ def test_side_channel_concatenation_rejects_a_mix(side_channel):
             side_channel: value,
         }
 
-    populated = make_output([[[1, 2]]] if side_channel == "rollout_sample_support" else [np.zeros((1, 1, 2), np.uint8)])
+    populated = make_output([[[1, 2]]] if side_channel == "rollout_sample_support" else [_routes(1, 0)])
     missing = make_output(None)
     for outputs in ([populated, missing], [missing, populated]):
         with pytest.raises(ValueError, match=f"all have null {side_channel}"):
@@ -831,7 +842,7 @@ class TestMergeStepwiseOutput:
             "rollout_metrics": None,
             "rollout_logprobs": None,
             "trajectory_ids": [tid],
-            "rollout_expert_indices": [np.asarray([[[1, 2]]], dtype=np.uint8)],
+            "rollout_expert_indices": [_routes(1, 1)],
             "is_last_step": [True],
         }
         with pytest.raises(AssertionError, match="rollout_expert_indices not supported"):
