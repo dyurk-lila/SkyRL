@@ -4,8 +4,11 @@ Utility functions for MoE Router Replay.
 
 from collections.abc import Sequence
 from contextlib import contextmanager
+from enum import StrEnum
+from typing import Optional
 
 import torch
+from loguru import logger
 
 from skyrl.backends.skyrl_train.distributed.megatron.token_metadata import (
     TokenMetadataLayout,
@@ -13,6 +16,17 @@ from skyrl.backends.skyrl_train.distributed.megatron.token_metadata import (
     align_token_metadata,
 )
 from skyrl.backends.skyrl_train.utils.packed_tensor import PackedTensor
+
+# The fused kernel implements Megatron's normalized sigmoid routing.
+SIGMOID_SCORE_FUNCTION = "sigmoid"
+
+
+class SideChannelPath(StrEnum):
+    """How replayed per-token routes were consumed."""
+
+    FUSED_KERNEL = "fused replay kernel"
+    UNFUSED = "unfused replay"
+    DISABLED = "replay-disabled"
 
 
 def replay_padding_row(
@@ -90,6 +104,202 @@ def patch_topk_router_expert_bias_padding_mask():
 
     TopKRouter._apply_expert_bias = patched_apply_expert_bias
     TopKRouter._expert_bias_padding_mask_patched = True
+
+
+# Read by the installed wrapper so later calls can update it without repatching.
+_fused_replay_kernel_enabled = False
+_logged_fallback_reasons: set[str] = set()
+
+# One-shot observability state per worker process.
+_replayed_layer_count: Optional[int] = None
+_logged_side_channel_path = False
+_warned_missing_rollout_routes = False
+
+
+def log_side_channel_path_once(path: SideChannelPath, topk: int, num_router_tokens: int) -> None:
+    """Log the replay path once per worker process."""
+    global _logged_side_channel_path
+    if _logged_side_channel_path:
+        return
+    _logged_side_channel_path = True
+    logger.info(
+        f"MoE router replay active via {path}: replaying {_replayed_layer_count} layer(s) on this rank, "
+        f"topk={topk}, {num_router_tokens} router tokens in the first replayed microbatch"
+    )
+
+
+def warn_if_training_without_replay(
+    replay_configured: bool,
+    num_microbatches_without_routes: int,
+    num_microbatches: int,
+) -> None:
+    """Warn once when configured replay receives microbatches without routes."""
+    global _warned_missing_rollout_routes
+    if not replay_configured or not num_microbatches_without_routes or _warned_missing_rollout_routes:
+        return
+    _warned_missing_rollout_routes = True
+    logger.warning(
+        f"moe_enable_routing_replay=True but {num_microbatches_without_routes}/{num_microbatches} "
+        f"microbatches carry no rollout_expert_indices: training them WITHOUT replay "
+        f"({SideChannelPath.DISABLED}). Check generator.inference_engine.enable_return_routed_experts "
+        "and that the rollout routes survive data preparation."
+    )
+
+
+def _log_fallback_once(reason: str, forced_unfuse: bool) -> None:
+    if reason in _logged_fallback_reasons:
+        return
+    _logged_fallback_reasons.add(reason)
+    if forced_unfuse:
+        logger.warning(
+            "moe_router_fusion=True with router replay active would silently DISCARD the "
+            "replayed expert indices (TE's fused top-k has no parameter that accepts them). "
+            f"Forcing moe_router_fusion=False for replayed routing. Fused replay unavailable: {reason}"
+        )
+    else:
+        logger.info(f"fused router replay not used, falling back to unfused replay: {reason}")
+
+
+def _fused_replay_unavailable_reason(
+    logits: torch.Tensor,
+    topk: int,
+    score_function: str,
+    dense_output: bool,
+    indices: Optional[torch.Tensor],
+    extra_kwargs: dict,
+) -> Optional[str]:
+    """Return ``None`` when the fused kernel can serve this call, else why not."""
+    from skyrl.backends.skyrl_train.kernels import replay_router
+
+    if not _fused_replay_kernel_enabled:
+        return "moe_fused_routing_replay=False"
+    if extra_kwargs:
+        # Refuse routing arguments the wrapper has not been checked against.
+        return f"unrecognized routing arguments {sorted(extra_kwargs)}"
+    if score_function != SIGMOID_SCORE_FUNCTION:
+        return f"score_function={score_function!r} (kernel implements {SIGMOID_SCORE_FUNCTION!r})"
+    if dense_output:
+        return "dense_output=True (compact contract not implemented)"
+    if logits.dtype not in replay_router.SUPPORTED_ROUTER_DTYPES:
+        supported = ", ".join(str(dtype) for dtype in replay_router.SUPPORTED_ROUTER_DTYPES)
+        return f"router dtype {logits.dtype} (kernel supports {supported})"
+    if topk < 2:
+        return f"topk={topk} (Megatron skips normalization at topk=1)"
+    if topk > replay_router.MAX_SUPPORTED_TOPK:
+        return f"topk={topk} > {replay_router.MAX_SUPPORTED_TOPK}"
+    if indices is None:
+        return "no replay indices installed"
+    if indices.dim() != 2 or indices.shape[0] != logits.shape[0] or indices.shape[1] != topk:
+        return f"replay indices shape {tuple(indices.shape)} != ({logits.shape[0]}, {topk})"
+    return replay_router.unavailable_reason()
+
+
+def patch_topk_router_fused_replay(enable_fused_kernel: bool = False):
+    """Patch Megatron routing before model creation.
+
+    Replayed sigmoid routing uses the fused kernel when supported and otherwise falls back
+    to Megatron's unfused path. TransformerEngine fusion is always disabled during replay
+    because it cannot consume precomputed indices. Non-replay routing remains unchanged.
+    """
+    global _fused_replay_kernel_enabled
+    _fused_replay_kernel_enabled = enable_fused_kernel
+
+    try:
+        from megatron.core.transformer.moe import moe_utils, router
+        from megatron.core.transformer.moe.router_replay import RouterReplayAction
+    except ImportError:
+        return
+
+    if getattr(moe_utils, "_fused_replay_patched", False):
+        return
+
+    from skyrl.backends.skyrl_train.kernels.replay_router import (
+        fused_replay_routing_dense,
+    )
+
+    original_topk_routing = moe_utils.topk_routing_with_score_function
+    replaying_actions = (RouterReplayAction.REPLAY_FORWARD, RouterReplayAction.REPLAY_BACKWARD)
+
+    def peek_replay_indices(router_replay) -> Optional[torch.Tensor]:
+        """Return the next indices without consuming the backward FIFO."""
+        if router_replay.router_replay_action == RouterReplayAction.REPLAY_FORWARD:
+            return router_replay.target_topk_idx
+        if router_replay.replay_backward_list:
+            return router_replay.replay_backward_list[0]
+        return None
+
+    def consume_replay_indices(router_replay) -> torch.Tensor:
+        """Mirror RouterReplay.get_replay_topk's consumption exactly."""
+        if router_replay.router_replay_action == RouterReplayAction.REPLAY_FORWARD:
+            return router_replay.target_topk_idx
+        return router_replay.replay_backward_list.pop(0)
+
+    def patched_topk_routing_with_score_function(
+        logits: torch.Tensor,
+        topk: int,
+        use_pre_softmax: bool = False,
+        num_groups: Optional[int] = None,
+        group_topk: Optional[int] = None,
+        scaling_factor: Optional[float] = None,
+        score_function: str = "softmax",
+        expert_bias: Optional[torch.Tensor] = None,
+        fused: bool = False,
+        router_replay=None,
+        dense_output: bool = False,
+        **extra_kwargs,
+    ):
+        replaying = router_replay is not None and router_replay.router_replay_action in replaying_actions
+        if not replaying:
+            return original_topk_routing(
+                logits,
+                topk,
+                use_pre_softmax=use_pre_softmax,
+                num_groups=num_groups,
+                group_topk=group_topk,
+                scaling_factor=scaling_factor,
+                score_function=score_function,
+                expert_bias=expert_bias,
+                fused=fused,
+                router_replay=router_replay,
+                dense_output=dense_output,
+                **extra_kwargs,
+            )
+
+        reason = _fused_replay_unavailable_reason(
+            logits,
+            topk,
+            score_function,
+            dense_output,
+            peek_replay_indices(router_replay),
+            extra_kwargs,
+        )
+        if reason is None:
+            log_side_channel_path_once(SideChannelPath.FUSED_KERNEL, topk, logits.shape[0])
+            indices = consume_replay_indices(router_replay)
+            return fused_replay_routing_dense(logits, indices, scaling_factor)
+
+        log_side_channel_path_once(SideChannelPath.UNFUSED, topk, logits.shape[0])
+        _log_fallback_once(reason, forced_unfuse=fused)
+        return original_topk_routing(
+            logits,
+            topk,
+            use_pre_softmax=use_pre_softmax,
+            num_groups=num_groups,
+            group_topk=group_topk,
+            scaling_factor=scaling_factor,
+            score_function=score_function,
+            expert_bias=expert_bias,
+            # Never fused: TE's fused top-k cannot accept replay indices.
+            fused=False,
+            router_replay=router_replay,
+            dense_output=dense_output,
+            **extra_kwargs,
+        )
+
+    moe_utils.topk_routing_with_score_function = patched_topk_routing_with_score_function
+    # router.py binds the function at import time.
+    router.topk_routing_with_score_function = patched_topk_routing_with_score_function
+    moe_utils._fused_replay_patched = True
 
 
 def _split_replay_indices(rollout_expert_indices: torch.Tensor) -> list[torch.Tensor]:
@@ -255,6 +465,8 @@ def setup_per_microbatch_replay_forward(
         [captured_layer_indices[slot] for slot in local_slot_indices],
         model_config,
     )
+    global _replayed_layer_count
+    _replayed_layer_count = len(local_slot_indices)
     layer_index = torch.tensor(local_slot_indices, dtype=torch.long, device=rollout_expert_indices.device)
     local_rollout_expert_indices = PackedTensor(
         rollout_expert_indices.values.index_select(1, layer_index),

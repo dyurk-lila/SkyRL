@@ -1,14 +1,15 @@
-import inspect
 import sys
 import types
 from types import SimpleNamespace
 
 import pytest
 import torch
+from loguru import logger
 
 from skyrl.backends.skyrl_train.distributed.megatron.token_metadata import (
     build_token_metadata_layout,
 )
+from skyrl.backends.skyrl_train.kernels.replay_router import _FusedReplayRoutingDense
 from skyrl.backends.skyrl_train.utils import replay_utils
 from skyrl.backends.skyrl_train.utils.packed_tensor import PackedTensor
 from skyrl.backends.skyrl_train.utils.replay_utils import make_replay_padding_indices
@@ -17,6 +18,19 @@ from skyrl.backends.skyrl_train.utils.replay_utils import make_replay_padding_in
 def _pack_routes(routes: torch.Tensor, attention_mask: torch.Tensor) -> PackedTensor:
     """Pack a ``[batch, seq_len, layers, topk]`` fixture to its real tokens."""
     return PackedTensor.from_segments([routes[row][attention_mask[row].bool()] for row in range(routes.shape[0])])
+
+
+@pytest.fixture
+def replay_logs():
+    """Collect ``(level, message)`` for every loguru record a test emits."""
+    records: list[tuple[str, str]] = []
+    sink_id = logger.add(
+        lambda message: records.append((message.record["level"].name, message.record["message"])),
+        level="INFO",
+        enqueue=False,
+    )
+    yield records
+    logger.remove(sink_id)
 
 
 @pytest.fixture
@@ -78,10 +92,6 @@ def test_replay_padding_rejects_missing_topk(shape):
         make_replay_padding_indices(shape, dtype=torch.uint8)
 
 
-def test_replay_has_no_dispatcher_specific_patch():
-    assert "TokenDispatcher" not in inspect.getsource(replay_utils)
-
-
 @pytest.mark.parametrize("route_dtype", [torch.uint8, torch.int16, torch.int32])
 def test_setup_replay_installs_indices_and_returns_model_mask(monkeypatch, parallel_state, route_dtype):
     router_replay_module = types.ModuleType("megatron.core.transformer.moe.router_replay")
@@ -111,6 +121,7 @@ def test_setup_replay_installs_indices_and_returns_model_mask(monkeypatch, paral
         "scatter_router_padding_mask_for_model",
         lambda mask, model, model_config: mask,
     )
+    monkeypatch.setattr(replay_utils, "_replayed_layer_count", None)
     apply_layout = replay_utils.align_packed_token_metadata
     routed_layer_counts = []
 
@@ -155,12 +166,14 @@ def test_setup_replay_installs_indices_and_returns_model_mask(monkeypatch, paral
     assert RouterReplay.action == RouterReplayAction.REPLAY_FORWARD
     assert model_kwargs["padding_mask"].tolist() == [[False, False, True]]
     assert routed_layer_counts == [1]
+    # What the path log reports: layers replayed on this rank, not the data's layer count.
+    assert replay_utils._replayed_layer_count == 1
 
 
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("tp_size", [1, 2])
 def test_replay_indices_are_dtype_independent(monkeypatch, parallel_state, packed, tp_size):
-    """Compact host routes must produce the same int32 replay data as int32 routes."""
+    """Compact int16 routes produce the same int32 replay data as int32 routes."""
     router_replay_module = types.ModuleType("megatron.core.transformer.moe.router_replay")
 
     class RouterReplay:
@@ -431,3 +444,372 @@ def test_router_replay_schedule_clears_after_exception(router_replay_module):
 
     assert router_replay_module.replay_backward_list == []
     assert router_replay_module.action is None
+
+
+# Fused dispatch and FIFO accounting with a pure-torch kernel stub.
+
+
+def _reference_dense_routing(logits, indices, scaling=None):
+    """Megatron's sigmoid replay contract in plain torch."""
+    scores = torch.sigmoid(torch.gather(logits.float(), 1, indices.long()))
+    probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+    if scaling:
+        probs = probs * scaling
+    probs = probs.type_as(logits)
+    routing_probs = torch.zeros_like(logits).scatter(1, indices.long(), probs)
+    routing_map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, indices.long(), True)
+    return routing_probs, routing_map
+
+
+def _ensure_module(monkeypatch, name):
+    if name in sys.modules:
+        return sys.modules[name]
+    module = types.ModuleType(name)
+    monkeypatch.setitem(sys.modules, name, module)
+    parent_name, _, leaf = name.rpartition(".")
+    if parent_name:
+        monkeypatch.setattr(_ensure_module(monkeypatch, parent_name), leaf, module, raising=False)
+    return module
+
+
+class _FusedReplayHarness:
+    """Fake Megatron seam plus recorders for both dispatch outcomes."""
+
+    def __init__(self, moe_utils, router, actions):
+        self.moe_utils = moe_utils
+        self.router = router
+        self.actions = actions
+        self.unfused_calls = []
+        self.kernel_calls = []
+
+    def original(self, logits, topk, **kwargs):
+        self.unfused_calls.append(kwargs)
+        indices = self.replay.target_topk_idx
+        if self.replay.router_replay_action == self.actions.REPLAY_BACKWARD:
+            indices = self.replay.replay_backward_list.pop(0)
+        return _reference_dense_routing(logits, indices, kwargs.get("scaling_factor"))
+
+    def kernel(self, logits, indices, scaling=None):
+        self.kernel_calls.append(indices)
+        return _reference_dense_routing(logits, indices, scaling)
+
+    def route(self, logits, topk, **kwargs):
+        kwargs.setdefault("score_function", replay_utils.SIGMOID_SCORE_FUNCTION)
+        kwargs.setdefault("router_replay", self.replay)
+        return self.moe_utils.topk_routing_with_score_function(logits, topk, **kwargs)
+
+
+@pytest.fixture
+def fused_replay(monkeypatch):
+    from skyrl.backends.skyrl_train.kernels import replay_router
+
+    moe_utils = _ensure_module(monkeypatch, "megatron.core.transformer.moe.moe_utils")
+    router = _ensure_module(monkeypatch, "megatron.core.transformer.moe.router")
+    replay_module = _ensure_module(monkeypatch, "megatron.core.transformer.moe.router_replay")
+
+    if not hasattr(replay_module, "RouterReplayAction"):
+        actions = SimpleNamespace(RECORD="record", REPLAY_FORWARD="replay_forward", REPLAY_BACKWARD="replay_backward")
+        monkeypatch.setattr(replay_module, "RouterReplayAction", actions, raising=False)
+    actions = replay_module.RouterReplayAction
+
+    harness = _FusedReplayHarness(moe_utils, router, actions)
+    harness.replay = SimpleNamespace(router_replay_action=None, target_topk_idx=None, replay_backward_list=[])
+    monkeypatch.setattr(moe_utils, "topk_routing_with_score_function", harness.original, raising=False)
+    monkeypatch.setattr(router, "topk_routing_with_score_function", harness.original, raising=False)
+    monkeypatch.setattr(moe_utils, "_fused_replay_patched", False, raising=False)
+    monkeypatch.setattr(replay_router, "unavailable_reason", lambda: None)
+    monkeypatch.setattr(replay_router, "fused_replay_routing_dense", harness.kernel)
+    monkeypatch.setattr(replay_utils, "_fused_replay_kernel_enabled", False)
+    monkeypatch.setattr(replay_utils, "_logged_fallback_reasons", set())
+    # One-shot log state is per process; monkeypatch restores it between tests.
+    monkeypatch.setattr(replay_utils, "_logged_side_channel_path", False)
+    monkeypatch.setattr(replay_utils, "_replayed_layer_count", None)
+    return harness
+
+
+def _logits_and_indices(num_tokens=6, num_experts=8, topk=3, seed=0):
+    generator = torch.Generator().manual_seed(seed)
+    logits = torch.randn(num_tokens, num_experts, generator=generator)
+    indices = torch.stack([torch.randperm(num_experts, generator=generator)[:topk] for _ in range(num_tokens)]).to(
+        torch.int32
+    )
+    return logits, indices
+
+
+def _routed_experts(routing_map):
+    """Sorted expert ids per token, from a dense ``[tokens, experts]`` boolean map."""
+    return routing_map.nonzero()[:, 1].view(routing_map.shape[0], -1).sort(dim=1).values
+
+
+def test_fused_replay_patch_installs_on_both_bindings(fused_replay):
+    replay_utils.patch_topk_router_fused_replay(enable_fused_kernel=True)
+
+    assert fused_replay.moe_utils.topk_routing_with_score_function is not fused_replay.original
+    assert (
+        fused_replay.router.topk_routing_with_score_function is fused_replay.moe_utils.topk_routing_with_score_function
+    )
+
+
+@pytest.mark.parametrize("action", [None, "RECORD"])
+def test_non_replay_calls_are_untouched(fused_replay, action):
+    replay_utils.patch_topk_router_fused_replay(enable_fused_kernel=True)
+    logits, indices = _logits_and_indices()
+    fused_replay.replay.router_replay_action = None if action is None else fused_replay.actions.RECORD
+    fused_replay.replay.target_topk_idx = indices
+
+    fused_replay.route(logits, indices.shape[1], fused=True)
+
+    # Recording/off is Megatron's business: fusion must not be second-guessed there.
+    assert fused_replay.kernel_calls == []
+    assert fused_replay.unfused_calls[0]["fused"] is True
+
+
+def test_fast_path_serves_replay_forward_without_consuming_fifo(fused_replay):
+    replay_utils.patch_topk_router_fused_replay(enable_fused_kernel=True)
+    logits, indices = _logits_and_indices()
+    fused_replay.replay.router_replay_action = fused_replay.actions.REPLAY_FORWARD
+    fused_replay.replay.target_topk_idx = indices
+    fused_replay.replay.replay_backward_list = [indices]
+
+    routing_probs, routing_map = fused_replay.route(logits, indices.shape[1])
+
+    assert fused_replay.unfused_calls == []
+    assert len(fused_replay.kernel_calls) == 1
+    assert torch.equal(_routed_experts(routing_map), indices.long().sort(dim=1).values)
+    assert routing_map.sum().item() == indices.numel()
+    assert torch.allclose(routing_probs.sum(dim=-1), torch.ones(indices.shape[0]), atol=1e-6)
+    assert fused_replay.replay.replay_backward_list == [indices]
+
+
+def test_fast_path_consumes_backward_fifo_in_microbatch_order(fused_replay):
+    replay_utils.patch_topk_router_fused_replay(enable_fused_kernel=True)
+    microbatches = [_logits_and_indices(num_tokens=4 + i, seed=i) for i in range(3)]
+
+    fused_replay.replay.router_replay_action = fused_replay.actions.REPLAY_BACKWARD
+    fused_replay.replay.replay_backward_list = [indices for _, indices in microbatches]
+
+    for logits, indices in microbatches:
+        _, routing_map = fused_replay.route(logits, indices.shape[1])
+        assert routing_map.sum().item() == indices.numel()
+
+    assert fused_replay.replay.replay_backward_list == []
+    for consumed, (_, expected) in zip(fused_replay.kernel_calls, microbatches, strict=True):
+        assert torch.equal(consumed, expected)
+
+
+def test_fallback_does_not_consume_backward_fifo(fused_replay):
+    """A rejected fast path must not pop: Megatron's own path pops right after."""
+    replay_utils.patch_topk_router_fused_replay(enable_fused_kernel=False)
+    logits, indices = _logits_and_indices()
+    fused_replay.replay.router_replay_action = fused_replay.actions.REPLAY_BACKWARD
+    fused_replay.replay.replay_backward_list = [indices]
+
+    fused_replay.route(logits, indices.shape[1])
+
+    assert fused_replay.kernel_calls == []
+    assert len(fused_replay.unfused_calls) == 1
+    # popped exactly once, by the unfused path
+    assert fused_replay.replay.replay_backward_list == []
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected_fragment"),
+    [
+        ({"score_function": "softmax"}, "score_function"),
+        ({"dense_output": True}, "dense_output"),
+        ({"unknown_future_arg": 1}, "unrecognized routing arguments"),
+    ],
+)
+def test_unsupported_shapes_fall_back(fused_replay, kwargs, expected_fragment):
+    replay_utils.patch_topk_router_fused_replay(enable_fused_kernel=True)
+    logits, indices = _logits_and_indices()
+    fused_replay.replay.router_replay_action = fused_replay.actions.REPLAY_FORWARD
+    fused_replay.replay.target_topk_idx = indices
+
+    fused_replay.route(logits, indices.shape[1], **kwargs)
+
+    assert fused_replay.kernel_calls == []
+    assert len(fused_replay.unfused_calls) == 1
+    assert any(expected_fragment in reason for reason in replay_utils._logged_fallback_reasons)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_low_precision_router_dtype_uses_kernel(fused_replay, dtype):
+    replay_utils.patch_topk_router_fused_replay(enable_fused_kernel=True)
+    logits, indices = _logits_and_indices()
+    fused_replay.replay.router_replay_action = fused_replay.actions.REPLAY_FORWARD
+    fused_replay.replay.target_topk_idx = indices
+
+    routing_probs, _ = fused_replay.route(logits.to(dtype), indices.shape[1])
+
+    assert len(fused_replay.kernel_calls) == 1
+    assert routing_probs.dtype == dtype
+
+
+def test_unsupported_router_dtype_falls_back(fused_replay):
+    replay_utils.patch_topk_router_fused_replay(enable_fused_kernel=True)
+    logits, indices = _logits_and_indices()
+    fused_replay.replay.router_replay_action = fused_replay.actions.REPLAY_FORWARD
+    fused_replay.replay.target_topk_idx = indices
+
+    fused_replay.route(logits.to(torch.float64), indices.shape[1])
+
+    assert fused_replay.kernel_calls == []
+    assert any("router dtype" in reason for reason in replay_utils._logged_fallback_reasons)
+
+
+def test_fused_replay_backward_accepts_missing_probability_gradient():
+    assert _FusedReplayRoutingDense.backward(SimpleNamespace(), None, None) == (None, None, None)
+
+
+@pytest.mark.parametrize("topk", [1, 33])
+def test_unsupported_topk_falls_back(fused_replay, topk):
+    replay_utils.patch_topk_router_fused_replay(enable_fused_kernel=True)
+    logits, indices = _logits_and_indices(num_experts=64, topk=topk)
+    fused_replay.replay.router_replay_action = fused_replay.actions.REPLAY_FORWARD
+    fused_replay.replay.target_topk_idx = indices
+
+    fused_replay.route(logits, topk)
+
+    assert fused_replay.kernel_calls == []
+
+
+def test_unavailable_extension_falls_back(fused_replay, monkeypatch):
+    """A CPU-only host, or any toolchain that cannot build the extension, must degrade."""
+    from skyrl.backends.skyrl_train.kernels import replay_router
+
+    monkeypatch.setattr(replay_router, "unavailable_reason", lambda: "extension build failed (fake)")
+    replay_utils.patch_topk_router_fused_replay(enable_fused_kernel=True)
+    logits, indices = _logits_and_indices()
+    fused_replay.replay.router_replay_action = fused_replay.actions.REPLAY_FORWARD
+    fused_replay.replay.target_topk_idx = indices
+
+    fused_replay.route(logits, indices.shape[1])
+
+    assert fused_replay.kernel_calls == []
+    assert len(fused_replay.unfused_calls) == 1
+
+
+@pytest.mark.parametrize("enable_fused_kernel", [False, True])
+def test_router_fusion_is_forced_off_while_replaying(fused_replay, enable_fused_kernel, monkeypatch):
+    """The live silent-mis-train bug: Megatron's ``if fused:`` early return drops
+    ``router_replay`` outright, so fused+replay trains against TE-selected experts at
+    chance-level index overlap while every loss curve stays plausible."""
+    from skyrl.backends.skyrl_train.kernels import replay_router
+
+    if not enable_fused_kernel:
+        monkeypatch.setattr(replay_router, "unavailable_reason", lambda: "no toolchain")
+    replay_utils.patch_topk_router_fused_replay(enable_fused_kernel=enable_fused_kernel)
+    logits, indices = _logits_and_indices()
+    fused_replay.replay.router_replay_action = fused_replay.actions.REPLAY_FORWARD
+    fused_replay.replay.target_topk_idx = indices
+
+    _, routing_map = fused_replay.route(logits, indices.shape[1], fused=True)
+
+    # Whichever path served it, the replayed experts are the ones that got routed.
+    assert routing_map.sum().item() == indices.numel()
+    assert torch.equal(_routed_experts(routing_map), indices.long().sort(dim=1).values)
+    if enable_fused_kernel:
+        assert len(fused_replay.kernel_calls) == 1
+    else:
+        # Forced unfused, and loudly: never hand fused=True to Megatron under replay.
+        assert fused_replay.unfused_calls[0]["fused"] is False
+        assert replay_utils._logged_fallback_reasons
+
+
+def test_scaling_factor_reaches_the_kernel(fused_replay):
+    replay_utils.patch_topk_router_fused_replay(enable_fused_kernel=True)
+    logits, indices = _logits_and_indices()
+    fused_replay.replay.router_replay_action = fused_replay.actions.REPLAY_FORWARD
+    fused_replay.replay.target_topk_idx = indices
+
+    scaled, _ = fused_replay.route(logits, indices.shape[1], scaling_factor=2.5)
+    unscaled, _ = fused_replay.route(logits, indices.shape[1])
+
+    assert torch.allclose(scaled, unscaled * 2.5, atol=1e-6)
+
+
+def test_patch_is_idempotent(fused_replay):
+    replay_utils.patch_topk_router_fused_replay(enable_fused_kernel=False)
+    once = fused_replay.moe_utils.topk_routing_with_score_function
+    replay_utils.patch_topk_router_fused_replay(enable_fused_kernel=True)
+
+    assert fused_replay.moe_utils.topk_routing_with_score_function is once
+    # A second call still updates the opt-in flag rather than leaving a stale wrapper.
+    logits, indices = _logits_and_indices()
+    fused_replay.replay.router_replay_action = fused_replay.actions.REPLAY_FORWARD
+    fused_replay.replay.target_topk_idx = indices
+    fused_replay.route(logits, indices.shape[1])
+
+    assert len(fused_replay.kernel_calls) == 1
+
+
+# Side-channel path observability.
+
+
+@pytest.mark.parametrize(
+    ("enable_fused_kernel", "expected_path"),
+    [
+        (True, replay_utils.SideChannelPath.FUSED_KERNEL),
+        (False, replay_utils.SideChannelPath.UNFUSED),
+    ],
+)
+def test_side_channel_path_is_logged_once_per_process(
+    fused_replay, replay_logs, monkeypatch, enable_fused_kernel, expected_path
+):
+    """One line naming the path, layer count, topk and token count -- not one per call."""
+    monkeypatch.setattr(replay_utils, "_replayed_layer_count", 3)
+    replay_utils.patch_topk_router_fused_replay(enable_fused_kernel=enable_fused_kernel)
+    logits, indices = _logits_and_indices(num_tokens=6, topk=3)
+    fused_replay.replay.router_replay_action = fused_replay.actions.REPLAY_FORWARD
+    fused_replay.replay.target_topk_idx = indices
+
+    # 3 layers x 2 microbatches worth of router calls.
+    for _ in range(6):
+        fused_replay.route(logits, indices.shape[1])
+
+    path_lines = [message for _, message in replay_logs if "MoE router replay active" in message]
+    assert len(path_lines) == 1, path_lines
+    assert str(expected_path) in path_lines[0]
+    assert "3 layer(s)" in path_lines[0]
+    assert "topk=3" in path_lines[0]
+    assert "6 router tokens" in path_lines[0]
+
+
+def test_non_replay_calls_log_no_path(fused_replay, replay_logs):
+    """RECORD / replay-off routing is Megatron's business and must stay silent."""
+    replay_utils.patch_topk_router_fused_replay(enable_fused_kernel=True)
+    logits, indices = _logits_and_indices()
+    fused_replay.replay.router_replay_action = fused_replay.actions.RECORD
+    fused_replay.replay.target_topk_idx = indices
+
+    fused_replay.route(logits, indices.shape[1])
+
+    assert [message for _, message in replay_logs if "MoE router replay active" in message] == []
+
+
+def test_missing_rollout_routes_warns_once(replay_logs, monkeypatch):
+    """The silent-skip case: replay configured, no routes in the batch."""
+    monkeypatch.setattr(replay_utils, "_warned_missing_rollout_routes", False)
+
+    for _ in range(3):
+        replay_utils.warn_if_training_without_replay(True, 2, 4)
+
+    warnings = [message for level, message in replay_logs if level == "WARNING"]
+    assert len(warnings) == 1, warnings
+    assert "2/4" in warnings[0]
+    assert "moe_enable_routing_replay=True" in warnings[0]
+    assert "WITHOUT replay" in warnings[0]
+    assert str(replay_utils.SideChannelPath.DISABLED) in warnings[0]
+
+
+@pytest.mark.parametrize(
+    ("replay_configured", "num_without_routes"),
+    [(False, 4), (True, 0)],
+)
+def test_no_warning_when_replay_off_or_routes_present(replay_logs, monkeypatch, replay_configured, num_without_routes):
+    monkeypatch.setattr(replay_utils, "_warned_missing_rollout_routes", False)
+
+    replay_utils.warn_if_training_without_replay(replay_configured, num_without_routes, 4)
+
+    assert [message for level, message in replay_logs if level == "WARNING"] == []

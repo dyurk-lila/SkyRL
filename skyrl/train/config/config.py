@@ -481,6 +481,8 @@ class MegatronConfig(BaseConfig):
     moe_enable_routing_replay: bool = False
     """Enable Megatron router replay.
     Used together with ``generator.inference_engine.enable_return_routed_experts`` to enable R3."""
+    moe_fused_routing_replay: bool = False
+    """Use SkyRL's fused CUDA router during replay when the configuration is supported."""
     moe_per_layer_logging: bool = False
     """Enable per-layer logging of MoE metrics (i.e. per layer aux losses)."""
     moe_router_dtype: str = "fp32"

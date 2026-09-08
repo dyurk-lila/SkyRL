@@ -1035,6 +1035,18 @@ class MegatronWorker:
         if mpu.get_pipeline_model_parallel_rank() != 0 and data.get("pixel_values") is not None:
             data["pixel_values"] = None
 
+    def _warm_compile_fused_replay_kernel(self) -> None:
+        """Compile once per node before the first forward."""
+        from skyrl.backends.skyrl_train.kernels import replay_router
+
+        distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+        if self._local_rank == 0:
+            replay_router.warm_compile()
+        if distributed:
+            torch.distributed.barrier()
+        if self._rank == 0 or not replay_router.is_available():
+            replay_router.log_availability()
+
 
 class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
     def __init__(self, **kwargs):
@@ -1121,11 +1133,16 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         if self.enable_router_replay:
             from skyrl.backends.skyrl_train.utils.replay_utils import (
                 patch_topk_router_expert_bias_padding_mask,
+                patch_topk_router_fused_replay,
                 patch_topk_router_layer_number,
             )
 
             patch_topk_router_expert_bias_padding_mask()
             patch_topk_router_layer_number()
+            # Also prevents TransformerEngine fusion from discarding replay indices.
+            patch_topk_router_fused_replay(enable_fused_kernel=self.cfg.policy.megatron_config.moe_fused_routing_replay)
+            if self.cfg.policy.megatron_config.moe_fused_routing_replay:
+                self._warm_compile_fused_replay_kernel()
 
         # Freeze MoE router params before optimizer build.
         # Megatron's DistributedOptimizer reads requires_grad at construction.
@@ -1942,6 +1959,15 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
             language_model_only=self.cfg.ref.language_model_only,
             bridge_weights_path=bridge_weights_path,
         )
+
+        if self.enable_router_replay:
+            from skyrl.backends.skyrl_train.utils.replay_utils import (
+                patch_topk_router_fused_replay,
+            )
+
+            patch_topk_router_fused_replay(enable_fused_kernel=self.cfg.ref.megatron_config.moe_fused_routing_replay)
+            if self.cfg.ref.megatron_config.moe_fused_routing_replay:
+                self._warm_compile_fused_replay_kernel()
 
         self.actor_module = self.make_megatron_module(
             wrap_with_ddp=False,
