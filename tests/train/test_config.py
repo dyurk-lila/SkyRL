@@ -413,6 +413,20 @@ def test_serialized_fp8_fp32_scales_reject_vllm_e8m0(monkeypatch):
         prepare_runtime_environment(cfg)
 
 
+def test_block_sparse_fused_lm_head_requires_fused_path():
+    with pytest.raises(ValueError, match="requires fused_lm_head_logprob=True"):
+        TrainerConfig(strategy="megatron", fused_lm_head_logprob_backend="triton_block_sparse")
+
+
+def test_block_sparse_fused_lm_head_accepts_backend_selection():
+    cfg = TrainerConfig(
+        strategy="megatron",
+        fused_lm_head_logprob=True,
+        fused_lm_head_logprob_backend="triton_block_sparse",
+    )
+    assert cfg.fused_lm_head_logprob_backend == "triton_block_sparse"
+
+
 def test_cli_overrides_plus_prefix_rejected():
     with pytest.raises(ValueError, match="The '\\+' prefix"):
         SkyRLTrainConfig.from_cli_overrides(["+new_field=value"])
