@@ -99,6 +99,7 @@ def _loss(
     tp_group,
     active_mask=None,
     mask_in_kernel=True,
+    active_spans=None,
 ):
     """Per-token CE summed to a scalar (so all modes produce identical grads)."""
     from megatron.core.fusions.fused_cross_entropy import (
@@ -132,11 +133,12 @@ def _loss(
             False,
         )
         kernel_mask = active_mask if mask_in_kernel else None
-        lp = (
-            FusedLinearLogprobTriton.apply(*args, kernel_mask)
-            if kernel_mask is not None
-            else FusedLinearLogprobTriton.apply(*args)
-        )
+        if active_spans is not None:
+            lp = FusedLinearLogprobTriton.apply(*args, kernel_mask, active_spans)
+        elif kernel_mask is not None:
+            lp = FusedLinearLogprobTriton.apply(*args, kernel_mask)
+        else:
+            lp = FusedLinearLogprobTriton.apply(*args)
         if active_mask is not None and not mask_in_kernel:
             return -(lp * active_mask).sum()
         return -lp.sum()
@@ -763,6 +765,124 @@ def _load_block_mask_trace(path: Path, dataset: str, num_tokens: int, tp: int, c
     return torch.tensor(window, dtype=torch.bool).unsqueeze(0)
 
 
+def _active_spans(active_mask: torch.Tensor, max_inactive_gap: int) -> tuple[tuple[int, int], ...]:
+    """Return ordered active spans, coalescing short zero gaps without moving rows."""
+    flat_mask = active_mask.detach().to(device="cpu", dtype=torch.bool).reshape(-1).tolist()
+    runs = []
+    start = None
+    for index, active in enumerate(flat_mask + [False]):
+        if active and start is None:
+            start = index
+        elif not active and start is not None:
+            runs.append((start, index))
+            start = None
+
+    spans = []
+    for start, end in runs:
+        if spans and start - spans[-1][1] <= max_inactive_gap:
+            spans[-1] = (spans[-1][0], end)
+        else:
+            spans.append((start, end))
+    return tuple(spans)
+
+
+def _benchmark_narrow_dlogits_tail(
+    args,
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    target: torch.Tensor,
+    active_mask: torch.Tensor,
+    tp_group,
+) -> dict[str, Any]:
+    """Compare the incumbent padded final split with direct narrow staging."""
+    from skyrl.backends.skyrl_train.distributed.megatron.fused_linear_logprob_triton import (
+        _OOV_LABEL_SENTINEL,
+        efficient_entropy_backward,
+        efficient_entropy_forward,
+    )
+
+    hidden_2d = hidden.detach().reshape(-1, hidden.shape[-1]).contiguous()
+    weight_2d = weight.detach().contiguous()
+    mask_1d = active_mask.reshape(-1).contiguous()
+    target_1d = target.reshape(-1)
+    vocab_start, vocab_end = _vocab_bounds(weight_2d.shape[0], tp_group)
+    rank = dist.get_rank(tp_group)
+    target_mask = (target_1d < vocab_start) | (target_1d >= vocab_end)
+    labels = (target_1d - vocab_start) + rank * weight_2d.shape[0]
+    labels = torch.where(target_mask, _OOV_LABEL_SENTINEL, labels).to(torch.int64).contiguous()
+    _, _, maximum, accumulate, entropy_b = efficient_entropy_forward(
+        hidden_2d,
+        weight_2d,
+        labels,
+        1.0,
+        tp_group,
+        mask_1d,
+    )
+    dlogprobs = torch.ones(hidden_2d.shape[0], dtype=torch.float32, device=hidden.device)
+    dentropy = torch.zeros_like(dlogprobs)
+    spans = _active_spans(mask_1d, 128)
+
+    def launch(narrow: bool):
+        return efficient_entropy_backward(
+            dlogprobs,
+            dentropy,
+            hidden_2d,
+            weight_2d,
+            labels,
+            maximum,
+            accumulate,
+            entropy_b,
+            False,
+            1.0,
+            tp_group,
+            mask_1d,
+            spans,
+            narrow,
+        )
+
+    outputs = {name: launch(narrow) for name, narrow in (("wide-tail", False), ("narrow-tail", True))}
+    torch.cuda.synchronize(hidden.device)
+    torch.testing.assert_close(outputs["narrow-tail"][0], outputs["wide-tail"][0], atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(outputs["narrow-tail"][1], outputs["wide-tail"][1], atol=2e-2, rtol=2e-2)
+    assert torch.count_nonzero(outputs["narrow-tail"][0][~mask_1d]) == 0
+
+    samples = {name: [] for name in outputs}
+    peaks = {name: [] for name in outputs}
+    variants = list(outputs)
+    for repetition in range(args.repetitions):
+        offset = repetition % len(variants)
+        for name in variants[offset:] + variants[:offset]:
+            torch.cuda.reset_peak_memory_stats(hidden.device)
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            launch(name == "narrow-tail")
+            end.record()
+            end.synchronize()
+            samples[name].append(start.elapsed_time(end))
+            peaks[name].append(torch.cuda.max_memory_allocated(hidden.device))
+
+    return {
+        "tail_width": weight_2d.shape[0] % 9504 or 9504,
+        "span_count": len(spans),
+        "metrics": {
+            name: {
+                "ms": statistics.median(values),
+                "peak_bytes": statistics.median(peaks[name]),
+                "dhidden_max_abs_vs_wide": (outputs[name][0].float() - outputs["wide-tail"][0].float())
+                .abs()
+                .max()
+                .item(),
+                "dweight_max_abs_vs_wide": (outputs[name][1].float() - outputs["wide-tail"][1].float())
+                .abs()
+                .max()
+                .item(),
+            }
+            for name, values in samples.items()
+        },
+    }
+
+
 def _run_block_mask_probe(args) -> None:
     """Measure the end-to-end value and dense-call overhead of tile skipping."""
     dist.init_process_group(backend="nccl")
@@ -794,7 +914,8 @@ def _run_block_mask_probe(args) -> None:
 
     check_tokens = 257
     check_hidden = 256
-    check_vocab_local = 2048
+    # Cross the 9,504-column backward split boundary and leave a partial tail.
+    check_vocab_local = 10_000
     shared_generator = torch.Generator(device=device).manual_seed(761)
     weight_generator = torch.Generator(device=device).manual_seed(991 + dist.get_rank(tp_group))
     hidden_base = torch.randn(
@@ -820,10 +941,13 @@ def _run_block_mask_probe(args) -> None:
         generator=shared_generator,
     )
     vocab_start, vocab_end = _vocab_bounds(check_vocab_local, tp_group)
+    blocky66 = torch.arange(check_tokens, device=device).unsqueeze(0) >= 55
+    # Gap-128 deliberately retains this hole inside one dHidden GEMM span.
+    blocky66[:, 128:160] = False
     masks = {
         "all": torch.ones((1, check_tokens), dtype=torch.bool, device=device),
         "blocky95": torch.arange(check_tokens, device=device).unsqueeze(0) >= 13,
-        "blocky66": torch.arange(check_tokens, device=device).unsqueeze(0) >= 87,
+        "blocky66": blocky66,
         "blocky25": torch.arange(check_tokens, device=device).unsqueeze(0) >= 193,
         "none": torch.zeros((1, check_tokens), dtype=torch.bool, device=device),
     }
@@ -836,6 +960,7 @@ def _run_block_mask_probe(args) -> None:
         tp_group,
         False,
     )
+    span_gaps = args.block_sparse_backward_span_gaps or []
     for mask_name, mask in masks.items():
         dense_hidden = hidden_base.clone().requires_grad_(True)
         dense_weight = weight_base.clone().requires_grad_(True)
@@ -867,6 +992,34 @@ def _run_block_mask_probe(args) -> None:
                 "weight_grad_max_abs": weight_delta,
             }
         )
+        for gap in span_gaps:
+            span_hidden = hidden_base.clone().requires_grad_(True)
+            span_weight = weight_base.clone().requires_grad_(True)
+            spans = _active_spans(mask, gap)
+            span_logprobs = FusedLinearLogprobTriton.apply(
+                span_hidden,
+                span_weight,
+                *fused_args,
+                mask,
+                spans,
+            )
+            span_loss = -span_logprobs.sum()
+            span_loss.backward()
+            torch.testing.assert_close(span_logprobs, expected_logprobs, atol=1e-5, rtol=1e-5)
+            torch.testing.assert_close(span_loss, dense_loss, atol=1e-4, rtol=1e-6)
+            torch.testing.assert_close(span_hidden.grad, dense_hidden.grad, atol=2e-2, rtol=2e-2)
+            torch.testing.assert_close(span_weight.grad, dense_weight.grad, atol=2e-2, rtol=2e-2)
+            assert torch.count_nonzero(span_logprobs[~mask]) == 0
+            assert torch.count_nonzero(span_hidden.grad[~mask]) == 0
+            correctness.append(
+                {
+                    "mask": f"{mask_name}-span-gap-{gap}",
+                    "logprob_max_abs": (span_logprobs - expected_logprobs).abs().max().item(),
+                    "loss_max_abs": (span_loss - dense_loss).abs().item(),
+                    "hidden_grad_max_abs": (span_hidden.grad - dense_hidden.grad).abs().max().item(),
+                    "weight_grad_max_abs": (span_weight.grad - dense_weight.grad).abs().max().item(),
+                }
+            )
 
     if rank0:
         print(
@@ -959,9 +1112,12 @@ def _run_block_mask_probe(args) -> None:
 
         for pattern, fraction, active_mask in mask_cases:
 
-            def launch(mask_in_kernel, hidden_input, weight_input, target_input, mask_input):
+            span_variants = {f"span-gap-{gap}": _active_spans(active_mask, gap) for gap in span_gaps}
+
+            def launch(variant, hidden_input, weight_input, target_input, mask_input):
                 hidden_input.grad = None
                 weight_input.grad = None
+                mask_in_kernel = variant != "dense"
                 loss = _loss(
                     "triton",
                     hidden_input,
@@ -972,50 +1128,93 @@ def _run_block_mask_probe(args) -> None:
                     tp_group,
                     mask_input,
                     mask_in_kernel,
+                    span_variants.get(variant),
                 )
                 loss.backward()
 
-            # Compile/autotune both binary modes outside the samples. Alternate
-            # their measured order to avoid clock/temperature drift.
-            launch(False, hidden, weight, target, active_mask)
-            launch(True, hidden, weight, target, active_mask)
+            variants = ["dense", "sparse", *span_variants]
+            for variant in variants:
+                launch(variant, hidden, weight, target, active_mask)
             torch.cuda.synchronize(device)
-            samples = {False: [], True: []}
-            peaks = {False: [], True: []}
+            samples = {variant: [] for variant in variants}
+            peaks = {variant: [] for variant in variants}
             for repetition in range(args.repetitions):
-                order = (False, True) if repetition % 2 == 0 else (True, False)
-                for mask_in_kernel in order:
+                offset = repetition % len(variants)
+                order = variants[offset:] + variants[:offset]
+                for variant in order:
                     torch.cuda.reset_peak_memory_stats(device)
                     start = torch.cuda.Event(enable_timing=True)
                     end = torch.cuda.Event(enable_timing=True)
                     start.record()
-                    launch(mask_in_kernel, hidden, weight, target, active_mask)
+                    launch(variant, hidden, weight, target, active_mask)
                     end.record()
                     end.synchronize()
-                    samples[mask_in_kernel].append(start.elapsed_time(end))
-                    peaks[mask_in_kernel].append(torch.cuda.max_memory_allocated(device))
+                    samples[variant].append(start.elapsed_time(end))
+                    peaks[variant].append(torch.cuda.max_memory_allocated(device))
 
             local_metrics = torch.tensor(
                 [
-                    statistics.median(samples[False]),
-                    statistics.median(samples[True]),
-                    statistics.median(peaks[False]),
-                    statistics.median(peaks[True]),
+                    metric
+                    for variant in variants
+                    for metric in (
+                        statistics.median(samples[variant]),
+                        statistics.median(peaks[variant]),
+                    )
                 ],
                 dtype=torch.float64,
                 device=device,
             )
             # Training step latency is set by the slowest TP/CP rank.
             dist.reduce(local_metrics, dst=0, op=dist.ReduceOp.MAX)
-            dense_ms, masked_ms, dense_peak, masked_peak = local_metrics.tolist()
+            reduced = local_metrics.tolist()
             if rank0:
-                print(
-                    f"tokens={seq_len} pattern={pattern} active={fraction:>5.1%} "
-                    f"dense={dense_ms:.3f}ms masked={masked_ms:.3f}ms "
-                    f"speedup={dense_ms / masked_ms:.3f}x "
-                    f"dense_peak={dense_peak / 1024**2:.0f}MB "
-                    f"masked_peak={masked_peak / 1024**2:.0f}MB"
+                metrics = {
+                    variant: {"ms": reduced[index * 2], "peak": reduced[index * 2 + 1]}
+                    for index, variant in enumerate(variants)
+                }
+                dense_ms = metrics["dense"]["ms"]
+                summary = " ".join(
+                    f"{variant}={values['ms']:.3f}ms/{dense_ms / values['ms']:.3f}x/"
+                    f"{values['peak'] / 1024**2:.0f}MB"
+                    for variant, values in metrics.items()
                 )
+                print(f"tokens={seq_len} pattern={pattern} active={fraction:>5.1%} {summary}")
+
+            if args.narrow_dlogits_tail_probe:
+                tail_result = _benchmark_narrow_dlogits_tail(
+                    args,
+                    hidden,
+                    weight,
+                    target,
+                    active_mask,
+                    tp_group,
+                )
+                tail_variants = tuple(tail_result["metrics"])
+                local_tail_metrics = torch.tensor(
+                    [tail_result["metrics"][variant]["ms"] for variant in tail_variants]
+                    + [tail_result["metrics"][variant]["peak_bytes"] for variant in tail_variants]
+                    + [tail_result["metrics"][variant]["dhidden_max_abs_vs_wide"] for variant in tail_variants]
+                    + [tail_result["metrics"][variant]["dweight_max_abs_vs_wide"] for variant in tail_variants],
+                    dtype=torch.float64,
+                    device=device,
+                )
+                dist.reduce(local_tail_metrics, dst=0, op=dist.ReduceOp.MAX)
+                if rank0:
+                    values = local_tail_metrics.tolist()
+                    variant_count = len(tail_variants)
+                    wide_ms, narrow_ms = values[:variant_count]
+                    wide_peak, narrow_peak = values[variant_count : 2 * variant_count]
+                    print(
+                        f"NARROW_DLOGITS_TAIL tokens={seq_len} pattern={pattern} "
+                        f"active={fraction:>5.1%} width={tail_result['tail_width']} "
+                        f"spans={tail_result['span_count']} "
+                        f"wide={wide_ms:.3f}ms narrow={narrow_ms:.3f}ms "
+                        f"speedup={wide_ms / narrow_ms:.4f}x "
+                        f"peak_delta={(narrow_peak - wide_peak) / 1024**2:.1f}MiB "
+                        f"dhidden_max_abs={max(values[2 * variant_count:3 * variant_count]):.4g} "
+                        f"dweight_max_abs={max(values[3 * variant_count:]):.4g}",
+                        flush=True,
+                    )
 
         del hidden, weight, target
         torch.cuda.empty_cache()
@@ -1292,6 +1491,17 @@ def main() -> None:
         help="compare general entropy with SkyRL's logprob-only specialization",
     )
     parser.add_argument(
+        "--narrow-dlogits-tail-probe",
+        action="store_true",
+        help="compare padded and direct-width final d-logits staging",
+    )
+    parser.add_argument(
+        "--block-sparse-backward-span-gaps",
+        type=int,
+        nargs="+",
+        help="benchmark ordered contiguous-span dHidden with these maximum inactive gaps",
+    )
+    parser.add_argument(
         "--block-mask-trace-only",
         action="store_true",
         help="omit synthetic suffix masks from the block-mask probe",
@@ -1311,6 +1521,8 @@ def main() -> None:
     probes = (args.autotune_sweep, args.block_mask_probe, args.entropy_specialization_probe)
     if sum(probes) > 1:
         parser.error("choose only one benchmark probe mode")
+    if args.narrow_dlogits_tail_probe and not args.block_mask_probe:
+        parser.error("--narrow-dlogits-tail-probe requires --block-mask-probe")
     if args.autotune_sweep:
         if args.output_dir is None:
             parser.error("--autotune-sweep requires --output-dir")

@@ -24,6 +24,7 @@ import megatron.core.parallel_state as mpu
 import torch
 import torch.distributed as dist
 
+from skyrl.backends.skyrl_train.distributed.megatron.active_spans import ActiveSpans
 from skyrl.train.fused_lm_head import FusedLmHeadBackend
 
 
@@ -479,6 +480,7 @@ def _fused_lm_head_logprob_apply(
     tp_group: torch.distributed.ProcessGroup,
     inference_only: bool,
     active_mask: Optional[torch.Tensor] = None,
+    active_spans: Optional[ActiveSpans] = None,
     compute_entropy: bool = False,
     entropy_requires_grad: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -511,6 +513,7 @@ def _fused_lm_head_logprob_apply(
                 tp_group,
                 inference_only,
                 active_mask,
+                active_spans,
                 compute_entropy,
                 entropy_requires_grad,
             )
@@ -786,6 +789,7 @@ def from_parallel_hidden_to_logprobs(
     temperature: float = 1.0,
     fused_backend: str = "torch",
     active_mask: Optional[torch.Tensor] = None,
+    active_spans: Optional[ActiveSpans] = None,
     return_entropy: bool = False,
     entropy_requires_grad: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -839,6 +843,7 @@ def from_parallel_hidden_to_logprobs(
         tp_group,
         inference_only,
         active_mask,
+        active_spans,
         return_entropy,
         entropy_requires_grad,
     )
@@ -882,6 +887,7 @@ def from_parallel_hidden_to_logprobs_packed_sequences(
     temperature: float = 1.0,
     fused_backend: str = "torch",
     active_mask: Optional[torch.Tensor] = None,
+    active_spans: Optional[ActiveSpans] = None,
     return_entropy: bool = False,
     entropy_requires_grad: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -953,6 +959,7 @@ def from_parallel_hidden_to_logprobs_packed_sequences(
         group,
         inference_only,
         active_mask,
+        active_spans,
         return_entropy,
         entropy_requires_grad,
     )
