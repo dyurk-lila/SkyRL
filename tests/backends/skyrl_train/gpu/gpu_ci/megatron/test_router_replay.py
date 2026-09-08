@@ -40,10 +40,9 @@ MOE_MODEL_NAME = "moonshotai/Moonlight-16B-A3B-Instruct"
 NUM_PROMPTS = 10
 N_SAMPLES_PER_PROMPT = 4
 MAX_GENERATE_LENGTH = 128
-# Moonlight 16B: 27 transformer layers (layer 0 dense), top_k=6, 64 routed experts. vLLM
-# captures every layer, so the captured layer dimension spans all 27.
-MOONLIGHT_NUM_LAYERS = 27
-MOONLIGHT_CAPTURED_LAYERS = tuple(range(MOONLIGHT_NUM_LAYERS))
+# Moonlight 16B: 27 transformer layers (layer 0 dense), top_k=6, 64 routed experts. The server
+# drops the expert-free layers, so a capture names only 1..26 and its layer dimension is 26 wide.
+MOONLIGHT_CAPTURED_LAYERS = tuple(range(1, 27))
 MOONLIGHT_TOPK = 6
 MOONLIGHT_NUM_EXPERTS = 64
 
@@ -56,7 +55,7 @@ def _packed_moonlight_routes(attention_mask: torch.Tensor) -> PackedTensor:
         route_start = torch.randint(
             0,
             MOONLIGHT_NUM_EXPERTS,
-            (real_tokens, MOONLIGHT_NUM_LAYERS, 1),
+            (real_tokens, len(MOONLIGHT_CAPTURED_LAYERS), 1),
             dtype=torch.int32,
         )
         segments.append((route_start + route_offsets) % MOONLIGHT_NUM_EXPERTS)

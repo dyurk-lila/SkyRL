@@ -5,6 +5,7 @@ from skyrl.backends.skyrl_train.utils.routed_experts import (
     RoutedExpertRoutes,
     RoutedExpertTrace,
     compact_routed_expert_indices,
+    select_moe_layer_routes,
     validate_moe_layer_indices,
 )
 
@@ -141,12 +142,6 @@ def test_routes_keep_the_captured_layer_mapping():
     assert routes.truncate(2).layer_indices == MOE_LAYERS
 
 
-def test_routes_covering_all_layers_names_every_slot():
-    routes = RoutedExpertRoutes.covering_all_layers(np.zeros((2, 4, 2), dtype=np.uint8))
-
-    assert routes.layer_indices == (0, 1, 2, 3)
-
-
 def test_routes_reject_a_layer_count_that_misses_a_slot():
     with pytest.raises(ValueError, match="cover 3 layers"):
         RoutedExpertRoutes(np.zeros((1, 3, 2), dtype=np.uint8), (0, 1))
@@ -165,6 +160,50 @@ def test_routes_compare_by_value():
     assert left != RoutedExpertRoutes(np.zeros((1, 2, 2), dtype=np.uint8), (2, 5))
     assert left != RoutedExpertRoutes(np.ones((1, 2, 2), dtype=np.uint8), MOE_LAYERS)
     assert left != np.zeros((1, 2, 2), dtype=np.uint8)
+
+
+def test_select_drops_expert_free_layers():
+    """Nemotron-style alternating mamba/MoE stack: only the odd layers carry routes."""
+    capture = np.zeros((4, 8, 2), dtype=np.int16)
+    moe_layers = (1, 3, 5, 7)
+    for slot, layer_index in enumerate(moe_layers):
+        capture[:, layer_index, :] = 300 + slot
+
+    routes = select_moe_layer_routes(capture, moe_layers)
+
+    assert routes.indices.shape == (4, 4, 2)
+    assert routes.layer_indices == moe_layers
+    for slot in range(len(moe_layers)):
+        assert np.all(routes.indices[:, slot, :] == 300 + slot)
+
+
+def test_select_keeps_a_leading_dense_layer_out_of_the_capture():
+    capture = np.arange(2 * 4 * 3, dtype=np.int32).reshape(2, 4, 3)
+
+    routes = select_moe_layer_routes(capture, (1, 2, 3))
+
+    assert routes.layer_indices == (1, 2, 3)
+    assert np.array_equal(routes.indices, capture[:, 1:, :])
+
+
+def test_select_is_identity_for_an_all_moe_model():
+    capture = np.arange(2 * 4 * 3, dtype=np.int32).reshape(2, 4, 3)
+
+    routes = select_moe_layer_routes(capture, range(4))
+
+    assert routes.indices is capture
+    assert routes.layer_indices == (0, 1, 2, 3)
+
+
+def test_select_rejects_layers_past_the_captured_stack():
+    with pytest.raises(ValueError, match="exceed the 4 layers"):
+        select_moe_layer_routes(np.zeros((1, 4, 2), dtype=np.uint8), (0, 4))
+
+
+@pytest.mark.parametrize("capture", [np.zeros((4, 2), dtype=np.uint8), [[[1, 2]]]])
+def test_select_rejects_a_capture_that_is_not_a_3d_array(capture):
+    with pytest.raises((TypeError, ValueError), match=r"NumPy array|\[tokens, layers, topk\]"):
+        select_moe_layer_routes(capture, (0,))
 
 
 def test_trace_carries_the_captured_layers_to_the_finalized_routes():

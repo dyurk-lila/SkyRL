@@ -283,10 +283,10 @@ def _run_replay_setup(monkeypatch, routes, captured_layer_indices, *, stage_rang
 @pytest.mark.parametrize(
     ("captured_layer_indices", "moe_layers", "stage_range"),
     [
-        (tuple(range(8)), (1, 3, 5, 7), (0, 8)),
-        (tuple(range(4)), (0, 1, 2, 3), (0, 4)),
-        (tuple(range(8)), (5, 7), (4, 4)),
-        (tuple(range(4)), (1, 2, 3), (0, 4)),
+        ((1, 3, 5, 7), (1, 3, 5, 7), (0, 8)),
+        (tuple(range(4)), tuple(range(4)), (0, 4)),
+        ((1, 3, 5, 7), (5, 7), (4, 4)),
+        ((1, 2, 3), (1, 2, 3), (0, 4)),
     ],
     ids=["interleaved", "all-moe", "later-pp-stage", "leading-dense"],
 )
@@ -304,21 +304,21 @@ def test_replay_maps_routers_by_carried_layer(
 
 
 def test_replay_raises_when_a_router_layer_was_not_captured(monkeypatch, parallel_state):
-    captured_layer_indices = tuple(range(4))
+    captured_layer_indices = (1, 3)
     _install_router_replay(monkeypatch, [2, 6])
     routes = _routes_tagged_by_layer(captured_layer_indices)
 
     with pytest.raises(ValueError, match="has no captured rollout routes"):
-        _run_replay_setup(monkeypatch, routes, captured_layer_indices, stage_range=(0, 4))
+        _run_replay_setup(monkeypatch, routes, captured_layer_indices, stage_range=(0, 8))
 
 
-def test_replay_raises_when_the_capture_does_not_cover_this_pp_stage(monkeypatch, parallel_state):
-    captured_layer_indices = tuple(range(4))
-    _install_router_replay(monkeypatch, [3, 4])
+def test_replay_raises_when_a_captured_layer_in_this_stage_owns_no_router(monkeypatch, parallel_state):
+    captured_layer_indices = (1, 3, 5, 7)
+    _install_router_replay(monkeypatch, [2, 4])
     routes = _routes_tagged_by_layer(captured_layer_indices)
 
-    with pytest.raises(ValueError, match=r"captured no routes for layers \[4, 5\]"):
-        _run_replay_setup(monkeypatch, routes, captured_layer_indices, stage_range=(2, 4))
+    with pytest.raises(ValueError, match=r"captured routes for MoE layers \[5\]"):
+        _run_replay_setup(monkeypatch, routes, captured_layer_indices, stage_range=(0, 6))
 
 
 @pytest.mark.parametrize("layer_numbers", [[None, None], [_UNPATCHED, _UNPATCHED]])

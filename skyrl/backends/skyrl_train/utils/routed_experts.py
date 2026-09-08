@@ -59,12 +59,6 @@ class RoutedExpertRoutes:
                 f"{len(self.layer_indices)} layer indices were carried alongside them"
             )
 
-    @classmethod
-    def covering_all_layers(cls, indices: RoutedExpertIndices) -> "RoutedExpertRoutes":
-        """Pair a capture spanning the whole transformer stack with the identity layer mapping."""
-        _validate_routed_expert_shape(indices)
-        return cls(indices, tuple(range(indices.shape[1])))
-
     @property
     def num_tokens(self) -> int:
         return self.indices.shape[0]
@@ -77,6 +71,24 @@ class RoutedExpertRoutes:
         if not isinstance(other, RoutedExpertRoutes):
             return False
         return self.layer_indices == other.layer_indices and np.array_equal(self.indices, other.indices)
+
+
+def select_moe_layer_routes(
+    capture: RoutedExpertIndices,
+    moe_layer_indices: Sequence[int],
+) -> RoutedExpertRoutes:
+    """Keep routed-MoE layers from a vLLM ``[tokens, all_layers, topk]`` capture."""
+    canonical_layer_indices = validate_moe_layer_indices(moe_layer_indices)
+    _validate_routed_expert_shape(capture)
+    num_layers = capture.shape[1]
+    if canonical_layer_indices[-1] >= num_layers:
+        raise ValueError(
+            f"MoE layer indices {canonical_layer_indices} exceed the {num_layers} layers reported by the engine"
+        )
+    if len(canonical_layer_indices) == num_layers:
+        return RoutedExpertRoutes(capture, canonical_layer_indices)
+    layer_index = np.asarray(canonical_layer_indices, dtype=ROUTED_EXPERT_LAYER_INDEX_DTYPE)
+    return RoutedExpertRoutes(capture[:, layer_index, :], canonical_layer_indices)
 
 
 class RoutedExpertTrace:

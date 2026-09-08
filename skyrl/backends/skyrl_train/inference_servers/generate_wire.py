@@ -100,14 +100,14 @@ def build_logprobs_content(
     return content, num_clamped
 
 
-def _to_host_array(routed_experts: Any) -> Any:
-    """Bring a framework tensor into host memory, leaving anything else alone.
+def capture_to_host_array(routed_experts: Any) -> Any:
+    """Bring one routed-expert capture into host memory, leaving anything else alone.
 
     vLLM hands back a torch tensor that may still live on a CUDA device, where
     ``np.asarray`` raises instead of transferring. Duck-typed so this module
     stays framework-agnostic, and deliberately not a blanket ``np.asarray``:
     objects without these methods (notably the nested lists this endpoint used
-    to send) fall through to ``compact_routed_expert_indices`` and are rejected.
+    to send) fall through to ``select_moe_layer_routes`` and are rejected.
     """
     for method in ("detach", "cpu", "numpy"):
         op = getattr(routed_experts, method, None)
@@ -180,11 +180,6 @@ def unpack_ndarray(
     array = np.frombuffer(data, dtype=dtype).reshape(shape)
     sidecar = {key: value for key, value in payload.items() if key not in _ENVELOPE_KEYS}
     return array, sidecar
-
-
-def routes_from_capture(routed_experts: Any) -> RoutedExpertRoutes:
-    """Pair a full-stack vLLM capture with its layer indices."""
-    return RoutedExpertRoutes.covering_all_layers(_to_host_array(routed_experts))
 
 
 def pack_routed_experts(routes: RoutedExpertRoutes) -> dict[str, Any]:
