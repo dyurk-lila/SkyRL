@@ -59,6 +59,9 @@ from skyrl.backends.skyrl_train.utils.replay_utils import (
     setup_per_microbatch_replay_backward,
     setup_per_microbatch_replay_forward,
 )
+from skyrl.backends.skyrl_train.utils.routed_experts import (
+    ROUTED_EXPERT_LAYER_INDICES_KEY,
+)
 from skyrl.backends.skyrl_train.utils.sample_support import SAMPLE_SUPPORT_FIELD
 from skyrl.backends.skyrl_train.utils.sample_support_replay import (
     compute_sample_support_scores,
@@ -434,6 +437,7 @@ class MegatronModelWrapper:
             fp8_enabled = is_fp8_enabled(getattr(model_config, "fp8", None))
             fp8_recipe = getattr(model_config, "fp8_recipe", None)
             rollout_expert_indices = batch.pop("rollout_expert_indices", None)
+            rollout_expert_layer_indices = batch.pop(ROUTED_EXPERT_LAYER_INDICES_KEY, None)
             router_padding_mask = batch.pop("router_padding_mask", None)
 
             sequences = batch["sequences"]
@@ -495,6 +499,7 @@ class MegatronModelWrapper:
             if rollout_expert_indices is not None:
                 model_replay_kwargs = setup_per_microbatch_replay_forward(
                     rollout_expert_indices,
+                    rollout_expert_layer_indices,
                     router_padding_mask,
                     attention_mask,
                     model=model,
@@ -1068,6 +1073,7 @@ class MegatronModelWrapper:
             fp8_enabled = is_fp8_enabled(getattr(model_config, "fp8", None))
             fp8_recipe = getattr(model_config, "fp8_recipe", None)
             rollout_expert_indices = batch.pop("rollout_expert_indices", None)
+            rollout_expert_layer_indices = batch.pop(ROUTED_EXPERT_LAYER_INDICES_KEY, None)
             router_padding_mask = batch.pop("router_padding_mask", None)
 
             sequences = batch["sequences"]
@@ -1150,6 +1156,7 @@ class MegatronModelWrapper:
             if rollout_expert_indices is not None:
                 model_replay_kwargs = setup_per_microbatch_replay_forward(
                     rollout_expert_indices,
+                    rollout_expert_layer_indices,
                     router_padding_mask,
                     attention_mask,
                     model=model,

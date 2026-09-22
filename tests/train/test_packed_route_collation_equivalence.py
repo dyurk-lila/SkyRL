@@ -22,6 +22,7 @@ from skyrl.backends.skyrl_train.utils.replay_utils import (
     make_replay_padding_indices,
     replay_padding_row,
 )
+from skyrl.backends.skyrl_train.utils.routed_experts import RoutedExpertRoutes
 from skyrl.train.dataset.preprocess import (
     convert_prompts_responses_to_batch_tensors,
     make_router_padding_mask,
@@ -148,11 +149,13 @@ def _make_batch(lengths: list[tuple[int, int]], *, captured_shortfall: int = 0, 
         if index == len(lengths) - 1:
             captured -= captured_shortfall
         routes.append(
-            rng.integers(
-                MIN_EXPERT_ID,
-                MIN_EXPERT_ID + 2000,
-                size=(captured, NUM_LAYERS, TOPK),
-                dtype=np.int16,
+            RoutedExpertRoutes.covering_all_layers(
+                rng.integers(
+                    MIN_EXPERT_ID,
+                    MIN_EXPERT_ID + 2000,
+                    size=(captured, NUM_LAYERS, TOPK),
+                    dtype=np.int16,
+                )
             )
         )
     return prompts, responses, rewards, loss_masks, routes
@@ -180,6 +183,7 @@ def _run_both_paths(
         loss_mask,
         _logprobs,
         packed_routes,
+        captured_layer_indices,
         _sample_support,
     ) = convert_prompts_responses_to_batch_tensors(
         PAD_TOKEN_ID,
@@ -189,8 +193,10 @@ def _run_both_paths(
         loss_masks,
         rollout_expert_indices=routes,
     )
-    router_padding_mask = make_router_padding_mask(attention_mask, [entry.shape[0] for entry in routes])
-    padded_routes = _reference_padded_routes(routes, [len(p) for p in prompts], [len(r) for r in responses])
+    router_padding_mask = make_router_padding_mask(attention_mask, [entry.num_tokens for entry in routes])
+    padded_routes = _reference_padded_routes(
+        [entry.indices for entry in routes], [len(p) for p in prompts], [len(r) for r in responses]
+    )
 
     if batch_pad_size:
         batch = TrainingInputBatch(
@@ -220,12 +226,14 @@ def _run_both_paths(
     tp_rank = tp_size - 1
     monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_world_size", lambda: tp_size, raising=False)
     monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_rank", lambda: tp_rank, raising=False)
-    router_replay.global_router_replay_instances = [object() for _ in local_layers]
+    # An all-MoE model captures every layer, so a router's slot is its own layer index.
+    router_replay.global_router_replay_instances = [SimpleNamespace(layer_number=layer + 1) for layer in local_layers]
     monkeypatch.setattr(replay_utils, "_get_current_pp_stage_layer_range", lambda model_config: stage_range)
 
     layout = build_token_metadata_layout(attention_mask, packed_routes.device, packed=packed, fp8_enabled=False)
     replay_utils.setup_per_microbatch_replay_forward(
         packed_routes,
+        captured_layer_indices,
         router_padding_mask,
         attention_mask,
         model=object(),
@@ -339,7 +347,7 @@ def test_packed_routes_match_under_context_parallelism(monkeypatch, parallel_sta
 def test_packed_collation_allocates_no_padded_rectangle(distribution):
     """The packed buffer must hold exactly the batch's real tokens."""
     prompts, responses, rewards, loss_masks, routes = _make_batch(LENGTH_DISTRIBUTIONS[distribution])
-    *_, packed_routes, _ = convert_prompts_responses_to_batch_tensors(
+    *_, packed_routes, captured_layer_indices, _ = convert_prompts_responses_to_batch_tensors(
         PAD_TOKEN_ID,
         prompts,
         responses,
@@ -353,3 +361,4 @@ def test_packed_collation_allocates_no_padded_rectangle(distribution):
     assert packed_routes.values.shape == (total_real, NUM_LAYERS, TOPK)
     assert packed_routes.values.numel() <= len(prompts) * max_total * NUM_LAYERS * TOPK
     assert packed_routes.cu_seqlens.tolist()[-1] == total_real
+    assert captured_layer_indices == tuple(range(NUM_LAYERS))

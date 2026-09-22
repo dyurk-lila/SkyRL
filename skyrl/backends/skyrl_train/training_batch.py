@@ -537,7 +537,8 @@ class TrainingInput(TypedDict, total=False):
     kl: Float[torch.Tensor, "batch_size response_len"]  # per-token KL, current vs reference policy
     rewards: Optional[Float[torch.Tensor, "batch_size response_len"]]  # env reward, typically only on the last token
     rollout_logprobs: Optional[Float[torch.Tensor, "batch_size response_len"]]  # sampling policy; off-policy corr.
-    # MoE router replay, packed to real tokens: values [sum(seq_len_i), layer_num, topk] + cu_seqlens
+    # MoE router replay, packed to real tokens: values [sum(seq_len_i), moe_layer_num, topk] +
+    # cu_seqlens. `metadata[ROUTED_EXPERT_LAYER_INDICES_KEY]` names the layer each slot holds.
     rollout_expert_indices: Optional[PackedTensor]
     router_padding_mask: Optional[Bool[torch.Tensor, "batch_size seq_len"]]  # True = no captured route (skip in replay)
     # Sampler support, packed to RESPONSE tokens: values [sum(response_len_i), top_k] + cu_seqlens
