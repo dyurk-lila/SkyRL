@@ -159,6 +159,14 @@ R3 requires per-token routes that line up with the trained tokens, so `SkyRLGymG
 R3 does induce additional training bias when mini-batching, since routing decisions are fixed for all mini-batches in a training batch. However, it has been shown to be important for stabilizing large-scale MoE training, particularly
 in models adopting a DeepSeek-V3 like architecture (notably the GLM family) due to the use of sigmoid-based affinity scoring instead of softmax for top-k routing.
 
+`moe_router_fusion=True` is incompatible with routing replay because TransformerEngine's fused top-k cannot accept precomputed indices. SkyRL rejects this configuration and forces fusion off at runtime if needed.
+
+Each worker logs its replay path once and warns if configured replay receives microbatches without rollout routes.
+
+## Fused routing replay
+
+`trainer.policy.megatron_config.moe_fused_routing_replay=True` serves replay through a fused CUDA kernel with Megatron's `(routing_probs, routing_map)` contract. It supports normalized sigmoid routing, fp32/fp16/bf16 logits, and `2 <= topk <= 32`; unsupported calls fall back to unfused replay. Workers compile the extension before the first forward in a node-local, torch-version-keyed directory.
+
 # Algorithmic Off Policy Correction
 
 In the previous sections, we described some reasons why off-policy drift can occur, and some ways to mitigate it (e.g., batch invariant kernels, routing replay). However,
