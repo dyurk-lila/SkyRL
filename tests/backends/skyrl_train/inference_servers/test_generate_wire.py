@@ -16,16 +16,19 @@ from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
     PackedField,
     RoutedExpertsWireKey,
     build_logprobs_content,
+    capture_to_host_array,
     decode_packed_routed_experts,
     decode_packed_sample_support,
     load_packed_body,
     pack_ndarray,
     pack_routed_experts,
     pack_sample_support,
-    routes_from_capture,
     unpack_ndarray,
 )
-from skyrl.backends.skyrl_train.utils.routed_experts import RoutedExpertRoutes
+from skyrl.backends.skyrl_train.utils.routed_experts import (
+    RoutedExpertRoutes,
+    select_moe_layer_routes,
+)
 
 _FLOAT32 = frozenset({np.dtype(np.float32)})
 _INT16 = frozenset({np.dtype(np.int16)})
@@ -36,11 +39,18 @@ def _support_envelope(support: np.ndarray) -> dict:
 
 
 def _routes(indices, layer_indices=None) -> RoutedExpertRoutes:
-    """Pair route values with their captured layers, defaulting to the whole stack."""
+    """Pair route values with their captured layers, defaulting to an all-MoE stack."""
     indices = np.asarray(indices)
     if layer_indices is None:
-        return RoutedExpertRoutes.covering_all_layers(indices)
+        layer_indices = range(indices.shape[1])
     return RoutedExpertRoutes(indices, layer_indices)
+
+
+def _routes_from_capture(capture, moe_layer_indices=None) -> RoutedExpertRoutes:
+    host_capture = capture_to_host_array(capture)
+    if moe_layer_indices is None:
+        moe_layer_indices = range(np.shape(host_capture)[1])
+    return select_moe_layer_routes(host_capture, moe_layer_indices)
 
 
 def _routed_experts_envelope(indices, layer_indices=None) -> dict:
@@ -145,17 +155,34 @@ def test_pack_rejects_invalid_routes(indices):
 
 def test_pack_rejects_nested_lists():
     with pytest.raises(TypeError, match="NumPy array"):
-        routes_from_capture([[[1, 2]]])
+        _routes_from_capture([[[1, 2]]])
 
 
 def test_pack_accepts_torch_tensors():
-    routes = torch.arange(12, dtype=torch.int64).reshape(3, 2, 2)
+    capture = torch.arange(12, dtype=torch.int64).reshape(3, 2, 2)
 
-    decoded = decode_packed_routed_experts(pack_routed_experts(routes_from_capture(routes)))
+    decoded = decode_packed_routed_experts(pack_routed_experts(_routes_from_capture(capture)))
 
     assert decoded.indices.dtype == np.uint8
-    assert np.array_equal(decoded.indices, routes.numpy())
+    assert np.array_equal(decoded.indices, capture.numpy())
     assert decoded.layer_indices == (0, 1)
+
+
+def test_pack_carries_only_the_moe_layers_of_a_hybrid_capture():
+    """The server's own expression: drop the expert-free slots, then name what survived.
+
+    vLLM's buffer spans all 8 layers; only 1, 3, 5, 7 own a router, so the wire payload must
+    be half the size and must say which layers its slots are.
+    """
+    capture = torch.zeros((3, 8, 2), dtype=torch.int64)
+    capture[:, 1::2, :] = 42
+
+    payload = pack_routed_experts(_routes_from_capture(capture, (1, 3, 5, 7)))
+    decoded = decode_packed_routed_experts(payload)
+
+    assert payload[PackedArrayKey.SHAPE] == [3, 4, 2]
+    assert decoded.layer_indices == (1, 3, 5, 7)
+    assert np.all(decoded.indices == 42)
 
 
 def test_pack_moves_device_tensors_to_host():
@@ -183,7 +210,7 @@ def test_pack_moves_device_tensors_to_host():
             return self._array
 
     routes = np.arange(12, dtype=np.int64).reshape(3, 2, 2)
-    decoded = decode_packed_routed_experts(pack_routed_experts(routes_from_capture(_DeviceTensor(routes))))
+    decoded = decode_packed_routed_experts(pack_routed_experts(_routes_from_capture(_DeviceTensor(routes), (0, 1))))
 
     assert calls == ["detach", "cpu", "numpy"]
     assert np.array_equal(decoded.indices, routes)
