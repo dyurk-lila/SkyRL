@@ -1,6 +1,5 @@
 """Support-conditioned scoring for bounded sampler replay."""
 
-import warnings
 from dataclasses import dataclass
 
 import torch
@@ -75,9 +74,7 @@ class _ChunkedCandidateProjection(torch.autograd.Function):
         if fused_backend in (FusedLmHeadBackend.TRITON, FusedLmHeadBackend.TRITON_BLOCK_SPARSE):
             # Recorded support is already candidate-sparse. Both Triton choices use that
             # sparsity instead of constructing the dense LM-head backend's row mask/spans.
-            projected = _try_triton_candidate_projection(hidden, weight, row_ids, token_ids, temperature, fused_backend)
-            if projected is not None:
-                return projected
+            return _triton_candidate_projection(hidden, weight, row_ids, token_ids, temperature)
         output = torch.empty(token_ids.shape, dtype=torch.float32, device=hidden.device)
         for start in range(0, token_ids.numel(), chunk_size):
             end = min(start + chunk_size, token_ids.numel())
@@ -104,49 +101,19 @@ class _ChunkedCandidateProjection(torch.autograd.Function):
         return grad_hidden, grad_weight, None, None, None, None, None
 
 
-def _candidate_projection_backend(
-    fused_backend: FusedLmHeadBackend,
-    hidden: torch.Tensor,
-) -> FusedLmHeadBackend:
-    """Fall back with the same availability contract as the full-vocabulary op."""
-    if fused_backend == FusedLmHeadBackend.TORCH:
-        return fused_backend
-    from skyrl.backends.skyrl_train.distributed.megatron.fused_sample_support_triton import (
-        TRITON_AVAILABLE,
-    )
-
-    if TRITON_AVAILABLE and hidden.is_cuda:
-        return fused_backend
-    warnings.warn(
-        f"fused_lm_head_logprob_backend={fused_backend!r} unavailable for sample-support projection; "
-        "falling back to the pure-PyTorch backend",
-        stacklevel=3,
-    )
-    return FusedLmHeadBackend.TORCH
-
-
-def _try_triton_candidate_projection(
+def _triton_candidate_projection(
     hidden: torch.Tensor,
     weight: torch.Tensor,
     row_ids: torch.Tensor,
     token_ids: torch.Tensor,
     temperature: float,
-    fused_backend: FusedLmHeadBackend,
-) -> torch.Tensor | None:
-    """Run Triton or preserve the full fused-LM-head fallback contract."""
-    try:
-        from skyrl.backends.skyrl_train.distributed.megatron.fused_sample_support_triton import (
-            candidate_projection,
-        )
+) -> torch.Tensor:
+    """Import Triton only when a Triton backend is selected."""
+    from skyrl.backends.skyrl_train.distributed.megatron.fused_sample_support_triton import (
+        candidate_projection,
+    )
 
-        return candidate_projection(hidden, weight, row_ids, token_ids, temperature)
-    except (ImportError, RuntimeError) as error:
-        warnings.warn(
-            f"fused_lm_head_logprob_backend={fused_backend!r} unavailable ({error}); "
-            "falling back to the pure-PyTorch backend",
-            stacklevel=3,
-        )
-        return None
+    return candidate_projection(hidden, weight, row_ids, token_ids, temperature)
 
 
 def _project_candidate_pairs(
@@ -164,7 +131,6 @@ def _project_candidate_pairs(
     pair_chunk_size = token_ids.numel() if chunk_size is None else chunk_size
     if pair_chunk_size <= 0:
         raise ValueError(f"candidate projection chunk size must be positive, got {pair_chunk_size}")
-    fused_backend = _candidate_projection_backend(fused_backend, hidden)
     if torch.is_grad_enabled() and (hidden.requires_grad or lm_head_weight.requires_grad):
         # A plain loop retains every selected chunk for backward. The custom backward reselects
         # one chunk at a time, so peak candidate-pair storage stays at the chunk bound.
@@ -179,11 +145,7 @@ def _project_candidate_pairs(
         )
 
     if fused_backend in (FusedLmHeadBackend.TRITON, FusedLmHeadBackend.TRITON_BLOCK_SPARSE):
-        projected = _try_triton_candidate_projection(
-            hidden, lm_head_weight, row_ids, token_ids, temperature, fused_backend
-        )
-        if projected is not None:
-            return projected
+        return _triton_candidate_projection(hidden, lm_head_weight, row_ids, token_ids, temperature)
 
     output = torch.empty(token_ids.shape, dtype=torch.float32, device=hidden.device)
     for start in range(0, token_ids.numel(), pair_chunk_size):

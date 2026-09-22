@@ -5,6 +5,7 @@ import threading
 import types
 from collections import Counter
 from typing import List, Tuple
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -27,6 +28,7 @@ from skyrl.backends.skyrl_train.utils.sample_support_replay import (
     reject_unsupported_sample_support_packing,
     sample_support_scores,
 )
+from skyrl.train.fused_lm_head import FusedLmHeadBackend
 
 VOCAB = 11
 TOP_K = 4
@@ -41,6 +43,7 @@ DENSE_SCORER_KWARGS = dict(
 
 
 def test_candidate_autotune_key_uses_coarse_occupancy_regimes():
+    pytest.importorskip("triton")
     from skyrl.backends.skyrl_train.distributed.megatron.fused_sample_support_triton import (
         _autotune_pair_regime,
     )
@@ -597,38 +600,38 @@ def test_an_all_padding_microbatch_scores_nothing():
     assert torch.all(scores.logprobs == 0)
 
 
-def test_fused_candidate_backend_falls_back_after_a_triton_runtime_error(monkeypatch):
-    from skyrl.backends.skyrl_train.distributed.megatron import (
-        fused_sample_support_triton,
-    )
-    from skyrl.train.fused_lm_head import FusedLmHeadBackend
-
-    def unavailable(*_args):
-        raise RuntimeError("unsupported target")
-
-    monkeypatch.setattr(fused_sample_support_triton, "candidate_projection", unavailable)
-    hidden = torch.randn(2, 3)
+@pytest.mark.parametrize("backend", [FusedLmHeadBackend.TRITON, FusedLmHeadBackend.TRITON_BLOCK_SPARSE])
+@pytest.mark.parametrize("requires_grad", [False, True])
+def test_fused_candidate_backend_propagates_triton_errors(monkeypatch, backend, requires_grad):
+    module_name = "skyrl.backends.skyrl_train.distributed.megatron.fused_sample_support_triton"
+    hidden = torch.randn(2, 3, requires_grad=requires_grad)
     weight = torch.randn(VOCAB, 3)
     ids = torch.tensor([0, 1])
-    with pytest.warns(UserWarning, match="unsupported target"):
-        result = sample_support_replay._try_triton_candidate_projection(
-            hidden, weight, ids, ids, 1.0, FusedLmHeadBackend.TRITON_BLOCK_SPARSE
-        )
-    assert result is None
+    monkeypatch.setitem(sys.modules, module_name, None)
+    with pytest.raises(ModuleNotFoundError, match="fused_sample_support_triton"):
+        sample_support_replay._project_candidate_pairs(hidden, ids, ids, weight, 1.0, 2, backend)
+
+    module = types.ModuleType(module_name)
+    module.candidate_projection = Mock(side_effect=RuntimeError("unsupported target"))
+    monkeypatch.setitem(sys.modules, module_name, module)
+    with pytest.raises(RuntimeError, match="unsupported target"):
+        sample_support_replay._project_candidate_pairs(hidden, ids, ids, weight, 1.0, 2, backend)
 
 
 @pytest.mark.parametrize("fused_backend", ["triton", "triton_block_sparse"])
-def test_fused_candidate_backend_falls_back_on_cpu(fused_backend):
+def test_fused_candidate_backend_rejects_cpu_execution(fused_backend):
     hidden = torch.randn(1, 2, 3, dtype=torch.float64, requires_grad=True)
     weight = torch.randn(VOCAB, 3, dtype=torch.float64, requires_grad=True)
     sampled = torch.tensor([[2, 5]])
     support = torch.tensor([[[2, 4, -1], [5, 3, 7]]], dtype=SAMPLE_SUPPORT_TORCH_DTYPE)
-    kwargs = dict(vocab_start_index=0, vocab_end_index=VOCAB, tp_group=None, lm_head_weight=weight)
-    expected = sample_support_scores(hidden, sampled, support, **kwargs)
-    with pytest.warns(UserWarning, match="falling back to the pure-PyTorch backend"):
-        actual = sample_support_scores(hidden, sampled, support, fused_backend=fused_backend, **kwargs)
-    torch.testing.assert_close(actual.logprobs, expected.logprobs)
-    expected_grads = torch.autograd.grad(expected.logprobs.sum(), (hidden, weight))
-    actual_grads = torch.autograd.grad(actual.logprobs.sum(), (hidden, weight))
-    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
-        torch.testing.assert_close(actual_grad, expected_grad)
+    with pytest.raises((ImportError, RuntimeError), match="triton|CUDA"):
+        sample_support_scores(
+            hidden,
+            sampled,
+            support,
+            vocab_start_index=0,
+            vocab_end_index=VOCAB,
+            tp_group=None,
+            lm_head_weight=weight,
+            fused_backend=fused_backend,
+        )

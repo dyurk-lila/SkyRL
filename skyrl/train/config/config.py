@@ -1600,7 +1600,7 @@ class TrainerConfig(BaseConfig):
     near a fully active mask; select it only after benchmarking representative
     masks and sharding. Under sample-support replay the recorded candidates
     already supply the sparsity, so the row mask and spans are not built.
-    Triton backends require CUDA + triton and fall back to ``"torch"`` when unavailable.
+    Triton backends require CUDA + Triton; import and execution errors propagate.
     Ignored unless ``fused_lm_head_logprob`` is true."""
 
     def __post_init__(self):
