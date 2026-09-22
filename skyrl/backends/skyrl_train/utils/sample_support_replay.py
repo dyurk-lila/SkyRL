@@ -1,5 +1,6 @@
 """Support-conditioned scoring for bounded sampler replay."""
 
+import warnings
 from dataclasses import dataclass
 
 import torch
@@ -17,6 +18,7 @@ from skyrl.backends.skyrl_train.utils.sample_support import (
     SAMPLE_SUPPORT_TORCH_DTYPE,
     align_sample_support_row_ids,
 )
+from skyrl.train.fused_lm_head import FusedLmHeadBackend
 
 
 def missing_sample_support_message(backend: str) -> str:
@@ -66,10 +68,16 @@ class _ChunkedCandidateProjection(torch.autograd.Function):
     """Selected LM-head projection that never retains a ``[pairs, hidden]`` activation."""
 
     @staticmethod
-    def forward(ctx, hidden, weight, row_ids, token_ids, temperature, chunk_size):
+    def forward(ctx, hidden, weight, row_ids, token_ids, temperature, chunk_size, fused_backend):
         ctx.save_for_backward(hidden, weight, row_ids, token_ids)
         ctx.temperature = temperature
         ctx.chunk_size = chunk_size
+        if fused_backend in (FusedLmHeadBackend.TRITON, FusedLmHeadBackend.TRITON_BLOCK_SPARSE):
+            # Recorded support is already candidate-sparse. Both Triton choices use that
+            # sparsity instead of constructing the dense LM-head backend's row mask/spans.
+            projected = _try_triton_candidate_projection(hidden, weight, row_ids, token_ids, temperature, fused_backend)
+            if projected is not None:
+                return projected
         output = torch.empty(token_ids.shape, dtype=torch.float32, device=hidden.device)
         for start in range(0, token_ids.numel(), chunk_size):
             end = min(start + chunk_size, token_ids.numel())
@@ -93,7 +101,52 @@ class _ChunkedCandidateProjection(torch.autograd.Function):
             if grad_weight is not None:
                 selected_hidden = hidden.index_select(0, chunk_rows).to(weight.dtype)
                 grad_weight.index_add_(0, chunk_tokens, chunk_grad.unsqueeze(1) * selected_hidden)
-        return grad_hidden, grad_weight, None, None, None, None
+        return grad_hidden, grad_weight, None, None, None, None, None
+
+
+def _candidate_projection_backend(
+    fused_backend: FusedLmHeadBackend,
+    hidden: torch.Tensor,
+) -> FusedLmHeadBackend:
+    """Fall back with the same availability contract as the full-vocabulary op."""
+    if fused_backend == FusedLmHeadBackend.TORCH:
+        return fused_backend
+    from skyrl.backends.skyrl_train.distributed.megatron.fused_sample_support_triton import (
+        TRITON_AVAILABLE,
+    )
+
+    if TRITON_AVAILABLE and hidden.is_cuda:
+        return fused_backend
+    warnings.warn(
+        f"fused_lm_head_logprob_backend={fused_backend!r} unavailable for sample-support projection; "
+        "falling back to the pure-PyTorch backend",
+        stacklevel=3,
+    )
+    return FusedLmHeadBackend.TORCH
+
+
+def _try_triton_candidate_projection(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    row_ids: torch.Tensor,
+    token_ids: torch.Tensor,
+    temperature: float,
+    fused_backend: FusedLmHeadBackend,
+) -> torch.Tensor | None:
+    """Run Triton or preserve the full fused-LM-head fallback contract."""
+    try:
+        from skyrl.backends.skyrl_train.distributed.megatron.fused_sample_support_triton import (
+            candidate_projection,
+        )
+
+        return candidate_projection(hidden, weight, row_ids, token_ids, temperature)
+    except (ImportError, RuntimeError) as error:
+        warnings.warn(
+            f"fused_lm_head_logprob_backend={fused_backend!r} unavailable ({error}); "
+            "falling back to the pure-PyTorch backend",
+            stacklevel=3,
+        )
+        return None
 
 
 def _project_candidate_pairs(
@@ -103,6 +156,7 @@ def _project_candidate_pairs(
     lm_head_weight: torch.Tensor,
     temperature: float,
     chunk_size: int | None,
+    fused_backend: FusedLmHeadBackend,
 ) -> torch.Tensor:
     """Project selected ``(token position, vocab row)`` pairs in bounded chunks."""
     if token_ids.numel() == 0:
@@ -110,6 +164,7 @@ def _project_candidate_pairs(
     pair_chunk_size = token_ids.numel() if chunk_size is None else chunk_size
     if pair_chunk_size <= 0:
         raise ValueError(f"candidate projection chunk size must be positive, got {pair_chunk_size}")
+    fused_backend = _candidate_projection_backend(fused_backend, hidden)
     if torch.is_grad_enabled() and (hidden.requires_grad or lm_head_weight.requires_grad):
         # A plain loop retains every selected chunk for backward. The custom backward reselects
         # one chunk at a time, so peak candidate-pair storage stays at the chunk bound.
@@ -120,7 +175,15 @@ def _project_candidate_pairs(
             token_ids,
             temperature,
             pair_chunk_size,
+            fused_backend,
         )
+
+    if fused_backend in (FusedLmHeadBackend.TRITON, FusedLmHeadBackend.TRITON_BLOCK_SPARSE):
+        projected = _try_triton_candidate_projection(
+            hidden, lm_head_weight, row_ids, token_ids, temperature, fused_backend
+        )
+        if projected is not None:
+            return projected
 
     output = torch.empty(token_ids.shape, dtype=torch.float32, device=hidden.device)
     for start in range(0, token_ids.numel(), pair_chunk_size):
@@ -138,6 +201,7 @@ def _selected_hidden_projection(
     temperature: float,
     chunk_size: int | None,
     invalid_value: float,
+    fused_backend: FusedLmHeadBackend,
 ) -> torch.Tensor:
     """Score a fixed-width candidate matrix without materializing vocabulary logits."""
     num_rows, width = token_ids.shape
@@ -149,6 +213,7 @@ def _selected_hidden_projection(
         lm_head_weight,
         temperature,
         chunk_size,
+        fused_backend,
     )
     return torch.where(local_mask.reshape(-1), projected, invalid_value).reshape(num_rows, width)
 
@@ -166,6 +231,7 @@ def sample_support_scores(
     lm_head_weight: torch.Tensor | None = None,
     temperature: float = 1.0,
     chunk_size: int | None = None,
+    fused_backend: FusedLmHeadBackend = FusedLmHeadBackend.TORCH,
 ) -> SampleSupportScores:
     """Renormalize scores and optionally compute entropy over each recorded support row."""
     if logits_or_hidden.shape[:-1] != sampled_ids.shape or support_ids.shape[:-1] != sampled_ids.shape:
@@ -212,6 +278,7 @@ def sample_support_scores(
             temperature,
             chunk_size,
             float("-inf"),
+            fused_backend,
         )
         local_sampled = _selected_hidden_projection(
             flat_source,
@@ -221,6 +288,7 @@ def sample_support_scores(
             temperature,
             chunk_size,
             0.0,
+            fused_backend,
         ).squeeze(1)
 
     local_max = local_values.detach().amax(dim=-1)
@@ -301,6 +369,7 @@ def score_aligned_sample_support(
     lm_head_weight: torch.Tensor | None = None,
     temperature: float = 1.0,
     chunk_size: int | None = None,
+    fused_backend: FusedLmHeadBackend = FusedLmHeadBackend.TORCH,
 ) -> SampleSupportScores:
     """Score token-aligned recorded support rows."""
     scores = sample_support_scores(
@@ -315,6 +384,7 @@ def score_aligned_sample_support(
         lm_head_weight=lm_head_weight,
         temperature=temperature if lm_head_weight is not None else 1.0,
         chunk_size=chunk_size,
+        fused_backend=FusedLmHeadBackend(fused_backend),
     )
     unsupported_loss_active = aligned_loss_mask & ~scores.valid_mask
     if unsupported_loss_active.any():
@@ -339,6 +409,7 @@ def compute_sample_support_scores(
     chunk_size: int | None,
     compute_entropy: bool = False,
     entropy_requires_grad: bool = False,
+    fused_backend: FusedLmHeadBackend = FusedLmHeadBackend.TORCH,
 ) -> SampleSupportScores:
     """Score support-conditioned logprobs in canonical trainer layout."""
     if sample_support is None:
@@ -376,6 +447,7 @@ def compute_sample_support_scores(
         lm_head_weight=lm_head_weight,
         temperature=temperature,
         chunk_size=chunk_size,
+        fused_backend=FusedLmHeadBackend(fused_backend),
     )
     if not packed:
         return scores

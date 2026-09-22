@@ -40,6 +40,14 @@ DENSE_SCORER_KWARGS = dict(
 )
 
 
+def test_candidate_autotune_key_uses_coarse_occupancy_regimes():
+    from skyrl.backends.skyrl_train.distributed.megatron.fused_sample_support_triton import (
+        _autotune_pair_regime,
+    )
+
+    assert [_autotune_pair_regime(size) for size in (1, 255, 256, 4095, 4096, 1_000_000)] == [0, 0, 1, 1, 2, 2]
+
+
 def _reference_support_logprobs(logits, sampled_ids, support_ids):
     """Renormalize over each row's recorded members with a dense full-vocabulary softmax."""
     outputs = []
@@ -587,3 +595,40 @@ def test_an_all_padding_microbatch_scores_nothing():
 
     assert not scores.valid_mask.any()
     assert torch.all(scores.logprobs == 0)
+
+
+def test_fused_candidate_backend_falls_back_after_a_triton_runtime_error(monkeypatch):
+    from skyrl.backends.skyrl_train.distributed.megatron import (
+        fused_sample_support_triton,
+    )
+    from skyrl.train.fused_lm_head import FusedLmHeadBackend
+
+    def unavailable(*_args):
+        raise RuntimeError("unsupported target")
+
+    monkeypatch.setattr(fused_sample_support_triton, "candidate_projection", unavailable)
+    hidden = torch.randn(2, 3)
+    weight = torch.randn(VOCAB, 3)
+    ids = torch.tensor([0, 1])
+    with pytest.warns(UserWarning, match="unsupported target"):
+        result = sample_support_replay._try_triton_candidate_projection(
+            hidden, weight, ids, ids, 1.0, FusedLmHeadBackend.TRITON_BLOCK_SPARSE
+        )
+    assert result is None
+
+
+@pytest.mark.parametrize("fused_backend", ["triton", "triton_block_sparse"])
+def test_fused_candidate_backend_falls_back_on_cpu(fused_backend):
+    hidden = torch.randn(1, 2, 3, dtype=torch.float64, requires_grad=True)
+    weight = torch.randn(VOCAB, 3, dtype=torch.float64, requires_grad=True)
+    sampled = torch.tensor([[2, 5]])
+    support = torch.tensor([[[2, 4, -1], [5, 3, 7]]], dtype=SAMPLE_SUPPORT_TORCH_DTYPE)
+    kwargs = dict(vocab_start_index=0, vocab_end_index=VOCAB, tp_group=None, lm_head_weight=weight)
+    expected = sample_support_scores(hidden, sampled, support, **kwargs)
+    with pytest.warns(UserWarning, match="falling back to the pure-PyTorch backend"):
+        actual = sample_support_scores(hidden, sampled, support, fused_backend=fused_backend, **kwargs)
+    torch.testing.assert_close(actual.logprobs, expected.logprobs)
+    expected_grads = torch.autograd.grad(expected.logprobs.sum(), (hidden, weight))
+    actual_grads = torch.autograd.grad(actual.logprobs.sum(), (hidden, weight))
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(actual_grad, expected_grad)
