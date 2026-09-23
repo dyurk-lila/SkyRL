@@ -291,8 +291,6 @@ class MegatronModelWrapper:
         self._fused_lm_head = self.cfg.fused_lm_head_logprob
         self._fused_lm_head_backend = self.cfg.fused_lm_head_logprob_backend
         self._fused_lm_head_block_sparse = self._fused_lm_head_backend == FusedLmHeadBackend.TRITON_BLOCK_SPARSE
-        if self._fused_lm_head_block_sparse and self.cfg.algorithm.enable_sample_support_replay:
-            raise ValueError("The triton_block_sparse fused LM-head backend does not support sample-support replay")
         # Some models (e.g. Qwen3.5 via the VL bridge -> Qwen3VLModel) pack
         # sequences inside their own forward; SkyRL sample packing would then
         # double-pack and corrupt the GDN cu_seqlens, so refuse it. For Qwen3.5,
@@ -440,6 +438,7 @@ class MegatronModelWrapper:
                     lm_head_weight=lm_head_weight if fused_lm_head else None,
                     temperature=temperature,
                     chunk_size=self.cfg.logprobs_chunk_size,
+                    fused_backend=self._fused_lm_head_backend,
                     compute_entropy=False,
                     entropy_requires_grad=False,
                 ).logprobs
@@ -511,7 +510,7 @@ class MegatronModelWrapper:
             fp8_recipe = getattr(model_config, "fp8_recipe", None)
             batch, sub_seq_lengths = _prepare_microbatch_host_metadata(
                 next(batch_iter),
-                block_sparse=self._fused_lm_head_block_sparse,
+                block_sparse=(self._fused_lm_head_block_sparse and not self.cfg.algorithm.enable_sample_support_replay),
                 remove_microbatch_padding=self.remove_microbatch_padding,
                 fp8_enabled=fp8_enabled,
                 fp8_recipe=fp8_recipe,
@@ -755,7 +754,7 @@ class MegatronModelWrapper:
             num_real_microbatches = data.get("num_real_microbatches", num_microbatches)
 
             sparse_active_mask = data[_ACTIVE_MASK_KEY]
-            if self._fused_lm_head_block_sparse:
+            if self._fused_lm_head_block_sparse and not self.cfg.algorithm.enable_sample_support_replay:
                 if loss_mask is None:
                     raise ValueError("The triton_block_sparse fused LM-head backend requires a loss mask")
                 if sparse_active_mask is None:
@@ -807,6 +806,7 @@ class MegatronModelWrapper:
                     lm_head_weight=lm_head_weight if fused_lm_head else None,
                     temperature=temperature,
                     chunk_size=self.cfg.logprobs_chunk_size,
+                    fused_backend=self._fused_lm_head_backend,
                     compute_entropy=compute_support_entropy,
                     entropy_requires_grad=compute_support_entropy and loss_config.use_entropy_loss,
                 )
@@ -1183,7 +1183,7 @@ class MegatronModelWrapper:
             # ``tolist`` synchronization.
             batch, sub_seq_lengths = _prepare_microbatch_host_metadata(
                 next(batch_iter),
-                block_sparse=self._fused_lm_head_block_sparse,
+                block_sparse=(self._fused_lm_head_block_sparse and not self.cfg.algorithm.enable_sample_support_replay),
                 remove_microbatch_padding=self.remove_microbatch_padding,
                 fp8_enabled=fp8_enabled,
                 fp8_recipe=fp8_recipe,
