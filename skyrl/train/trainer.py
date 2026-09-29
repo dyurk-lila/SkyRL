@@ -350,7 +350,7 @@ class RayPPOTrainer:
                         # 1.1. generation phase
                         if self._vllm_metrics_scraper is not None:
                             self._vllm_metrics_scraper.resume()
-                        with Timer("generate", self.all_timings):
+                        with Timer("generate", self.all_timings), deadline.operation("generate"):
                             generator_output: GeneratorOutput = await self.generate(generator_input)
                         if self._vllm_metrics_scraper is not None:
                             self._vllm_metrics_scraper.pause()
