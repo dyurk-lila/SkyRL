@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from skyrl.train.utils.async_utils import BackgroundFailure
+from skyrl.train.utils.async_utils import BackgroundFailure, cleanup_preserving_primary
 
 # --------------------------------------------------------------------------------------
 # BackgroundFailure
@@ -94,3 +94,56 @@ async def test_guard_propagates_awaitable_exception():
 
     with pytest.raises(KeyError):
         await failure.guard(bad())
+
+
+# --------------------------------------------------------------------------------------
+# cleanup_preserving_primary
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cleanup_failure_does_not_mask_primary():
+    async def failing_cleanup():
+        raise ConnectionError("engine unreachable")
+
+    with pytest.raises(ValueError, match="broadcast failed") as exc_info:
+        async with cleanup_preserving_primary(failing_cleanup, "resume_generation"):
+            raise ValueError("broadcast failed")
+    (note,) = exc_info.value.__notes__
+    assert note.startswith("resume_generation also failed during cleanup: ConnectionError(")
+
+
+@pytest.mark.asyncio
+async def test_cleanup_error_propagates_on_success():
+    async def failing_cleanup():
+        raise ConnectionError("engine unreachable")
+
+    with pytest.raises(ConnectionError):
+        async with cleanup_preserving_primary(failing_cleanup, "resume_generation"):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_cleanup_runs_on_success_and_on_cancel():
+    calls = []
+
+    async def cleanup():
+        calls.append("cleanup")
+
+    async with cleanup_preserving_primary(cleanup, "resume_generation"):
+        pass
+    assert calls == ["cleanup"]
+
+    started = asyncio.Event()
+
+    async def body():
+        async with cleanup_preserving_primary(cleanup, "resume_generation"):
+            started.set()
+            await asyncio.sleep(3600)
+
+    task = asyncio.create_task(body())
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert calls == ["cleanup", "cleanup"]

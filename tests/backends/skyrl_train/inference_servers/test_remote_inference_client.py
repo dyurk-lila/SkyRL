@@ -13,6 +13,7 @@ import numpy as np
 import orjson
 import pytest
 import pytest_asyncio
+import ray
 import uvicorn
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
@@ -32,6 +33,7 @@ from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
 )
 from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
     SKYRL_LORA_ADAPTER_NAME,
+    InferenceServerHTTPError,
     PauseMode,
     RemoteGenerateClient,
     RemoteInferenceClient,
@@ -117,6 +119,10 @@ def create_mock_vllm_server(server_id: int) -> FastAPI:
     @app.post("/test/bad_request_text")
     async def bad_request_text():
         return PlainTextResponse("prompt too long", status_code=400)
+
+    @app.post("/test/control_plain_error")
+    async def control_plain_error():
+        return PlainTextResponse("engine is dead", status_code=502)
 
     @app.post("/finish_session")
     async def finish_session(session_id: str = Query(...)):
@@ -496,6 +502,72 @@ def error_router():
     time.sleep(0.2)
 
 
+def _assert_picklable_http_error(exc: BaseException, *, status: int, message: str) -> None:
+    assert isinstance(exc, InferenceServerHTTPError)
+    restored = pickle.loads(pickle.dumps(exc))
+    assert type(restored) is InferenceServerHTTPError
+    assert (restored.status, restored.message, str(restored)) == (status, message, str(exc))
+
+
+class TestInferenceServerHTTPError:
+    """aiohttp's ClientResponseError can't be pickled, so Ray would replace it with a bare RayError."""
+
+    @staticmethod
+    def _error() -> InferenceServerHTTPError:
+        exc = InferenceServerHTTPError(
+            "POST", "http://127.0.0.1:1/pause", 503, "overloaded", [("Content-Type", "text/plain"), ("X-A", "1")]
+        )
+        exc.add_note("while pausing")
+        return exc
+
+    @pytest.mark.parametrize("dumps,loads", [(pickle.dumps, pickle.loads), (ray.cloudpickle.dumps, pickle.loads)])
+    def test_round_trip(self, dumps, loads):
+        exc = self._error()
+        restored = loads(dumps(exc))
+        assert restored.status == 503
+        assert restored.message == "overloaded"
+        assert list(restored.headers.items()) == [("Content-Type", "text/plain"), ("X-A", "1")]
+        assert restored.request_info.method == "POST"
+        assert str(restored) == str(exc) == "503, message='overloaded', url='http://127.0.0.1:1/pause'"
+        assert restored.__notes__ == ["while pausing"]
+
+    def test_type_hierarchy(self):
+        exc = self._error()
+        assert isinstance(exc, aiohttp.ClientResponseError)
+        assert not isinstance(exc, (TimeoutError, OSError))
+
+    def test_aiohttp_error_is_not_picklable(self):
+        """The failure this class exists for: if aiohttp's own error becomes picklable, it can be retired."""
+        from multidict import CIMultiDict, CIMultiDictProxy
+        from yarl import URL
+
+        headers = CIMultiDictProxy(CIMultiDict([("Content-Type", "text/plain")]))
+        request_info = aiohttp.RequestInfo(URL("http://x/"), "POST", headers, URL("http://x/"))
+        exc = aiohttp.ClientResponseError(request_info, (), status=500, message="m", headers=headers)
+        with pytest.raises(TypeError):
+            pickle.dumps(exc)
+
+    def test_survives_a_ray_task(self):
+        @ray.remote
+        def fail():
+            exc = InferenceServerHTTPError("POST", "http://127.0.0.1:1/pause", 503, "overloaded")
+            exc.add_note("while pausing")
+            raise exc
+
+        with pytest.raises(InferenceServerHTTPError) as exc_info:
+            ray.get(fail.remote())
+        assert exc_info.value.status == 503
+        assert exc_info.value.message == "overloaded"
+        assert "while pausing" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_control_plane_non_json_error_body(self, client, mock_servers):
+        """A plain-text 5xx on the control plane must not surface as aiohttp's unpicklable ContentTypeError."""
+        with pytest.raises(InferenceServerHTTPError) as exc_info:
+            await client._call_server(mock_servers["server_urls"][0], "/test/control_plain_error")
+        _assert_picklable_http_error(exc_info.value, status=502, message="engine is dead")
+
+
 class TestRemoteInferenceClientInit:
     """Test client initialization and serialization."""
 
@@ -770,8 +842,9 @@ class TestPackedSideChannelBodies:
 
     @pytest.mark.asyncio
     async def test_client_error_with_non_json_body_surfaces_the_text(self, client, mock_servers):
-        with pytest.raises(aiohttp.ClientResponseError, match="prompt too long"):
+        with pytest.raises(aiohttp.ClientResponseError, match="prompt too long") as exc_info:
             await client._post(f"{mock_servers['proxy_url']}/test/bad_request_text", json={})
+        _assert_picklable_http_error(exc_info.value, status=400, message="prompt too long")
 
     @pytest.mark.asyncio
     async def test_non_routed_expert_generate_never_scans_the_body(self, client, monkeypatch):
@@ -1386,8 +1459,9 @@ class TestLoRAControlPlane:
     @pytest.mark.asyncio
     async def test_unload_unknown_lora_raises(self, client, mock_servers):
         # Server returns 404, surfaced as ClientResponseError via raise_for_status.
-        with pytest.raises(aiohttp.ClientResponseError):
+        with pytest.raises(aiohttp.ClientResponseError) as exc_info:
             await client.unload_lora_adapter("nonexistent-lora")
+        _assert_picklable_http_error(exc_info.value, status=404, message="Not Found")
         registries = await _get_lora_registries(mock_servers["server_urls"])
         for reg in registries:
             assert "nonexistent-lora" not in reg

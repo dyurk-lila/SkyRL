@@ -1,7 +1,8 @@
-"""asyncio helpers for surfacing background-task failures as real exceptions."""
+"""asyncio helpers that keep the original exception visible: background-task failures and cleanup errors."""
 
 import asyncio
-from typing import Awaitable, Optional, TypeVar
+import contextlib
+from typing import Any, Awaitable, Callable, Optional, TypeVar
 
 T = TypeVar("T")
 
@@ -52,3 +53,21 @@ class BackgroundFailure:
         finally:
             task.cancel()
             failure_wait.cancel()
+
+
+@contextlib.asynccontextmanager
+async def cleanup_preserving_primary(cleanup: Callable[[], Awaitable[Any]], description: str):
+    """Always await ``cleanup()`` on exit, without letting a cleanup error replace the body's exception.
+
+    If the body raised (including cancellation), a cleanup failure is attached to that primary exception as a
+    note and the primary propagates. On success, a cleanup failure propagates normally.
+    """
+    try:
+        yield
+    except BaseException as primary:
+        try:
+            await cleanup()
+        except BaseException as cleanup_exc:
+            primary.add_note(f"{description} also failed during cleanup: {cleanup_exc!r}")
+        raise
+    await cleanup()
