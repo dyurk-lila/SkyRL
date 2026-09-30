@@ -1492,6 +1492,26 @@ class SFTTrainer:
     # Checkpoint resume
     # ------------------------------------------------------------------ #
 
+    def _load_dataloader_state(self, dataloader_state_path: str) -> None:
+        """Restore the train dataloader position. A missing file restarts the data order; a corrupt one raises."""
+        if not io.exists(dataloader_state_path):
+            logger.warning(
+                f"No data.pt found at {dataloader_state_path}; dataloader will start from the "
+                "beginning of its sampling order (older checkpoint or RNG-only resume)."
+            )
+            return
+        try:
+            with io.open_file(dataloader_state_path, "rb") as f:
+                dataloader_state = torch.load(f, map_location="cpu", weights_only=False)
+            self.train_dataloader.load_state_dict(dataloader_state)
+        except Exception as e:
+            e.add_note(
+                f"while loading dataloader state {dataloader_state_path}; "
+                "refusing to restart data from the beginning of a resumed run"
+            )
+            raise
+        logger.info("Restored train dataloader state")
+
     def load_checkpoint(self) -> int:
         """Load a checkpoint and return the step number to resume from.
 
@@ -1567,20 +1587,7 @@ class SFTTrainer:
 
         # Restore train dataloader / sampler position so sampling resumes from
         # the exact next example (mirrors the RL trainer's data.pt handling).
-        dataloader_state_path = os.path.join(checkpoint_path, "data.pt")
-        if io.exists(dataloader_state_path):
-            try:
-                with io.open_file(dataloader_state_path, "rb") as f:
-                    dataloader_state = torch.load(f, map_location="cpu", weights_only=False)
-                self.train_dataloader.load_state_dict(dataloader_state)
-                logger.info("Restored train dataloader state")
-            except Exception as e:
-                logger.warning(f"Failed to restore dataloader state: {e}")
-        else:
-            logger.warning(
-                f"No data.pt found at {dataloader_state_path}; dataloader will start from the "
-                "beginning of its sampling order (older checkpoint or RNG-only resume)."
-            )
+        self._load_dataloader_state(os.path.join(checkpoint_path, "data.pt"))
 
         logger.info(f"Successfully resumed from global_step_{global_step}")
         return global_step

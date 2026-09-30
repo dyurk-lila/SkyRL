@@ -1748,6 +1748,25 @@ class RayPPOTrainer:
         # NOTE (sumanthrh): the function will get called twice on the node with driver process, but it's ok because it's idempotent
         cleanup_old_checkpoints(self.cfg.trainer.ckpt_path, self.cfg.trainer.max_ckpts_to_keep)
 
+    def _load_dataloader_state(self, dataloader_state_path: str) -> None:
+        """Restore the train dataloader position. A missing file restarts the data order; a corrupt one raises."""
+        if not io.exists(dataloader_state_path):
+            logger.warning(
+                f"No dataloader state found at {dataloader_state_path}. Dataloader will start from beginning."
+            )
+            return
+        try:
+            with io.open_file(dataloader_state_path, "rb") as f:
+                dataloader_state = torch.load(f, map_location="cpu", weights_only=False)
+            self.train_dataloader.load_state_dict(dataloader_state)
+        except Exception as e:
+            e.add_note(
+                f"while loading dataloader state {dataloader_state_path}; "
+                "refusing to restart data from the beginning of a resumed run"
+            )
+            raise
+        logger.info("Successfully loaded dataloader state")
+
     def load_checkpoints(self) -> Tuple[int, str]:
         """
         Load complete checkpoint state and return the global_step to resume from.
@@ -1824,18 +1843,7 @@ class RayPPOTrainer:
             logger.warning(f"Global step mismatch: path={global_step}, saved={saved_global_step}. Using path value.")
 
         # 2. Load dataloader state if available
-        if io.exists(dataloader_state_path):
-            try:
-                with io.open_file(dataloader_state_path, "rb") as f:
-                    dataloader_state = torch.load(f, map_location="cpu", weights_only=False)
-                self.train_dataloader.load_state_dict(dataloader_state)
-                logger.info("Successfully loaded dataloader state")
-            except Exception as e:
-                logger.warning(f"Failed to load dataloader state: {e}. Dataloader will start from beginning.")
-        else:
-            logger.warning(
-                f"No dataloader state found at {dataloader_state_path}. Dataloader will start from beginning."
-            )
+        self._load_dataloader_state(dataloader_state_path)
 
         # 3. Load policy checkpoint (dispatch handles offload/backload)
         logger.info(f"Loading policy checkpoint from {policy_ckpt_dir}")

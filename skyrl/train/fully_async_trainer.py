@@ -1180,6 +1180,10 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         logger.info(f"Saved fully-async state to {fully_async_state_path}")
         return global_step_folder
 
+    def _load_dataloader_state(self, dataloader_state_path: str) -> None:
+        # The data position comes from fully_async_state.pt; AsyncDataloader resets the loader state anyway.
+        pass
+
     def load_checkpoints(self) -> Tuple[int, str, Optional[Set[str]], Optional[Set[str]], Optional[int]]:
         """
         Load the base checkpoint without loading the dataloader state, and load the fully-async state.
