@@ -10,7 +10,7 @@ The difference from the sibling [`harbor`](../harbor) integration: there Harbor
 collects per-turn token ids itself (`collect_rollout_details`), which is why
 summarization is banned. Here a rewritten history is a new branch of the
 graph, so **summarization is allowed**. Each root-to-leaf path becomes one
-training row.
+training row, unless `skycap.train_paths` says otherwise (below).
 
 ## Running
 
@@ -27,7 +27,67 @@ uv run --isolated --extra fsdp --extra harbor --extra skycap \
 The rest of the configuration is the sibling's: `harbor_trial_config` holds
 Harbor's `TrialConfig`, with defaults from `../harbor/harbor_trial_config/default.yaml`.
 `skycap.*` sets the record directory (default `{trainer.export_path}/skycap`),
-the idle TTL, the port and the renderer pool size.
+the idle TTL, the renderer pool size, which paths train and how agents inside
+remote sandboxes reach skycap ([below](#agents-inside-remote-sandboxes)).
+
+## Which paths train
+
+`skycap.train_paths` picks the rows of each rollout:
+
+- `all` (default): every root-to-leaf path, each sampled message trained once.
+  A reply the harness discarded and asked again for (mini-swe-agent on a format
+  error) is a dead-end path, and trains with the rollout's advantage too.
+- `final`: only the path to the reply of the rollout's last model call, the
+  conversation the harness ended with. One row per rollout; nothing off it
+  trains.
+- `pkg.module:function`: a custom rule, a function of skycap's context graph to
+  rows, each a path and the model nodes on it to train. skycap builds the
+  tokens, loss masks and routes, and checks the rows. The module must be
+  importable on every node, since each skycap server imports it at start. A
+  rule that raises masks that rollout without retrying the trial.
+
+For example, the final path plus every discarded reply under 64 sampled tokens,
+each as a row of its own (`skycap.train_paths=my_rules:final_and_short_discards`):
+
+```python
+from skycap.graph import MessageGraph
+from skycap.paths import Row, final_path
+
+def final_and_short_discards(graph: MessageGraph) -> list[Row]:
+    rows = final_path(graph)
+    final = set(rows[0].path) if rows else set()
+    for leaf in graph.leaves():
+        tokens = graph.nodes[leaf].tokens
+        if leaf not in final and graph.nodes[leaf].author == "model" and tokens is not None:
+            if len(tokens.token_ids) - tokens.sampled_start < 64:
+                rows.append(Row(graph.path_to(leaf), [leaf]))
+    return rows
+```
+
+Every row of a trial carries its reward. See [skycap's README](../../../skycap/README.md#which-paths-train)
+for what a rule may return.
+
+## Agents inside remote sandboxes
+
+Terminus-2 calls the model from the trainer's process, so it reaches skycap at
+each server's own URL. Harbor's installed agents (mini-swe-agent, Claude Code,
+...) call it from inside their Daytona or Modal sandbox, which can't reach the
+cluster. `skycap.exposure` serves each server's harness routes to them, through
+skycap's exposure ([skycap's README](../../../skycap/README.md#expose-a-server-to-remote-harnesses)):
+
+```bash
+# A Cloudflare quick tunnel per server: outbound internet only, for development.
+  harbor_trial_config.agent.name=mini-swe-agent skycap.exposure.type=cloudflare
+# An address the sandboxes route to; server i listens on port + i (frp on a public VM, or the node's own).
+  skycap.exposure.type=external_host skycap.exposure.kwargs.host=203.0.113.7 skycap.exposure.kwargs.port=11500
+```
+
+Only the harness routes are reachable that way, never the control plane. An
+installed agent gets its trajectory's route on the exposed URL in its sandbox's
+environment (`OPENAI_API_BASE`, `HOSTED_VLLM_API_BASE`, and placeholder keys);
+Terminus-2 keeps the server's own URL. A quick tunnel takes at most 200 calls in
+flight, and a call whose reply hasn't started after about 125 s fails, so use
+`external_host` for many agents or long replies.
 
 ## How it fits
 
@@ -49,15 +109,18 @@ Masking is the sibling's:
 - **Context-length stop:** trains with reward 0, unless overlong filtering is on.
 - **Failed inside skycap** (e.g. an unattributable prompt): the trial isn't trained on.
 
+R3 (rollout routing replay) needs
+`generator.inference_engine.enable_return_routed_experts=true` and
+`trainer.policy.megatron_config.moe_enable_routing_replay=true`, with Megatron
+and vLLM's `mp` backend, as for SkyRL's own generator. Each row carries routes
+for its whole prompt and response, each from the forward pass that ran that
+token. A trial whose trained path lacks routes is retried, then masked, and
+counted in `generate/skycap/num_missing_route_trajectories`.
+
 ## Limits
 
-- **No R3 yet.** skycap records routed experts, but SkyRL's trainer refuses them
-  with step-wise output. So the generator refuses
-  `enable_return_routed_experts=true`, and the trainer change is a follow-up.
 - **Sampler support** (`enable_return_sample_support_set`) is passed through,
   padded to `top_k`.
-- **One skycap server per run.** The generator takes a list of URLs and spreads
-  trajectories over them, for when servers are launched separately.
 
 ## Tests
 
