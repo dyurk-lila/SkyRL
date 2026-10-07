@@ -23,6 +23,7 @@ from skyrl.backends.skyrl_train.utils.sample_support import (
 )
 
 DictType = TypeVar("DictType")
+REAL_SAMPLE_MASK = "real_sample_mask"
 
 
 class TensorFormat(StrEnum):
@@ -525,6 +526,7 @@ class TrainingInput(TypedDict, total=False):
     ``convert_prompts_responses_to_batch_tensors``, which documents the layout in full.
     """
 
+    real_sample_mask: Bool[torch.Tensor, "batch_size"]  # noqa: F821
     sequences: Integer[torch.Tensor, "batch_size seq_len"]  # prompt + response token ids
     attention_mask: Integer[torch.Tensor, "batch_size seq_len"]  # 1 = real token, 0 = padding
     loss_mask: Float[torch.Tensor, "batch_size response_len"]  # 1 = trainable; 0 masks e.g. tool output
@@ -549,7 +551,12 @@ class TrainingInput(TypedDict, total=False):
 class TrainingInputBatch(TensorBatch[TrainingInput]):
     """Training input data"""
 
-    pass
+    @property
+    def real_sample_mask(self) -> torch.Tensor:
+        """Identify real rows, including real trajectories with no loss tokens."""
+        if REAL_SAMPLE_MASK in self:
+            return self[REAL_SAMPLE_MASK]
+        return torch.ones(self.batch_size, dtype=torch.bool, device=self["sequences"].device)
 
 
 class TrainingOutputBatch(TensorBatch[Dict[str, torch.Tensor]]):
@@ -605,6 +612,28 @@ def packed_dummy_row_segments(key: str, count: int) -> List[int]:
     return [_packed_field_padding_rule(key).dummy_row_length] * count
 
 
+def append_tensor_list_padding(key: str, field: TensorList, count: int) -> TensorList:
+    """Extend a ragged ``TensorList`` field with ``count`` synthetic batch rows.
+
+    ``TensorList`` fields are indexed by batch position, so they must grow with the
+    rest of the batch: consumers either check their length against
+    ``sequences.shape[0]`` or derive the batch size from them.
+
+    ``sub_seq_lengths`` gets ``[1]``: one sub-sequence of one valid token, matching a
+    synthetic row's single attended token. Other fields (e.g. ``pixel_values``,
+    ``image_grid_thw``) get a zero-row tensor of the same trailing shape and dtype,
+    which contributes nothing when concatenated for the vision tower.
+    """
+    if count <= 0:
+        return field
+    reference = field.tensors[0]
+    if key == "sub_seq_lengths":
+        row = torch.ones(1, dtype=reference.dtype, device=reference.device)
+    else:
+        row = torch.empty(0, *reference.shape[1:], dtype=reference.dtype, device=reference.device)
+    return TensorList.cat([field, TensorList([row.clone() for _ in range(count)])])
+
+
 def pad_training_input_batch(unpadded_batch: TrainingInputBatch, pad_size: int) -> TrainingInputBatch:
     """Pad `pad_size` entries to `unpadded_batch`, return a newly allocated TrainingInputBatch. If pad_size is 0, return the original batch."""
     # TODO(Charlie): This incurs 2x CPU memory usage when pad_size > 0. Optimize when needed.
@@ -652,6 +681,10 @@ def pad_training_input_batch(unpadded_batch: TrainingInputBatch, pad_size: int) 
             pad_indices = [0] * pad_size
             padding_tensor = tensor[pad_indices].clone()
             new_tensors[key] = torch.cat([tensor, padding_tensor], dim=0)
+
+    new_tensors[REAL_SAMPLE_MASK] = torch.cat(
+        [unpadded_batch.real_sample_mask, torch.zeros(pad_size, dtype=torch.bool)]
+    )
 
     # Update metadata as well.
     new_metadata = {}

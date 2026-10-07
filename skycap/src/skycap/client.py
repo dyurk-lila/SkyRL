@@ -2,7 +2,7 @@
 
     pool = CapturePool(["http://capture-0:8080", "http://capture-1:8080"])
     async with pool.trajectory({"task": "t1", "step": 3}) as trajectory:
-        run_harness(base_url=trajectory.base_url)       # an unchanged OpenAI client
+        run_harness(base_url=trajectory.base_url, api_key=trajectory.api_key)  # an unchanged OpenAI client
         result = await trajectory.finish({"reward": 1.0})
     result.status, result.samples
 
@@ -15,7 +15,10 @@ A server that can't be reached, or answers 5xx, is skipped for that create.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import itertools
+import json
 import random
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
@@ -24,6 +27,7 @@ from typing import Any
 
 import aiohttp
 
+from skycap.paths import PATH_RULE_FAILED
 from skycap.samples import Sample
 
 
@@ -34,6 +38,10 @@ class CaptureError(Exception):
         super().__init__(message)
         #: The HTTP status, when the server answered.
         self.status = status
+
+
+class PathRuleError(CaptureError):
+    """``finish``'s path rule raised on the server. The trajectory is ended, without samples."""
 
 
 @dataclass(slots=True)
@@ -47,20 +55,44 @@ class FinishResult:
 
 
 class Trajectory:
-    def __init__(self, pool: CapturePool, server: str, trajectory_id: str, base_url: str) -> None:
+    def __init__(
+        self,
+        pool: CapturePool,
+        server: str,
+        trajectory_id: str,
+        base_url: str,
+        paths: str = "all",
+        exposed_base_url: str | None = None,
+        api_key: str | None = None,
+    ) -> None:
         self._pool = pool
         self.server = server
         self.id = trajectory_id
         #: Point the harness's OpenAI client here.
         self.base_url = base_url
+        #: Or here, for a harness outside this network, when the server is exposed (``skycap.exposure``).
+        self.exposed_base_url = exposed_base_url
+        #: And give it this as its ``api_key``: a server started with ``require_api_key`` answers only it.
+        self.api_key = api_key
         self.result: FinishResult | None = None
         #: What the last ``finish`` sent, so a failed one can be sent again unchanged.
         self.finishing: dict[str, Any] | None = None
+        #: The path rule ``finish`` uses when it names none, including the one a failed block is finished with.
+        self.paths = paths
 
-    async def finish(self, annotations: dict[str, Any] | None = None) -> FinishResult:
-        """Seal the trajectory and get its samples. Safe to call more than once."""
+    async def finish(self, annotations: dict[str, Any] | None = None, *, paths: str | None = None) -> FinishResult:
+        """Seal the trajectory and get its samples. Safe to call more than once.
+
+        ``paths`` names the path rule that picks the samples (``skycap.paths``): ``all``, a sample per
+        root-to-leaf path; ``final``, only the path to the last model call's reply; or a custom rule the
+        server has. It defaults to the trajectory's ``paths``. Raises ``PathRuleError`` if the rule raised.
+        """
         self.finishing = annotations or {}
-        body = await self._pool._post(f"{self.server}/trajectories/{self.id}/finish", {"annotations": self.finishing})
+        if paths is not None:
+            self.paths = paths
+        body = await self._pool._post(
+            f"{self.server}/trajectories/{self.id}/finish", {"annotations": self.finishing, "paths": self.paths}
+        )
         self.result = FinishResult(
             id=body["id"],
             status=body["status"],
@@ -81,7 +113,6 @@ class CapturePool:
         self,
         urls: Sequence[str],
         *,
-        session: aiohttp.ClientSession | None = None,
         timeout: float = 60.0,
     ) -> None:
         if not urls:
@@ -89,8 +120,8 @@ class CapturePool:
         self.urls = [url.rstrip("/") for url in urls]
         start = random.randrange(len(self.urls))
         self._next = itertools.cycle(self.urls[start:] + self.urls[:start])
-        self._session = session
-        self._owns_session = session is None
+        self._session: aiohttp.ClientSession | None = None
+        self._session_loop: asyncio.AbstractEventLoop | None = None
         self._timeout = aiohttp.ClientTimeout(total=timeout)
         self._closed = False
 
@@ -98,14 +129,29 @@ class CapturePool:
         if self._closed:
             raise RuntimeError("the CapturePool is closed")
         if self._session is None:
-            self._session = aiohttp.ClientSession(timeout=self._timeout)
+            self._session, self._session_loop = aiohttp.ClientSession(timeout=self._timeout), asyncio.get_running_loop()
         return self._session
 
     async def close(self) -> None:
+        """Close the HTTP session, also once the loop it was used on has ended.
+
+        A session can only be awaited on its own loop. When that loop is gone, so
+        are its connections: the session is detached and its connector marked
+        closed instead, which keeps aiohttp from reporting them as leaked.
+        """
         self._closed = True
-        if self._owns_session and self._session is not None:
-            await self._session.close()
-            self._session = None
+        session, loop = self._session, self._session_loop
+        self._session = self._session_loop = None
+        if session is None:
+            return
+        if loop is asyncio.get_running_loop():
+            await session.close()
+            return
+        connector = session.connector
+        session.detach()
+        if connector is not None:
+            with contextlib.suppress(Exception):
+                connector._close()  # the synchronous close aiohttp itself uses on a dead loop
 
     async def __aenter__(self) -> CapturePool:
         return self
@@ -113,8 +159,8 @@ class CapturePool:
     async def __aexit__(self, *exc: object) -> None:
         await self.close()
 
-    async def create(self, meta: dict[str, Any] | None = None) -> Trajectory:
-        """A new trajectory on the next reachable server."""
+    async def create(self, meta: dict[str, Any] | None = None, *, paths: str = "all") -> Trajectory:
+        """A new trajectory on the next reachable server, to be finished with the path rule ``paths``."""
         errors = []
         for _ in range(len(self.urls)):
             server = next(self._next)
@@ -128,18 +174,26 @@ class CapturePool:
                     raise
                 errors.append(str(error))
                 continue
-            return Trajectory(self, server, body["id"], body["base_url"])
+            return Trajectory(
+                self,
+                server=server,
+                trajectory_id=body["id"],
+                base_url=body["base_url"],
+                paths=paths,
+                exposed_base_url=body.get("exposed_base_url"),
+                api_key=body.get("api_key"),
+            )
         raise CaptureError(f"no capture server reachable: {'; '.join(errors)}")
 
     @asynccontextmanager
-    async def trajectory(self, meta: dict[str, Any] | None = None) -> AsyncIterator[Trajectory]:
-        """A trajectory that is always finished.
+    async def trajectory(self, meta: dict[str, Any] | None = None, *, paths: str = "all") -> AsyncIterator[Trajectory]:
+        """A trajectory that is always finished, with the path rule ``paths`` unless its ``finish`` names another.
 
         If the block raised before finishing, the trajectory is finished with
         ``{"error": ...}``. If its own ``finish`` failed, that finish is sent
         again, so the caller's annotations (a reward) aren't replaced.
         """
-        trajectory = await self.create(meta)
+        trajectory = await self.create(meta, paths=paths)
         try:
             yield trajectory
         except BaseException as error:
@@ -170,5 +224,17 @@ async def _body(response: aiohttp.ClientResponse) -> dict[str, Any]:
     if response.status != 200:
         # An error body may not be JSON (a proxy's HTML page, aiohttp's plain 404).
         detail = (await response.text(errors="replace"))[:2000]
-        raise CaptureError(f"{response.method} {response.url}: HTTP {response.status}: {detail}", response.status)
+        message = f"{response.method} {response.url}: HTTP {response.status}: {detail}"
+        if _code(detail) == PATH_RULE_FAILED:
+            raise PathRuleError(message, response.status)
+        raise CaptureError(message, response.status)
     return await response.json(content_type=None)
+
+
+def _code(detail: str) -> str | None:
+    """The ``code`` of a JSON error body, if it has one."""
+    try:
+        body = json.loads(detail)
+    except ValueError:
+        return None
+    return body.get("code") if isinstance(body, dict) else None
