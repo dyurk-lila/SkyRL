@@ -31,6 +31,7 @@ from skyrl.backends.skyrl_train.distributed.megatron.megatron_strategy import (
 from skyrl.backends.skyrl_train.distributed.megatron.megatron_utils import (
     _clear_mtp_hybrid_pattern,
     _convert_moe_experts_lora_to_vllm,
+    freeze_dsa_indexer,
     freeze_moe_router,
     gdn_in_proj_lora_is_safe,
     get_model_config,
@@ -42,8 +43,16 @@ from skyrl.backends.skyrl_train.distributed.megatron.optimizer import (
     get_megatron_optimizer_param_scheduler,
     init_megatron_optim_config,
 )
+from skyrl.backends.skyrl_train.distributed.megatron.quantization_utils import (
+    resolve_auto_fp8_recipe,
+    validate_concrete_fp8_recipe,
+    validate_mxfp8_gdn_tp_alignment,
+)
 from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
     SKYRL_LORA_ADAPTER_NAME,
+)
+from skyrl.backends.skyrl_train.patches.megatron.patch_dsa_hybrid_indexer import (
+    apply_dsa_hybrid_indexer_patch,
 )
 from skyrl.backends.skyrl_train.patches.megatron.patch_dsa_index_share import (
     patch_dsa_index_share,
@@ -54,6 +63,9 @@ from skyrl.backends.skyrl_train.patches.megatron.patch_packed_per_expert_sharded
 from skyrl.backends.skyrl_train.patches.megatron.patch_shared_expert_lora_tp import (
     apply_shared_expert_lora_tp_patch,
 )
+from skyrl.backends.skyrl_train.patches.megatron.patch_sparse_mla_nope import (
+    patch_sparse_mla_nope,
+)
 from skyrl.backends.skyrl_train.patches.megatron.patch_vision_attention_backend import (
     patch_vision_attention_backend,
 )
@@ -61,9 +73,11 @@ from skyrl.backends.skyrl_train.patches.te.patch_fa2_head_dim import (
     patch_fa2_head_dim_allowlist,
 )
 from skyrl.backends.skyrl_train.training_batch import (
+    TensorList,
     TrainingInputBatch,
     TrainingOutputBatch,
     append_packed_field_padding,
+    append_tensor_list_padding,
     packed_dummy_row_segments,
 )
 from skyrl.backends.skyrl_train.utils.packed_tensor import PackedTensor
@@ -74,10 +88,7 @@ from skyrl.backends.skyrl_train.weight_sync import (
     get_transfer_strategy,
 )
 from skyrl.backends.skyrl_train.weight_sync.fp8 import (
-    BLOCKWISE_FP8,
-    SerializedFp8Config,
-    registered_fp8_spec_names,
-    resolve_fp8_spec,
+    resolve_serialized_fp8_config,
 )
 from skyrl.backends.skyrl_train.workers.megatron.adapter_store import (
     AdapterStore,
@@ -100,7 +111,7 @@ from skyrl.backends.skyrl_train.workers.worker_utils import (
     get_microbatch_iterator,
     reduce_metrics,
 )
-from skyrl.env_vars import SKYRL_WORKER_NCCL_TIMEOUT_IN_S
+from skyrl.env_vars import SKYRL_MEGATRON_RANDOM_INIT, SKYRL_WORKER_NCCL_TIMEOUT_IN_S
 from skyrl.train.config.config import MegatronDDPConfig, get_config_as_dict
 from skyrl.train.utils.utils import update_model_config
 from skyrl.utils.tok import get_tokenizer
@@ -118,6 +129,7 @@ from skyrl.backends.skyrl_train.workers.megatron.model_bridges import (
 )
 
 apply_shared_expert_lora_tp_patch()
+apply_dsa_hybrid_indexer_patch()
 
 
 class MegatronWorker:
@@ -223,6 +235,18 @@ class MegatronWorker:
             if isinstance(transformer_config_kwargs, dict)
             else OmegaConf.to_container(transformer_config_kwargs, resolve=True)
         )
+        # validate_megatron_cfg resolves fp8_recipe="auto" on the driver when it
+        # can see a GPU; a GPU-less driver ships "auto" through unresolved. The
+        # worker always has the target device visible, so resolve here and
+        # re-run the device/recipe validation the blind driver had to skip.
+        resolve_auto_fp8_recipe(transformer_config_kwargs)
+        validate_concrete_fp8_recipe(transformer_config_kwargs)
+        # Megatron's own fp8 guard checks only the GLOBAL GDN in_proj dim; TE
+        # quantizes the TP shard. Refuse misaligned shards here with the
+        # arithmetic instead of TE's C++ assert deep inside model build.
+        validate_mxfp8_gdn_tp_alignment(
+            transformer_config_kwargs, hf_config, megatron_config.tensor_model_parallel_size
+        )
 
         if not self.cfg.gradient_checkpointing:
             for key in ("recompute_granularity", "recompute_method", "recompute_num_layers"):
@@ -264,7 +288,11 @@ class MegatronWorker:
                 "DeepSeek-V3 bridge (vision tower + mm projector dropped)"
             )
 
-        provider = bridge.to_megatron_provider()
+        if SKYRL_MEGATRON_RANDOM_INIT:
+            logger.warning("SKYRL_MEGATRON_RANDOM_INIT=1: randomly initializing weights (checkpoint not loaded)")
+        # Random init needs no extra sync: MegatronStrategy.set_seed seeds every TP rank alike and calls
+        # model_parallel_cuda_manual_seed, so TP-replicated parameters come out identical.
+        provider = bridge.to_megatron_provider(load_weights=not SKYRL_MEGATRON_RANDOM_INIT)
 
         if not enable_mtp and getattr(provider, "mtp_num_layers", None):
             logger.info(f"Disabling MTP for training (mtp_num_layers={provider.mtp_num_layers} -> None)")
@@ -500,8 +528,10 @@ class MegatronWorker:
             DistributedDataParallelConfig,
         )
 
-        # TE patch to allow FA2 for head_dim 256 on SM103 (B300)
-        # Delete along with the patch module once the TE pin includes NVIDIA/TransformerEngine#3360.
+        # TE patch to allow FA2 for head_dim 256 on SM103 (B300) and other arches
+        # outside TE's allowlist. Still needed on 2.19.0: NVIDIA/TransformerEngine#3360
+        # is open and unmerged, and the gate it removes is present in every release
+        # through 2.19.0 (renamed from head_dim_qk to fa2_padded_head_dim in 2.17.0).
         patch_fa2_head_dim_allowlist()
 
         # Isolate the DSA index-share holder per checkpointed forward (GLM 5 and
@@ -509,6 +539,20 @@ class MegatronWorker:
         # Delete along with the patch module once the megatron-core pin includes
         # NVIDIA/Megatron-LM#6793.
         patch_dsa_index_share()
+
+        # Drop the MoE dispatcher's router-probs reference after each MoE forward; under full
+        # recompute it otherwise pins every MoE layer's recomputed graph through backward.
+        from skyrl.backends.skyrl_train.patches.megatron.patch_moe_release_dispatcher_probs import (
+            patch_moe_release_dispatcher_probs,
+        )
+
+        patch_moe_release_dispatcher_probs()
+
+        # Let the TileLang SparseMLA kernel take NoPE MLA (q/k width 512) and top-k widths that
+        # are not a multiple of 64 (GLM-5.3-Flash k-pool: 2051); otherwise DSA falls back to a
+        # dense O(L^2) softmax. Delete along with the patch module once the megatron-core pin
+        # includes NVIDIA/Megatron-LM#7617.
+        patch_sparse_mla_nope()
 
         # Give the Qwen3-VL ViT the language model's attention backend; megatron-core
         # now asserts NVTE_* attention env vars agree across all models in a process.
@@ -673,6 +717,8 @@ class MegatronWorker:
         because Megatron's forward_backward_func requires uniform micro_batch_size across all
         microbatches (especially with PP > 1). Scalar keys (``num_actions``,
         ``num_microbatches``, ``num_real_microbatches``) are passed through unchanged.
+        Ragged per-sample fields carried as a ``TensorList`` (``sub_seq_lengths``,
+        ``pixel_values``, ``image_grid_thw``) grow by ``append_tensor_list_padding``.
 
         Defined on the base worker so the shared ``_forward_logprobs`` path works for
         policy, ref, and critic workers alike.
@@ -721,6 +767,8 @@ class MegatronWorker:
                 else:
                     pad_tensor = torch.zeros((pad_count, *value.shape[1:]), dtype=value.dtype, device=device)
                 padded[key] = torch.cat([value, pad_tensor], dim=0)
+            elif isinstance(value, TensorList):
+                padded[key] = append_tensor_list_padding(key, value, pad_count)
             else:
                 padded[key] = value
 
@@ -849,6 +897,14 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             if self._rank == 0:
                 logger.info("freeze_moe_router=True: freezing MoE router params")
             self.provider.register_pre_wrap_hook(freeze_moe_router)
+
+        # Freeze DSA indexer params before DDP buckets them: DDP decides bucket
+        # membership from requires_grad in its constructor, and overlap_grad_reduce
+        # asserts that every bucketed param's backward hook fired.
+        if self.cfg.policy.megatron_config.freeze_dsa_indexer:
+            if self._rank == 0:
+                logger.info("freeze_dsa_indexer=True: freezing DSA indexer params")
+            self.provider.register_pre_wrap_hook(freeze_dsa_indexer)
 
         # wrap with DDP for training
         wrap_with_ddp = not self.cfg.policy.inference_only_init
@@ -1060,6 +1116,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             ``metrics`` (all-reduced across DP).
         """
         self.model.train()
+        torch.cuda.reset_peak_memory_stats()
 
         all_metrics = defaultdict(list)
 
@@ -1211,6 +1268,10 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             status["num_microbatches"] = float(len(micro_buffer))
             status["num_padding_microbatches"] = float(num_padding_microbatches)
 
+        # Peak CUDA memory over this forward_backward call, max-reduced across ranks.
+        status["peak_mem_allocated_gb_max"] = torch.cuda.max_memory_allocated() / 1024**3
+        status["peak_mem_reserved_gb_max"] = torch.cuda.max_memory_reserved() / 1024**3
+
         group = mpu.get_data_parallel_group(with_context_parallel=False)
         status = all_reduce_metrics(status, self.strategy, group=group, sum_loss_metrics=True)
 
@@ -1329,8 +1390,6 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         self._serialized_fp8_config = None
         mode = inference_engine_cfg.fp8_weight_sync_mode
         if mode is not None:
-            if mode != BLOCKWISE_FP8:
-                raise ValueError(f"Unsupported fp8_weight_sync_mode={mode!r}. Supported value: {BLOCKWISE_FP8!r}.")
             resolved_backend = get_transfer_strategy(
                 inference_engine_cfg.weight_sync_backend,
                 self.cfg.placement.colocate_all,
@@ -1340,13 +1399,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                     "Serialized FP8 weight sync requires the NCCL or CUDA-IPC push backend, "
                     f"got {resolved_backend!r}."
                 )
-            spec = resolve_fp8_spec(self.strategy.hf_config)
-            if spec is None:
-                raise ValueError(
-                    "FP8 weight sync requires a registered model spec for the configured checkpoint "
-                    f"(registered specs: {', '.join(registered_fp8_spec_names())})."
-                )
-            self._serialized_fp8_config = SerializedFp8Config(spec=spec)
+            self._serialized_fp8_config = resolve_serialized_fp8_config(mode, self.strategy.hf_config)
 
         await super().init_weight_sync_state(inference_engine_client, inference_engine_cfg)
 
