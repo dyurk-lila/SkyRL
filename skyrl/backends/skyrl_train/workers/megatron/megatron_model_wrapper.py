@@ -1,3 +1,4 @@
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional
@@ -10,6 +11,7 @@ from megatron.bridge.peft.utils import (
     finalize_model_grads_with_expert_adapter_sync,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.utils import unwrap_model
 from omegaconf import OmegaConf
 
 from skyrl.backends.skyrl_train.distributed.megatron.fused_lm_head import (
@@ -19,7 +21,7 @@ from skyrl.backends.skyrl_train.distributed.megatron.fused_lm_head import (
 from skyrl.backends.skyrl_train.distributed.megatron.megatron_utils import (
     get_model_config,
     make_batch_generator,
-    model_packs_sequences_internally,
+    model_owns_vlm_packing,
     preprocess_packed_seqs,
     recover_left_padding,
     remove_left_padding,
@@ -54,7 +56,11 @@ from skyrl.backends.skyrl_train.mtp.soft_ce import (
     shift_mask_for_mtp,
     unpadded_vocab_shard_width,
 )
-from skyrl.backends.skyrl_train.training_batch import TensorList
+from skyrl.backends.skyrl_train.training_batch import REAL_SAMPLE_MASK, TensorList
+from skyrl.backends.skyrl_train.utils.loss_normalization import (
+    MINIBATCH_LOSS_NORMALIZATION,
+    MinibatchLossNormalization,
+)
 from skyrl.backends.skyrl_train.utils.packed_tensor import PackedTensor
 from skyrl.backends.skyrl_train.utils.ppo_utils import (
     PolicyLossRegistry,
@@ -118,15 +124,17 @@ def _build_packed_targets(
 def _build_packed_valid_mask(
     attention_mask: torch.Tensor,
     packed_seq_params,
+    real_sample_mask: torch.Tensor,
     sub_seq_lengths: Optional[list[list[int]]] = None,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Build a ``[1, T]`` real-token mask aligned to the packed (THD) logits layout.
 
-    1.0 for real tokens, 0.0 for the per-segment alignment padding that ``preprocess_packed_seqs``
-    inserts between sub-sequences. This is the packed counterpart of the ``[batch, seq]``
-    ``attention_mask`` the decoupled MTP draft loss uses to mask invalid positions; mirrors the
-    index math of :func:`_build_packed_targets` but scatters ones instead of token ids.
+    1.0 for real tokens of real rows, 0.0 for synthetic rows and for the per-segment alignment
+    padding that ``preprocess_packed_seqs`` inserts between sub-sequences. This is the packed
+    counterpart of the ``[batch, seq]`` mask the decoupled MTP draft loss uses to mask invalid
+    positions; mirrors the index math of :func:`_build_packed_targets` but scatters ones instead
+    of token ids.
     """
     cu_padded = packed_seq_params.cu_seqlens_q_padded.to(device=attention_mask.device, dtype=torch.long)
     total_padded_tokens = int(cu_padded[-1].item())
@@ -134,18 +142,20 @@ def _build_packed_valid_mask(
     if sub_seq_lengths is not None:
         cu_padded_cpu = cu_padded.detach().cpu().tolist()
         seg_idx = 0
-        for row_lens in sub_seq_lengths:
+        for row_lens, real in zip(sub_seq_lengths, real_sample_mask.tolist()):
             for seq_len in row_lens:
                 seq_len = int(seq_len)
                 packed_start = cu_padded_cpu[seg_idx]
-                mask[packed_start : packed_start + seq_len] = 1.0
+                if real:
+                    mask[packed_start : packed_start + seq_len] = 1.0
                 seg_idx += 1
         return mask.unsqueeze(0)
 
     attn = attention_mask.to(device=cu_padded.device, dtype=torch.bool)
+    real_tokens = attn & real_sample_mask.to(device=cu_padded.device, dtype=torch.bool)[:, None]
     token_offsets = attn.to(torch.long).cumsum(dim=1) - 1
     packed_indices = cu_padded[:-1].unsqueeze(1) + token_offsets
-    mask[packed_indices[attn]] = 1.0
+    mask[packed_indices[real_tokens]] = 1.0
     return mask.unsqueeze(0)
 
 
@@ -215,29 +225,27 @@ class MegatronModelWrapper:
         self.policy_loss_fn = policy_loss_fn
         self.remove_microbatch_padding = self.cfg.remove_microbatch_padding
         self.is_vlm = is_vlm
+        # Sample packing for VLMs needs a model that computes mRoPE positions from the packed
+        # stream itself; other VLMs only run unpacked (see _assert_vlm_supported).
+        self.model_owns_vlm_packing = is_vlm and model_owns_vlm_packing(self.actor_module)
         # Fuse the LM-head projection into the chunked log-prob/entropy via the
         # GPTModel output_processor hook (avoids materializing the full
         # [B, S, vocab//TP] logits + its fp32 grad). See model_utils.
         self._fused_lm_head = bool(getattr(self.cfg, "fused_lm_head_logprob", False))
         self._fused_lm_head_backend = getattr(self.cfg, "fused_lm_head_logprob_backend", "torch")
-        # Some models (e.g. Qwen3.5 via the VL bridge -> Qwen3VLModel) pack
-        # sequences inside their own forward; SkyRL sample packing would then
-        # double-pack and corrupt the GDN cu_seqlens, so refuse it. For Qwen3.5,
-        # use language_model_only=True (native GPTModel GDN path) to pack.
-        if self.remove_microbatch_padding and model_packs_sequences_internally(self.actor_module):
-            raise ValueError(
-                "remove_microbatch_padding=True (sample packing) is not supported for models that "
-                "pack sequences inside their own forward (e.g. the Qwen3.5 VL Qwen3VLModel): it "
-                "double-packs and corrupts the GatedDeltaNet cu_seqlens. Set "
-                "trainer.policy.language_model_only=True to route Qwen3.5 to the native GPTModel GDN "
-                "packing path, or set trainer.remove_microbatch_padding=False."
-            )
-
         # Pending grad-sync request recorded by `_defer_finalize_model_grads`, replayed
         # by `run_pending_grad_sync`. See those methods for why the sync is deferred.
         self._pending_grad_sync: Optional[dict] = None
 
         config = get_model_config(self.actor_module[0])
+        # Megatron-Bridge's Qwen-VL providers force calculate_per_token_loss when CP > 1 (VLM CP).
+        self._per_token_loss = bool(getattr(config, "calculate_per_token_loss", False))
+        if self._per_token_loss and any(
+            getattr(getattr(chunk, "ddp_config", None), "overlap_grad_reduce", False) for chunk in self.actor_module
+        ):
+            # _per_token_grad_scaling rescales the grad buffers between calls, which would race
+            # with reductions still in flight.
+            raise ValueError("calculate_per_token_loss (VLM context parallelism) requires overlap_grad_reduce=false")
         # This is set to None by default: https://github.com/NVIDIA/Megatron-LM/blob/07b22a05136a3cb08ece05f7de38cf6aeeb165fb/megatron/core/model_parallel_config.py#L95
         # use the built-in finalize_model_grads function to all reduce gradients across
         # parallelism dimensions -- but deferred to optim_step rather than run per
@@ -268,15 +276,52 @@ class MegatronModelWrapper:
         So we record the request here and replay it exactly once from
         :meth:`run_pending_grad_sync`, called by the worker's ``optim_step``.
 
-        ``num_tokens`` is only non-None under ``calculate_per_token_loss`` (never set by
-        SkyRL, whose loss scaling assumes the per-microbatch path); accumulate it across
-        calls so the deferred sync divides by the whole window's token count if it ever is.
+        ``num_tokens`` is only non-None under ``calculate_per_token_loss``. The schedule passes the
+        call's token count, ``finalize_model_grads`` all-reduces it and divides every gradient by it,
+        and Bridge's finalize wrapper passes it through:
+        https://github.com/NVIDIA/Megatron-LM/blob/d476c21be396dc666d2e04fa8c199c3851a1551f/megatron/core/pipeline_parallel/schedules.py#L863-L870
+        https://github.com/NVIDIA/Megatron-LM/blob/d476c21be396dc666d2e04fa8c199c3851a1551f/megatron/core/distributed/finalize_model_grads.py#L694-L713
+        https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/8e7077c6826d17eb4d4d54e6eb15c5a581eda4c0/src/megatron/bridge/peft/utils.py#L1095-L1114
+        We drop it and replay with ``num_tokens=None``, because one division at the end would average
+        several ``forward_backward`` calls instead of adding them. Each call's gradients are divided by
+        its own count instead; see :meth:`_per_token_grad_scaling` for details.
         """
-        del model, kwargs  # replayed against self.actor_module with default process groups
-        pending = self._pending_grad_sync
-        if pending is not None and pending["num_tokens"] is not None and num_tokens is not None:
-            num_tokens = pending["num_tokens"] + num_tokens
-        self._pending_grad_sync = {"num_tokens": num_tokens}
+        del model, num_tokens, kwargs  # replayed against self.actor_module with default process groups
+        self._pending_grad_sync = {"num_tokens": None}
+
+    @contextmanager
+    def _per_token_grad_scaling(self, num_tokens_global: int):
+        """Apply ``calculate_per_token_loss``'s division by the token count to this call's gradients only.
+
+        ``loss_func`` multiplies each call's loss by that call's global token count N, so the
+        buffer gets N·g from the call. Megatron would divide once at finalize, by the counts summed
+        over every call before the optimizer step. With three calls of N = 100, 200, 300:
+
+            buffer = 100·g1 + 200·g2 + 300·g3, divided by 600
+                   = 1/6·g1 + 1/3·g2 + 1/2·g3        (wrong: a weighted average)
+
+        Instead, scale the buffer by N before the call and by 1/N after it:
+
+            call  enter (×N)      + backward   exit (÷N)   buffer
+            1     0               + 100·g1     ÷100        g1
+            2     200·g1          + 200·g2     ÷200        g1 + g2
+            3     300·(g1+g2)     + 300·g3     ÷300        g1 + g2 + g3
+
+        The finalize replay then runs with ``num_tokens=None`` and doesn't divide, so the result is
+        g1 + g2 + g3. With a single call the enter scaling is a no-op (the buffer is zero).
+
+        Gradients are still local here (the DP/CP reduction runs once, from
+        ``run_pending_grad_sync``), and ``scale_gradients`` is the per-chunk method finalize
+        uses for that division, so it covers the same buffers and needs no collective.
+        """
+        num_tokens_global = max(1, int(num_tokens_global))
+        for chunk in self.actor_module:
+            chunk.scale_gradients(float(num_tokens_global))
+        try:
+            yield
+        finally:
+            for chunk in self.actor_module:
+                chunk.scale_gradients(1.0 / num_tokens_global)
 
     def run_pending_grad_sync(self) -> None:
         """Reduce gradients across DP/TP/PP exactly once for the accumulated window.
@@ -299,13 +344,30 @@ class MegatronModelWrapper:
         return self.forward(*args, **kwargs)
 
     def _assert_vlm_supported(self):
-        """Guard the VLM parallelism constraints carried over from the FSDP path.
+        """Guard the VLM parallelism constraints.
 
-        3D RoPE and multimodal token positions make sample/microbatch packing,
-        context parallelism, and sequence parallelism unsafe for VLMs today.
+        With ``remove_microbatch_padding`` the model receives a [1, T] THD stream and
+        Megatron-Bridge's Qwen3-VL model rebuilds 3D mRoPE positions per packed
+        sub-sequence from ``packed_seq_params`` (``rope.get_rope_index``), without
+        re-packing the stream (NVIDIA-NeMo/Megatron-Bridge#4532). Other VLMs only run
+        unpacked (``model_owns_vlm_packing``).
+
+        Context parallelism: for those models the full packed stream goes to every CP rank
+        (``preprocess_packed_seqs(shard_for_cp=False)``) and the model computes mRoPE,
+        places image features and applies the CP split itself. Its rank-local logits are
+        expected in the same 2*CP zigzag layout SkyRL's packed log-prob gather uses
+        (test_megatron_vlm_cp_vs_no_cp checks this).
         """
-        assert not self.remove_microbatch_padding, "VLM + microbatch padding removal unsupported"
-        assert mpu.get_context_parallel_world_size() == 1, "VLM + context parallelism unsupported"
+        if self.remove_microbatch_padding and not self.model_owns_vlm_packing:
+            model_cls = type(unwrap_model(self.actor_module[0])).__name__
+            raise ValueError(
+                "trainer.remove_microbatch_padding=true (sample packing) is supported for VLMs only on "
+                "Megatron-Bridge's Qwen3VLModel (Qwen3-VL, Qwen3.5-VL), which rebuilds mRoPE positions per "
+                f"packed sample; got {model_cls}. Set trainer.remove_microbatch_padding=false."
+            )
+        # CP needs packing (validate_megatron_cfg), so the check above also limits VLM CP to models that
+        # apply the CP split themselves (shard_for_cp=False below relies on it). MTP with CP is refused in
+        # validate_megatron_cfg too.
         assert (
             mpu.get_tensor_model_parallel_world_size() == 1 or self.cfg.policy.sequence_parallel_size == 1
         ), "VLM + sequence parallelism unsupported"
@@ -470,6 +532,10 @@ class MegatronModelWrapper:
                     sub_seq_lengths=sub_seq_lengths,
                     fp8_enabled=fp8_enabled,
                     fp8_recipe=fp8_recipe,
+                    # Qwen3VLModel needs the full stream on every CP rank to compute mRoPE and place
+                    # image features, then applies the CP split itself (see preprocess_packed_seqs).
+                    # Other models get SkyRL's per-rank split, which GPTModel requires.
+                    shard_for_cp=not self.model_owns_vlm_packing,
                 )
                 batch["packed_seq_params"] = packed_seq_params
                 batch["packed_targets"] = _build_packed_targets(
@@ -628,6 +694,7 @@ class MegatronModelWrapper:
         # (with the trunk input detached) for us to score. Training only.
         model_config = get_model_config(self.actor_module[0])
         mtp_enabled = (not forward_only) and bool(getattr(model_config, "mtp_num_layers", None))
+        per_token_loss = self._per_token_loss
         # Defaults live on the MegatronConfig dataclass (config.py) -- read the fields directly
         # rather than restating them in getattr fallbacks that could drift.
         mcfg = self.cfg.policy.megatron_config
@@ -671,15 +738,37 @@ class MegatronModelWrapper:
             rollout_action_logprobs = data["rollout_action_logprobs"]
             response_mask = data.get("response_mask")
             num_microbatches = data.get("num_microbatches")
-            # Number of microbatches carrying real samples (excludes fully-padding
-            # microbatches added by token-based batching). Used to normalize the
-            # KL/entropy terms over real microbatches only. Falls back to
-            # num_microbatches when not provided (no padding microbatches).
-            num_real_microbatches = data.get("num_real_microbatches", num_microbatches)
+            normalization: MinibatchLossNormalization = data[MINIBATCH_LOSS_NORMALIZATION]
 
             dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
             tp_grp = mpu.get_tensor_model_parallel_group()
             tp_rank = mpu.get_tensor_model_parallel_rank()
+
+            # Policy, KL, entropy and MTP losses are normalized over the optimizer step, so
+            # undo Megatron's gradient averaging to sum their contributions across microbatches.
+            if per_token_loss:
+                # calculate_per_token_loss: the schedule leaves a 3-tuple loss unscaled, DDP sums over
+                # DP x CP, and this call's gradients are divided by its global token count
+                # (_per_token_grad_scaling). Multiply by that count (attached by the worker) so the
+                # division cancels, as in verl's Megatron engine.
+                # Forward-only loss passes have no gradient sync, so the counts default there.
+                num_tokens_global = data.get("num_tokens_global", 1)
+                grad_sum_correction_factor = num_tokens_global
+            else:
+                # Default: Megatron divides loss by num_microbatches
+                # (https://github.com/NVIDIA/Megatron-LM/blob/core_v0.15.2/megatron/core/pipeline_parallel/schedules.py#L248)
+                # and the data parallel all-reduce averages gradients across dp_size.
+                # Megatron's schedule separately multiplies loss by the CP size for two-output loss funcs,
+                # so CP ranks are not included in this correction factor.
+                # (https://github.com/NVIDIA/Megatron-LM/blob/core_v0.15.2/megatron/core/distributed/distributed_data_parallel.py#L285)
+                # so we multiply by both factors to recover the correct sum reduction.
+                grad_sum_correction_factor = num_microbatches * dp_size
+
+            def loss_output(loss, metrics):
+                if per_token_loss:
+                    num_tokens_local = data.get("num_tokens_local", 0)
+                    return loss, torch.tensor(num_tokens_local, dtype=torch.int, device=loss.device), metrics
+                return loss, metrics
 
             # Fused LM-head: `logits` is actually decoder hidden states [B, S, H]
             # (the output_processor skipped the projection); fold the LM-head into
@@ -791,8 +880,7 @@ class MegatronModelWrapper:
 
             # Decoupled MTP / draft loss: soft-CE distillation of the detached-input MTP head against
             # the policy's own next-token distribution (full-vocab, or top-k when mtp_loss_topk is
-            # set). The local masked-mean scalar is folded into the loss below like the KL/entropy
-            # aux terms.
+            # set). Each depth's masked sum is normalized over the whole optimizer step, like entropy.
             draft_loss = None
             student_logits_list = data.get("mtp_student_logits")
             if mtp_enabled and student_logits_list:
@@ -801,7 +889,9 @@ class MegatronModelWrapper:
                 # MTP roll/mask respect sub-sequence boundaries (see shift_mask_for_mtp). Otherwise the
                 # [batch, seq] attention mask aligns with the de-padded logits.
                 packed = packed_seq_params is not None
-                draft_mask = (data["mtp_packed_mask"] if packed else data["attention_mask"]).to(logits.dtype)
+                draft_mask = (
+                    data["mtp_packed_mask"] if packed else data["attention_mask"] & data[REAL_SAMPLE_MASK][:, None]
+                ).to(logits.dtype)
                 mtp_cu_seqlens = packed_seq_params.cu_seqlens_q_padded if packed else None
                 vocab_size_tp = logits.shape[-1]
                 # Undo the in-place temperature scaling so the teacher is the true policy distribution.
@@ -821,6 +911,9 @@ class MegatronModelWrapper:
                     if true_shard_width != vocab_size_tp:
                         student_logits = student_logits[..., :true_shard_width]
                     layer_mask = shift_mask_for_mtp(draft_mask, layer_idx, cu_seqlens=mtp_cu_seqlens)
+                    num_layer_tokens = torch.tensor(
+                        normalization.num_mtp_tokens(layer_idx + 1), dtype=torch.float32, device=layer_mask.device
+                    )
                     if mtp_loss_topk:
                         # Top-k draft loss: O(seq*k) memory, no full-vocab softmax. Pass the un-rolled
                         # policy logits + roll_shift so top-k runs on them directly and only the small
@@ -833,6 +926,7 @@ class MegatronModelWrapper:
                                 k=mtp_loss_topk,
                                 vocab_parallel_group=tp_grp,
                                 roll_shift=layer_idx + 1,
+                                global_normalization_factor=num_layer_tokens,
                             )
                         )
                     else:
@@ -844,6 +938,7 @@ class MegatronModelWrapper:
                                 layer_mask,
                                 vocab_parallel_group=tp_grp,
                                 chunk_size=mtp_loss_chunk_size,
+                                global_normalization_factor=num_layer_tokens,
                             )
                         )
                 draft_loss = torch.stack(per_layer_losses).mean()
@@ -856,19 +951,9 @@ class MegatronModelWrapper:
             if resolved_loss_name == "cross_entropy":
                 # Policy loss masks are pre-scaled to achieve the correct reduction
                 # when summing across the entire minibatch (see `DefaultCollator`).
-                # Megatron divides loss by num_microbatches
-                # (https://github.com/NVIDIA/Megatron-LM/blob/core_v0.15.2/megatron/core/pipeline_parallel/schedules.py#L248)
-                # and the data parallel all-reduce averages gradients across dp_size.
-                # Megatron's schedule separately multiplies loss by the CP size for two-output loss funcs,
-                # so CP ranks are not included in this correction factor.
-                # (https://github.com/NVIDIA/Megatron-LM/blob/core_v0.15.2/megatron/core/distributed/distributed_data_parallel.py#L285)
-                # so we multiply by both factors to recover the correct sum reduction.
-                grad_sum_correction_factor = num_microbatches * dp_size
                 loss = policy_loss * grad_sum_correction_factor
-                # Fold the per-token-mean MTP/draft loss in with the same micro-batch correction as the RL path.
                 if draft_loss is not None:
-                    kl_entropy_microbatch_scale = num_microbatches / max(1, num_real_microbatches)
-                    loss = loss + mtp_loss_weight * draft_loss * kl_entropy_microbatch_scale
+                    loss = loss + mtp_loss_weight * draft_loss * grad_sum_correction_factor
                 unscaled_loss = policy_loss
 
                 # Only build per-token outputs for callers that consume them.
@@ -919,7 +1004,7 @@ class MegatronModelWrapper:
                 }
                 if draft_loss is not None:
                     metrics["mtp_loss"] = draft_loss.detach().item()
-                return loss, metrics
+                return loss_output(loss, metrics)
 
             # RL path: add optional KL/entropy terms
             with torch.set_grad_enabled(loss_config.use_entropy_loss):
@@ -980,6 +1065,8 @@ class MegatronModelWrapper:
                     entropy = masked_mean(entropy_BS, loss_mask)
                     entropy_for_loss = entropy
 
+            entropy = normalization.token_mean_contribution(entropy, loss_mask)
+            entropy_for_loss = normalization.token_mean_contribution(entropy_for_loss, loss_mask)
             if loss_config.use_entropy_loss:
                 entropy_loss_term = entropy_for_loss * loss_config.entropy_loss_coef
             else:
@@ -992,41 +1079,18 @@ class MegatronModelWrapper:
                     loss_mask=loss_mask,
                     kl_estimator_type=loss_config.kl_estimator_type,
                 )
-                kl_loss = masked_mean(kl_loss, loss_mask, dim=-1).mean()
+                kl_loss = normalization.sequence_mean_contribution(
+                    masked_mean(kl_loss, loss_mask, dim=-1), data[REAL_SAMPLE_MASK]
+                )
             else:
                 kl_loss = torch.tensor(0.0, device=logits.device)
             kl_loss_term = kl_loss * loss_config.kl_loss_coef
 
             # Policy losses are pre-scaled to achieve the correct loss_reduction
             # when summing across the entire minibatch (see `apply_loss_reduction_to_advantages_minibatch`).
-            # Megatron divides loss by num_microbatches
-            # (https://github.com/NVIDIA/Megatron-LM/blob/core_v0.15.2/megatron/core/pipeline_parallel/schedules.py#L248)
-            # and the data parallel all-reduce averages gradients across dp_size.
-            # Megatron's schedule separately multiplies loss by the CP size for two-output loss funcs,
-            # so CP ranks are not included in this correction factor.
-            # (https://github.com/NVIDIA/Megatron-LM/blob/core_v0.15.2/megatron/core/distributed/distributed_data_parallel.py#L285)
-            # so we multiply by both factors to recover the correct sum reduction.
-            grad_sum_correction_factor = num_microbatches * dp_size
-
-            # NOTE: The KL and entropy loss terms are not pre-scaled,
-            # so we just average them across microbatches and DP workers.
-            # KL and entropy use Megatron's existing microbatch and CP schedule scaling.
-            # Megatron divides by num_microbatches (which includes fully-padding microbatches
-            # added by token-based batching). Those padding microbatches contribute 0 to
-            # KL/entropy, so dividing by the full count would dilute the regularization by
-            # num_real/num_total. Scale up by num_microbatches/num_real_microbatches so the
-            # terms are averaged over real microbatches only (no-op when there is no padding).
-            kl_entropy_microbatch_scale = num_microbatches / max(1, num_real_microbatches)
-            loss = (
-                policy_loss * grad_sum_correction_factor
-                + (kl_loss_term - entropy_loss_term) * kl_entropy_microbatch_scale
-            )
-            # The decoupled MTP/draft loss is a per-token mean (like KL/entropy), so fold it in with
-            # the same micro-batch correction. Its gradient only reaches the MTP-head parameters: the
-            # trunk hidden states, the re-embedding, the output weight and the teacher distribution
-            # are all detached.
+            loss = (policy_loss + kl_loss_term - entropy_loss_term) * grad_sum_correction_factor
             if draft_loss is not None:
-                loss = loss + mtp_loss_weight * draft_loss * kl_entropy_microbatch_scale
+                loss = loss + mtp_loss_weight * draft_loss * grad_sum_correction_factor
             unscaled_loss = loss / grad_sum_correction_factor
 
             # Build per-sequence loss_fn_outputs with logprobs.
@@ -1063,7 +1127,7 @@ class MegatronModelWrapper:
             metrics.update(
                 compute_minibatch_rollout_logprob_diff_metrics(action_log_probs, rollout_action_logprobs, loss_mask)
             )
-            return loss, metrics
+            return loss_output(loss, metrics)
 
         def forward_step(batch_iter, model):
             # NOTE(Charlie): despite the name, methods like `remove_left_padding()` are padding-agnostic
@@ -1113,6 +1177,10 @@ class MegatronModelWrapper:
                     sub_seq_lengths=sub_seq_lengths,
                     fp8_enabled=fp8_enabled,
                     fp8_recipe=fp8_recipe,
+                    # Qwen3VLModel needs the full stream on every CP rank to compute mRoPE and place
+                    # image features, then applies the CP split itself (see preprocess_packed_seqs).
+                    # Other models get SkyRL's per-rank split, which GPTModel requires.
+                    shard_for_cp=not self.model_owns_vlm_packing,
                 )
                 batch["packed_seq_params"] = packed_seq_params
                 batch["packed_targets"] = _build_packed_targets(
@@ -1253,7 +1321,10 @@ class MegatronModelWrapper:
                 if self.remove_microbatch_padding:
                     batch["mtp_student_logits"] = student_logits
                     batch["mtp_packed_mask"] = _build_packed_valid_mask(
-                        attention_mask, packed_seq_params, sub_seq_lengths=sub_seq_lengths
+                        attention_mask,
+                        packed_seq_params,
+                        batch[REAL_SAMPLE_MASK],
+                        sub_seq_lengths=sub_seq_lengths,
                     )
                 else:
                     batch["mtp_student_logits"] = [depad(sl) for sl in student_logits]
@@ -1267,7 +1338,12 @@ class MegatronModelWrapper:
         batch_generator = make_batch_generator(micro_batches, vpp_size=len(self.actor_module))
 
         replay_enabled = any(batch["rollout_expert_indices"] is not None for batch in micro_batches)
-        with router_replay_schedule(replay_enabled):
+        grad_scaling = (
+            self._per_token_grad_scaling(micro_batches[0]["num_tokens_global"])
+            if per_token_loss and not forward_only
+            else nullcontext()
+        )
+        with router_replay_schedule(replay_enabled), grad_scaling:
             metrics_list = forward_backward_func(
                 forward_step_func=forward_step,
                 data_iterator=batch_generator,
