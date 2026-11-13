@@ -2,6 +2,7 @@
 uv  run --isolated --extra dev pytest tests/train/test_trainer.py
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -10,16 +11,19 @@ import torch
 from jaxtyping import Float, Integer
 from pytest import approx
 
-from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
-from skyrl.backends.skyrl_train.utils.sample_support import (
-    SAMPLE_SUPPORT_DTYPE,
-    SAMPLE_SUPPORT_PADDING,
+from skyrl.backends.skyrl_train.training_batch import (
+    TrainingInputBatch,
+    pad_training_input_batch,
+)
+from skyrl.backends.skyrl_train.utils.loss_normalization import (
+    MinibatchLossNormalization,
 )
 from skyrl.backends.skyrl_train.workers.worker import CriticWorkerBase, PolicyWorkerBase
 from skyrl.backends.skyrl_train.workers.worker_utils import BatchIterator
 from skyrl.train.config import SkyRLTrainConfig
 from skyrl.train.trainer import RayPPOTrainer
 from skyrl.train.utils.utils import validate_batch_sizes
+from tests.backends.skyrl_train.sample_support_helpers import csr
 from tests.train.util import example_dummy_config
 
 
@@ -131,15 +135,15 @@ def test_convert_to_training_input_records_sample_support_metrics(dummy_config, 
     )
     trainer.dispatch = MagicMock()
     trainer.dispatch.get_lcm_dp_size.return_value = 1
-    padding_row = [SAMPLE_SUPPORT_PADDING] * 4
+    padding_row = [-1] * 4
     generator_output = {
         "prompt_token_ids": [[1, 2], [3]],
         "response_ids": [[4, 5, 6], [7, 8]],
         "rewards": [[0.0, 0.0, 1.0], [0.0, 1.0]],
         "loss_masks": [[1, 1, 0], [1, 1]],
         "rollout_sample_support": [
-            np.array([[4, 14, -1, -1], [5, 15, 25, 35], padding_row], dtype=SAMPLE_SUPPORT_DTYPE),
-            np.array([[7, -1, -1, -1], [8, 18, 28, -1]], dtype=SAMPLE_SUPPORT_DTYPE),
+            csr([[4, 14, -1, -1], [5, 15, 25, 35], padding_row]),
+            csr([[7, -1, -1, -1], [8, 18, 28, -1]]),
         ],
     }
 
@@ -362,40 +366,6 @@ def test_run_flushes_pending_metrics_before_logging_exception():
     assert ordered_calls == ["flush_pending_metrics", "tracker.log_exception"]
     trainer.tracker.log_exception.assert_called_once()
     assert trainer.tracker.log_exception.call_args.kwargs["step"] == 7
-
-
-def test_micro_batches_accumulated_initialized():
-    """Test that _micro_batches_accumulated is initialized to 0 in worker __init__."""
-
-    # Create minimal worker instances for testing
-    class TestCriticWorker(CriticWorkerBase):
-        def init_model(self, *args, **kwargs):
-            pass
-
-        def offload_to_cpu(self, offload_optimizer=True, offload_model=True):
-            pass
-
-        def backload_to_gpu(self, backload_optimizer=True, backload_model=True):
-            pass
-
-        def _forward_micro_batch(self, micro_batch):
-            pass
-
-    cfg = SkyRLTrainConfig()
-    cfg.trainer.algorithm.policy_loss_type = "regular"
-
-    # CriticWorker has _micro_batches_accumulated initialized at construction
-    critic_worker = TestCriticWorker(
-        cfg=cfg.trainer,
-        world_size=4,
-        rank=0,
-        local_rank=0,
-        master_addr="localhost",
-        master_port=12345,
-        sequence_parallel_size=1,
-    )
-    assert hasattr(critic_worker, "_micro_batches_accumulated")
-    assert critic_worker._micro_batches_accumulated == 0
 
 
 def test_validate_batch_sizes():
@@ -635,7 +605,7 @@ def test_forward_backward_batch_calculations():
     policy_forward_backward_micro_calls = []
 
     def mock_policy_forward_backward_micro(
-        experience, microbatch_weight, loss_fn=None, loss_fn_config=None, return_per_token_outputs=True
+        experience, loss_normalization, loss_fn=None, loss_fn_config=None, return_per_token_outputs=True
     ):
         policy_forward_backward_micro_calls.append(experience)
         return {"policy_loss": 0.5, "ppo_clip_ratio": 0.1, "policy_entropy": 2.0, "response_length": response_length}
@@ -650,7 +620,7 @@ def test_forward_backward_batch_calculations():
     expected_micro_batches = len(dataloader)  # Should be 6
 
     # Run forward_backward
-    with (patch("torch.distributed.barrier"),):
+    with patch("torch.distributed.barrier"), patch("torch.cuda.current_device", return_value="cpu"):
         result = policy_worker.forward_backward(dummy_databatch)
 
     # Verify Policy Worker Results
@@ -664,29 +634,23 @@ def test_forward_backward_batch_calculations():
     # Test CriticWorkerBase with same pattern
     critic_worker = create_test_worker(CriticWorkerBase)
 
-    # Reset _micro_batches_accumulated (initialized in __init__, reset here for test isolation)
-    critic_worker._micro_batches_accumulated = 0
-
     # Mock _forward_backward_micro for critic
     critic_forward_backward_micro_calls = []
 
-    def mock_critic_forward_backward_micro(experience, loss_fn=None, loss_fn_config=None):
+    def mock_critic_forward_backward_micro(experience, loss_normalization):
         critic_forward_backward_micro_calls.append(experience)
         return {"critic_loss": 0.3, "values_mean": 1.0}
 
     critic_worker._forward_backward_micro = mock_critic_forward_backward_micro
 
     # Run forward_backward for critic
-    with (patch("torch.distributed.barrier"),):
+    with patch("torch.distributed.barrier"), patch("torch.cuda.current_device", return_value="cpu"):
         result = critic_worker.forward_backward(dummy_databatch)
 
     # Verify Critic Worker Results
     assert (
         len(critic_forward_backward_micro_calls) == expected_micro_batches
     ), f"CriticWorker: Expected {expected_micro_batches} _forward_backward_micro calls, got {len(critic_forward_backward_micro_calls)}"
-
-    # Verify _micro_batches_accumulated is set correctly
-    assert critic_worker._micro_batches_accumulated == expected_micro_batches
 
     # Verify result structure for critic
     assert "critic_loss" in result.metrics
@@ -733,3 +697,68 @@ def test_validate_batch_sizes_lcm_dp_requirement():
     # Pass: ref disabled -> requirement reduces to policy_dp. With policy_dp=2, tbs=2 is valid.
     cfg = create_config(train_batch_size=2, policy_dp=2, ref_dp=3, include_ref=False)
     validate_batch_sizes(cfg)
+
+
+@pytest.mark.parametrize(
+    "role, tp, ep, etp, expert_grid",
+    [
+        ("policy", 1, 1, None, None),
+        ("policy", 1, 8, None, 8),  # run_codecontests.sh's old MEGATRON_EP default on 2 GPUs
+        ("policy", 2, 1, None, None),  # an unset etp is tp: 2 * 1 * 1 divides 2
+        ("policy", 2, 2, None, 4),  # ... so ep=2 next to tp=2 needs 4 GPUs
+        ("policy", 2, 2, 1, None),  # an explicit etp=1 decouples the expert grid from tp
+        ("ref", 1, 8, None, 8),
+    ],
+)
+def test_validate_batch_sizes_megatron_expert_grid(role, tp, ep, etp, expert_grid):
+    """On 2 GPUs, Megatron's expert grid (pp * ep * etp) must divide the world size like the dense one,
+    for a dense model too; ``expert_grid`` is the size the error names, None when the layout is valid."""
+    cfg = SkyRLTrainConfig()
+    cfg.trainer.strategy = "megatron"
+    cfg.trainer.train_batch_size = cfg.trainer.policy_mini_batch_size = 4
+    cfg.trainer.micro_train_batch_size_per_gpu = cfg.trainer.micro_forward_batch_size_per_gpu = 1
+    cfg.trainer.placement.policy_num_gpus_per_node = cfg.trainer.placement.ref_num_gpus_per_node = 2
+    cfg.trainer.critic.model.path = None
+    cfg.trainer.algorithm.use_kl_loss = role == "ref"
+    cfg.generator.n_samples_per_prompt = 1
+    megatron_config = getattr(cfg.trainer, role).megatron_config
+    megatron_config.tensor_model_parallel_size = tp
+    megatron_config.expert_model_parallel_size = ep
+    megatron_config.expert_tensor_parallel_size = etp
+
+    if expert_grid is None:
+        validate_batch_sizes(cfg)
+    else:
+        with pytest.raises(
+            ValueError,
+            match=rf"world_size 2 should be divisible by Megatron's expert grid \(pp \* ep \* etp\) {expert_grid}\. "
+            rf"trainer\.{role}\.megatron_config\.expert_model_parallel_size",
+        ):
+            validate_batch_sizes(cfg)
+
+
+def test_batch_advantage_normalization_ignores_padding_rows():
+    """The z-score covers real response tokens only, so DP padding rows don't move it."""
+    cfg = SkyRLTrainConfig()
+    cfg.trainer.algorithm.advantage_batch_normalize = True
+    cfg.trainer.algorithm.loss_reduction = "token_mean"
+    trainer = SimpleNamespace(cfg=cfg)
+    data = TrainingInputBatch(
+        {
+            "sequences": torch.zeros(3, 4, dtype=torch.long),
+            "attention_mask": torch.ones(3, 4, dtype=torch.long),
+            "advantages": torch.tensor([[1.0, 1.0], [-2.0, 0.0], [4.0, 4.0]]),
+            "response_mask": torch.tensor([[1, 1], [1, 0], [1, 1]]),
+            "loss_mask": torch.tensor([[1, 1], [1, 0], [1, 1]]),
+        }
+    )
+    padded = pad_training_input_batch(data, 2)
+
+    def normalize(batch):
+        normalization = MinibatchLossNormalization.from_batch(batch)
+        return RayPPOTrainer._normalize_advantages(trainer, batch, [(0, len(batch))], [normalization])["advantages"]
+
+    torch.testing.assert_close(normalize(padded)[:3], normalize(data))
+    real = data["advantages"][data["response_mask"].bool()]
+    expected = (real - real.mean()) / real.std(unbiased=False) / data["loss_mask"].sum()
+    torch.testing.assert_close(normalize(data)[data["response_mask"].bool()], expected)

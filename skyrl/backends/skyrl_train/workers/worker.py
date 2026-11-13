@@ -16,8 +16,10 @@ from loguru import logger
 from omegaconf import OmegaConf
 from ray import ObjectRef
 from ray.util.placement_group import (
+    PlacementGroup,
     placement_group,
     placement_group_table,
+    remove_placement_group,
 )
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from torch.optim import Optimizer
@@ -41,18 +43,29 @@ from skyrl.backends.skyrl_train.training_batch import (
     TrainingOutputBatch,
 )
 from skyrl.backends.skyrl_train.utils.io import io
+from skyrl.backends.skyrl_train.utils.loss_normalization import (
+    MinibatchLossNormalization,
+)
 from skyrl.backends.skyrl_train.utils.ppo_utils import (
     PolicyLossRegistry,
+    PolicyLossType,
     compute_approx_kl,
     ppo_critic_loss,
+    score_centering_weight,
 )
 from skyrl.backends.skyrl_train.utils.profiler import Profiler
-from skyrl.backends.skyrl_train.utils.sample_support import SAMPLE_SUPPORT_FIELD
+from skyrl.backends.skyrl_train.utils.sample_support import (
+    SAMPLE_SUPPORT_FIELD,
+    SCORE_CENTERING_SCORES_KEY,
+)
+from skyrl.backends.skyrl_train.utils.sample_support_replay import (
+    score_centering_loss_inputs,
+    score_centering_metrics,
+)
 from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
 from skyrl.backends.skyrl_train.workers.worker_utils import (
     BaseBatchIterator,
     BatchIterator,
-    TokenBasedBatchIterator,
     all_reduce_metrics,
     compute_minibatch_rollout_logprob_diff_metrics,
     get_microbatch_iterator,
@@ -62,17 +75,53 @@ from skyrl.env_vars import (
     SKYRL_RAY_PG_TIMEOUT_IN_S,
     SKYRL_WORKER_NCCL_TIMEOUT_IN_S,
 )
+from skyrl.tinker import types as tinker_types
 from skyrl.train.config import TorchProfilerConfig, TrainerConfig
 from skyrl.train.dataset.replay_buffer import Experience
 from skyrl.train.utils import deadline
 from skyrl.train.utils.utils import (
     ResolvedPlacementGroup,
+    cleanup_on_error,
     configure_ray_worker_logging,
     get_ray_pg_ready_with_timeout,
     ray_noset_visible_devices,
 )
 
 _SET_AFFINITY = False
+
+
+def _apply_adam_params_to_group(param_group: dict, adam_params: tinker_types.AdamParams) -> None:
+    """Write the request's AdamParams into one optimizer param group.
+
+    Every Adam implementation in play (torch's eager and fused, Megatron's, apex's)
+    reads ``lr``/``betas``/``eps``/``weight_decay`` from the group inside ``step()``,
+    so per-step writes take effect without touching the optimizer objects.
+    ``weight_decay`` is only written where the optimizer already decays at build time,
+    so groups excluded from decay (e.g. Megatron's no-decay groups, ``wd_mult == 0``)
+    keep their ``0`` instead of decaying by the request's value. Whether a group
+    decays is a build-time decision, so it is latched here on the first visit: a
+    request's ``weight_decay=0`` zeroes a decaying group for that step only and later
+    requests can decay again, while structurally no-decay groups stay ``0`` forever.
+    """
+    param_group["lr"] = adam_params.learning_rate
+    param_group["betas"] = (adam_params.beta1, adam_params.beta2)
+    param_group["eps"] = adam_params.eps
+    if "skyrl_decaying_group" not in param_group:
+        # Megatron's structural exclusion lives in wd_mult: bias and 1-shape groups get 0.0
+        # while every group's weight_decay holds the same build-time default until the param
+        # scheduler folds wd_mult into it (after optimizer.step). A torch-built group carries
+        # no wd_mult; there the build-time weight_decay is the decision.
+        param_group["skyrl_decaying_group"] = (
+            param_group["wd_mult"] != 0.0 if "wd_mult" in param_group else bool(param_group["weight_decay"])
+        )
+    if param_group["skyrl_decaying_group"]:
+        param_group["weight_decay"] = adam_params.weight_decay
+
+
+# Allocation/free events kept in the ``record_memory`` history ring buffer. Live
+# blocks in a snapshot keep their allocation stacks regardless of this cap; it
+# bounds only the event trace, which otherwise grows without limit over a run.
+MEMORY_HISTORY_MAX_ENTRIES = 100_000
 
 if TYPE_CHECKING:
     from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
@@ -108,7 +157,7 @@ class DistributedTorchRayActor:
 
         self.record_memory = record_memory
         if record_memory:
-            torch.cuda.memory._record_memory_history()
+            torch.cuda.memory._record_memory_history(max_entries=MEMORY_HISTORY_MAX_ENTRIES)
 
         # Redirect worker output to log file (infra logs shouldn't pollute driver stdout)
         from skyrl.train.utils.ray_logging import redirect_actor_output_to_file
@@ -412,6 +461,10 @@ class Worker(DistributedTorchRayActor):
         """Return this rank's last-window kernel summary, or None."""
         return self.profiler.get_kernel_summary() if self.profiler is not None else None
 
+    def get_device_name(self) -> str:
+        """Returns this worker's CUDA device name, e.g. ``"NVIDIA B200"``, or ``""`` without a GPU."""
+        return torch.cuda.get_device_name() if torch.cuda.is_available() else ""
+
     def _get_module_for_offload(self):
         """Return the model module(s) to be offloaded/backloaded. Megatron offloads `self.actor_module`. FSDP workers use `self.model` directly."""
         return self.model
@@ -688,6 +741,12 @@ class Worker(DistributedTorchRayActor):
         if finalize is not None:
             finalize()
 
+    def release_optimizer_state_files(self):
+        """Delete optimizer state kept in files (Megatron ``optimizer_offload_to_disk``) at the end of training."""
+        release = getattr(self.strategy, "release_optimizer_state_files", None)
+        if release is not None and getattr(self, "optimizer", None) is not None:
+            release(self.optimizer)
+
     def load_checkpoint(self, ckpt_dir: str, load_optimizer_states: bool = True, load_lr_scheduler_states: bool = True):
         _, states = self.strategy.load_checkpoint(
             model=self.model,
@@ -716,18 +775,27 @@ class Worker(DistributedTorchRayActor):
             return None
         return self.optimizer.param_groups[0]["lr"]
 
-    def set_lr(self, learning_rate: float) -> None:
-        """
-        Set learning rate for the optimizer.
+    def set_optimizer_hparams(self, adam_params: tinker_types.AdamParams) -> None:
+        """Apply the request's ``AdamParams`` to the live optimizer before each ``optim_step``.
 
-        This directly updates the optimizer's param_groups, bypassing the scheduler.
-        Useful for external learning rate schedules (e.g., from Tinker). No-op when
-        ``policy.inference_only_init=True`` (no optimizer constructed).
+        ``lr``, ``betas``, ``eps`` and ``weight_decay`` live in the optimizer's param groups,
+        and every Adam implementation reads them from there on each step, so writing the
+        groups is all that is needed for the request's values to take effect.
+        ``weight_decay`` is only written where the optimizer already decays: groups excluded
+        at build time (e.g. Megatron's no-decay groups) keep their ``0``. ``grad_clip_norm``
+        (``0.0`` disables clipping, as in the Tinker SDK) is written wherever the backend
+        reads its per-step clip: an FSDP strategy clips with ``self.strategy.max_norm``,
+        and the Megatron worker overrides this method for its optimizer configs.
+        No-op when the worker was initialized with ``policy.inference_only_init=True``
+        (no optimizer constructed).
         """
         if self.optimizer is None:
             return
         for param_group in self.optimizer.param_groups:
-            param_group["lr"] = learning_rate
+            _apply_adam_params_to_group(param_group, adam_params)
+        # Only the FSDP strategies expose a per-step max_norm; other strategies clip elsewhere.
+        if hasattr(getattr(self, "strategy", None), "max_norm"):
+            self.strategy.max_norm = adam_params.grad_clip_norm
 
 
 # adapted from OpenReasonerZero: https://github.com/Open-Reasoner-Zero/Open-Reasoner-Zero/blob/main/orz/ppo/actors.py
@@ -779,7 +847,11 @@ class PPORayActorGroup:
         self.sequence_parallel_size = sequence_parallel_size
         self.record_memory = record_memory
         self._last_dp_size: Optional[int] = None
-        self._initiate_actors(pg, num_gpus_per_actor)
+        self._actor_handlers = []
+        self.actor_infos = []
+        self._internal_pg: Optional[PlacementGroup] = None
+        with cleanup_on_error(self.shutdown, "Shutting down the actor group"):
+            self._initiate_actors(pg, num_gpus_per_actor)
 
     def _initiate_actors(self, pg: Optional[ResolvedPlacementGroup], num_gpus_per_actor: float):
         """Initialize Ray actors in the worker group.
@@ -822,6 +894,7 @@ class PPORayActorGroup:
 
             raw_pg = placement_group(bundles, strategy="PACK")
             get_ray_pg_ready_with_timeout(raw_pg, timeout=SKYRL_RAY_PG_TIMEOUT_IN_S)
+            self._internal_pg = raw_pg
 
         def _scheduling_strategy_for_rank(rank):
             if reordered_bundle_indices:
@@ -893,6 +966,16 @@ class PPORayActorGroup:
         if self.actor_infos:
             self._last_dp_size = self.actor_infos[0].rank.dp_size
         logger.info(f"Mesh Ranks: {[actor_info.rank for actor_info in self.actor_infos]}")
+
+    def shutdown(self) -> None:
+        """Kill the workers and remove the placement group this group created, if any."""
+        for actor in self._actor_handlers:
+            ray.kill(actor)
+        self._actor_handlers = []
+        self.actor_infos = []
+        if self._internal_pg is not None:
+            remove_placement_group(self._internal_pg)
+            self._internal_pg = None
 
     def async_init_model(
         self,
@@ -978,7 +1061,6 @@ class PolicyWorkerBase(Worker):
         self.scheduler: LRScheduler = None
         self.optimizer: Optimizer = None
         self.strategy: DistributedStrategy = None
-        self.record_memory: bool = False
         self.mesh_rank: MeshRank = None
         self.policy_loss_fn: Callable = PolicyLossRegistry.get(self.cfg.algorithm.policy_loss_type)
 
@@ -988,12 +1070,13 @@ class PolicyWorkerBase(Worker):
         loss_fn: Optional[str] = None,
         loss_fn_config: Optional[Dict[str, Any]] = None,
         return_per_token_outputs: bool = True,
+        loss_normalization: Optional[MinibatchLossNormalization] = None,
     ) -> WorkerOutput:
         """
         Perform forward and backward passes for a batch, handling micro-batching internally.
 
         The batch is split into micro batches based on micro_train_batch_size_per_gpu.
-        Gradients accumulate across micro batches. Gradient scaling happens at optim_step.
+        Gradients accumulate with minibatch normalization before optim_step.
 
         Args:
             data: TrainingInputBatch (already DP-sharded by WorkerDispatch/MeshDispatch)
@@ -1004,6 +1087,8 @@ class PolicyWorkerBase(Worker):
             return_per_token_outputs: When False, skip building per-token
                 ``loss_fn_outputs`` (logprobs / elementwise NLL) for callers that
                 consume only scalar ``metrics`` (e.g. the SFT trainer).
+            loss_normalization: Denominators of the optimizer step this call contributes to.
+                Defaults to counting ``data`` as the whole step.
 
         Returns:
             :class:`WorkerOutput` with per-sample ``loss_fn_outputs`` and scalar
@@ -1016,15 +1101,17 @@ class PolicyWorkerBase(Worker):
         )
         all_metrics = defaultdict(list)
         loss_fn_output_batches = []  # per-microbatch; restored to input order below
+        dp_group = self.device_mesh.get_group("dp")
+        if loss_normalization is None:
+            loss_normalization = MinibatchLossNormalization.from_batch(data, dp_group=dp_group)
 
         for microbatch in microbatch_iterator:
             experience = BaseBatchIterator.batch_to_experience(microbatch)
-            microbatch_weight = len(microbatch) / len(data)
             metrics = self._forward_backward_micro(
                 experience,
-                microbatch_weight,
                 loss_fn=loss_fn,
                 loss_fn_config=loss_fn_config,
+                loss_normalization=loss_normalization,
                 return_per_token_outputs=return_per_token_outputs,
             )
 
@@ -1033,16 +1120,6 @@ class PolicyWorkerBase(Worker):
 
             for k, v in metrics.items():
                 all_metrics[k].append(v)
-
-        # Token-based batching packs samples into microbatches out of input order and
-        # appends padding microbatches, so per-sample outputs must be mapped back to
-        # their input positions (and padding entries dropped) before returning.
-        if not any(loss_fn_output_batches):
-            all_loss_fn_outputs = []
-        elif isinstance(microbatch_iterator, TokenBasedBatchIterator):
-            all_loss_fn_outputs = microbatch_iterator.reorder_and_combine_items(loss_fn_output_batches)
-        else:
-            all_loss_fn_outputs = [item for batch in loss_fn_output_batches for item in batch]
 
         # Reduce across microbatches and all-reduce metrics across DP ranks.
         # Loss metrics are pre-scaled sums, so keep the same sum-reduction
@@ -1055,17 +1132,18 @@ class PolicyWorkerBase(Worker):
         # identical on every rank; num_padding_microbatches reports the per-rank average).
         if self.cfg.max_tokens_per_microbatch > 0:
             result["num_microbatches"] = float(len(microbatch_iterator))
-            result["num_padding_microbatches"] = float(getattr(microbatch_iterator, "num_padding_microbatches", 0))
+            result["num_padding_microbatches"] = float(microbatch_iterator.num_padding_microbatches)
 
-        dp_group = self.device_mesh.get_group("dp")
         result = all_reduce_metrics(result, self.strategy, group=dp_group, sum_loss_metrics=True)
 
-        return WorkerOutput(loss_fn_outputs=all_loss_fn_outputs, metrics=result)
+        return WorkerOutput(
+            loss_fn_outputs=microbatch_iterator.reorder_and_combine_items(loss_fn_output_batches), metrics=result
+        )
 
     def _forward_backward_micro(
         self,
         experience: Experience,
-        microbatch_weight: float,
+        loss_normalization: MinibatchLossNormalization,
         loss_fn: Optional[str] = None,
         loss_fn_config: Optional[Dict[str, Any]] = None,
         return_per_token_outputs: bool = True,
@@ -1075,7 +1153,7 @@ class PolicyWorkerBase(Worker):
 
         Args:
             experience: Experience object for one micro batch
-            microbatch_weight: Weight of the micro batch in the overall batch
+            loss_normalization: Global minibatch denominators, shared across microbatches.
             loss_fn: Optional train loss function name to use instead of config default.
                 Public Tinker aliases such as ``ppo`` should be normalized by the backend
                 before reaching the worker.
@@ -1122,6 +1200,13 @@ class PolicyWorkerBase(Worker):
             new_loss_config = OmegaConf.merge(OmegaConf.create(asdict(loss_config)), OmegaConf.create(loss_fn_config))
             # NOTE: users can provide a custom loss config class, so we need to use the same class after applying overrides
             loss_config = type(loss_config).from_dict_config(new_loss_config)
+        centering_weight = (
+            score_centering_weight(resolved_loss_name, loss_config)
+            if self.cfg.algorithm.enable_score_centering
+            else None
+        )
+        # The FSDP forward returns logit positions, so action t is scored one column earlier.
+        action_positions = slice(-num_actions - 1, -1)
 
         # TODO (sumanthrh): don't think this does anything for fsdp rn because autocast happens internally
         with torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
@@ -1139,20 +1224,30 @@ class PolicyWorkerBase(Worker):
                 sample_support=experience.rollout_sample_support if sample_support_replay else None,
                 loss_mask=loss_mask if sample_support_replay else None,
                 enable_sample_support_replay=sample_support_replay,
+                centering_weight=centering_weight,
             )
             # loss function
             # TODO: recompute advantages
+            centering_inputs = None
+            loss_rollout_logprobs, score_centering_kwargs = rollout_action_logprobs, {}
+            if centering_weight is not None:
+                centering_inputs = score_centering_loss_inputs(
+                    output[SCORE_CENTERING_SCORES_KEY], action_positions, rollout_action_logprobs, advantages
+                )
+                loss_rollout_logprobs = centering_inputs.sampler_logprobs
+                score_centering_kwargs = centering_inputs.loss_kwargs()
             policy_loss, loss_metrics = current_loss_fn(
                 action_log_probs,
                 old_action_log_probs,
                 advantages,
                 config=loss_config,
                 loss_mask=loss_mask,
-                rollout_logprobs=rollout_action_logprobs,
+                rollout_logprobs=loss_rollout_logprobs,
+                **score_centering_kwargs,
             )
 
-        # SFT path: skip KL/entropy terms, return per-token outputs for Tinker API
-        if resolved_loss_name == "cross_entropy":
+        # SFT objectives contain their complete loss and need no RL KL/entropy terms.
+        if resolved_loss_name == PolicyLossType.CROSS_ENTROPY:
             # Policy loss masks are pre-scaled to achieve the correct reduction
             # when summing across the entire minibatch (see `DefaultCollator`).
             # FSDP averages loss value over DP ranks by default,
@@ -1216,6 +1311,7 @@ class PolicyWorkerBase(Worker):
                 entropy_BS = output["entropy"]
                 entropy_BS = entropy_BS[:, -num_actions - 1 : -1]
                 entropy = masked_mean(entropy_BS, loss_mask)
+                entropy = loss_normalization.token_mean_contribution(entropy, loss_mask)
 
             if self.cfg.algorithm.use_entropy_loss:
                 entropy_loss_term = entropy * self.cfg.algorithm.entropy_loss_coef
@@ -1230,7 +1326,9 @@ class PolicyWorkerBase(Worker):
                     loss_mask=loss_mask,
                     kl_estimator_type=self.cfg.algorithm.kl_estimator_type,
                 )
-                kl_loss = masked_mean(kl_loss, loss_mask, dim=-1).mean()
+                kl_loss = loss_normalization.sequence_mean_contribution(
+                    masked_mean(kl_loss, loss_mask, dim=-1), experience.real_sample_mask
+                )
             else:
                 kl_loss = torch.tensor(0.0)
             kl_loss_term = kl_loss * self.cfg.algorithm.kl_loss_coef
@@ -1240,9 +1338,7 @@ class PolicyWorkerBase(Worker):
             # dp_size to recover the correct sum reduction across workers.
             grad_sum_correction_factor = self.mesh_rank.dp_size
 
-            # NOTE: The KL and entropy loss terms are not pre-scaled,
-            # so we just average them across microbatches and DP workers.
-            loss = policy_loss * grad_sum_correction_factor + (kl_loss_term - entropy_loss_term) * microbatch_weight
+            loss = (policy_loss + kl_loss_term - entropy_loss_term) * grad_sum_correction_factor
             unscaled_loss = loss / grad_sum_correction_factor
             self.strategy.backward(loss, self.model, self.optimizer)
 
@@ -1276,6 +1372,12 @@ class PolicyWorkerBase(Worker):
             }
             for k, v in loss_metrics.items():
                 status["loss_metrics/" + k] = v
+            if centering_inputs is not None:
+                status.update(
+                    score_centering_metrics(
+                        output[SCORE_CENTERING_SCORES_KEY], centering_inputs, action_positions, loss_mask
+                    )
+                )
             if self.cfg.algorithm.use_kl_loss:
                 status["policy_kl"] = kl_loss.item()
             status.update(
@@ -1566,68 +1668,65 @@ class CriticWorkerBase(Worker):
         self.scheduler: LRScheduler = None
         self.optimizer: Optimizer = None
         self.strategy: DistributedStrategy = None
-        self.record_memory: bool = False
         self.mesh_rank: MeshRank = None
         self.critic_loss_fn: Callable = ppo_critic_loss
-        self._micro_batches_accumulated = 0
 
-    def forward_backward(self, data: TrainingInputBatch) -> WorkerOutput:
+    def forward_backward(
+        self, data: TrainingInputBatch, loss_normalization: Optional[MinibatchLossNormalization] = None
+    ) -> WorkerOutput:
         """
         Perform forward and backward passes for a batch, handling micro-batching internally.
 
         The batch is split into micro batches based on micro_train_batch_size_per_gpu,
         or by token count if max_tokens_per_microbatch is configured.
-        Gradients accumulate across micro batches. Gradient scaling happens at optim_step.
+        Gradients accumulate with minibatch normalization before optim_step.
 
         Args:
             data: TrainingInputBatch (already DP-sharded by WorkerDispatch/MeshDispatch)
+            loss_normalization: Denominators of the optimizer step this call contributes to.
+                Defaults to counting ``data`` as the whole step.
 
         Returns:
             :class:`WorkerOutput` with empty ``loss_fn_outputs`` and scalar
             ``metrics`` (all-reduced across DP).
         """
-        use_token_batching = self.cfg.max_tokens_per_microbatch > 0
         microbatch_iterator = get_microbatch_iterator(
             data,
             micro_batch_size=self.cfg.micro_train_batch_size_per_gpu,
             max_tokens_per_microbatch=self.cfg.max_tokens_per_microbatch,
         )
         all_metrics = defaultdict(list)
+        dp_group = self.device_mesh.get_group("dp")
+        if loss_normalization is None:
+            loss_normalization = MinibatchLossNormalization.from_batch(data, dp_group=dp_group)
 
         for microbatch in microbatch_iterator:
             experience = BaseBatchIterator.batch_to_experience(microbatch)
 
-            if use_token_batching:
-                # With token-based batching, microbatches may have different sizes.
-                # Scale loss by microbatch_weight so gradients are correctly weighted.
-                microbatch_weight = len(microbatch) / len(data)
-                metrics = self._forward_backward_micro(experience, microbatch_weight=microbatch_weight)
-            else:
-                metrics = self._forward_backward_micro(experience)
-                self._micro_batches_accumulated += 1
+            metrics = self._forward_backward_micro(experience, loss_normalization=loss_normalization)
 
             for k, v in metrics.items():
                 all_metrics[k].append(v)
 
         # reduce metrics across micro batches
-        result = reduce_metrics(all_metrics)
+        result = reduce_metrics(all_metrics, sum_loss_metrics=True)
 
         # all reduce metrics across DP workers
-        result = all_reduce_metrics(result, self.strategy)
+        result = all_reduce_metrics(result, self.strategy, group=dp_group, sum_loss_metrics=True)
 
         return WorkerOutput(metrics=result)
 
     def _forward_backward_micro(
-        self, experience: Experience, microbatch_weight: Optional[float] = None
+        self,
+        experience: Experience,
+        loss_normalization: MinibatchLossNormalization,
     ) -> Dict[str, float]:
         """
         Perform forward and backward pass for one micro batch.
 
         Args:
             experience: Experience object for one micro batch
-            microbatch_weight: If provided, scale loss by this weight before backward.
-                Used with token-based batching where microbatches have variable sizes.
-                If None, loss is unscaled (gradient scaling happens at optim_step time).
+            loss_normalization: Global minibatch denominators, shared across microbatches.
 
         Returns:
             All-reduced metrics dict for this micro batch
@@ -1660,14 +1759,13 @@ class CriticWorkerBase(Worker):
                 loss_mask=loss_mask,
             )
 
-        if microbatch_weight is not None:
-            # Token-based batching: scale loss by weight so gradients are properly weighted
-            loss = loss * microbatch_weight
-        # else: NO loss scaling here - gradient scaling happens at optim_step
+        # ppo_critic_loss is a mean of per-row means; synthetic rows contribute zero.
+        unscaled_loss = loss * sequences.shape[0] / max(1.0, loss_normalization.num_sequences)
+        loss = unscaled_loss * self.mesh_rank.dp_size
         self.strategy.backward(loss, self.model, self.optimizer)
 
         status = {
-            "critic_loss": loss.item(),
+            "critic_loss": unscaled_loss.item(),
             "values_mean": masked_mean(values, loss_mask).item(),
             "values_clipfrac": clipfrac,
             "critic_lr": self.scheduler.get_last_lr()[0],
@@ -1677,25 +1775,13 @@ class CriticWorkerBase(Worker):
 
     def optim_step(self) -> float:
         """
-        Scale gradients by 1/micro_batches_accumulated, perform optimizer step, and reset counter.
+        Perform an optimizer step with gradients already normalized over the minibatch.
 
         Returns:
             The gradient norm (before scaling, after clipping)
         """
-        # Scale accumulated gradients by 1/N to get correct average
-        # NOTE: When using token-based batching, loss is pre-scaled by microbatch_weight
-        # in forward_backward, so _micro_batches_accumulated stays 0 and no scaling needed.
-        if self._micro_batches_accumulated > 0:
-            scale = 1.0 / self._micro_batches_accumulated
-            for param in self.model.parameters():
-                if param.grad is not None:
-                    param.grad.mul_(scale)
-
         # Perform optimizer step (includes gradient clipping)
         grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="critic")
-
-        # Reset counter for next accumulation cycle
-        self._micro_batches_accumulated = 0
 
         if grad_norm is not None:
             grad_norm = grad_norm.detach().cpu().item()

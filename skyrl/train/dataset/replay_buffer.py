@@ -14,16 +14,23 @@ import torch
 import torch.nn.functional as F
 from jaxtyping import Bool, Float, Integer
 
-from skyrl.backends.skyrl_train.training_batch import TensorList
+from skyrl.backends.skyrl_train.training_batch import (
+    PACKED_BATCH_FIELD_TYPES,
+    TensorList,
+)
 from skyrl.backends.skyrl_train.utils.packed_tensor import PackedTensor
+from skyrl.backends.skyrl_train.utils.sample_support import PackedSampleSupport
 
 BasicType = Union[int, float, str, bool]
+
+
+_MOVABLE = (torch.Tensor, *PACKED_BATCH_FIELD_TYPES)
 
 
 def to(tensor: Union[torch.Tensor, PackedTensor, List[torch.Tensor], BasicType], device):
     if isinstance(tensor, list):
         return [to(t, device) for t in tensor]
-    elif isinstance(tensor, (torch.Tensor, PackedTensor)):
+    elif isinstance(tensor, _MOVABLE):
         return tensor.to(device)
     else:
         return tensor
@@ -32,7 +39,7 @@ def to(tensor: Union[torch.Tensor, PackedTensor, List[torch.Tensor], BasicType],
 def pin_memory(tensor: Union[torch.Tensor, PackedTensor, List[torch.Tensor], BasicType]):
     if isinstance(tensor, list):
         return [pin_memory(t) for t in tensor]
-    elif isinstance(tensor, (torch.Tensor, PackedTensor)):
+    elif isinstance(tensor, _MOVABLE):
         return tensor.pin_memory()
     else:
         return tensor
@@ -73,8 +80,8 @@ class Experience:
     num_actions: int
     info: Optional[dict]
     router_padding_mask: Optional[Bool[torch.Tensor, "batch seq_len"]] = None
-    # Sampler support packed to response tokens: values [sum(response_len_i), top_k] + cu_seqlens.
-    rollout_sample_support: Optional[PackedTensor] = None
+    # Sampler support packed to response tokens: one CSR row of vocabulary IDs per token.
+    rollout_sample_support: Optional[PackedSampleSupport] = None
     kl: Optional[Float[torch.Tensor, "batch response_len"]] = None
     metadata: Optional[Dict[str, Any]] = None
     pixel_values: Optional[TensorList] = None
@@ -82,10 +89,13 @@ class Experience:
     # Per-row sub-sequence lengths for sequence packing (one 1-D int tensor per
     # packed row); ``None`` when packing is off.
     sub_seq_lengths: Optional[TensorList] = None
+    real_sample_mask: Optional[Bool[torch.Tensor, "batch"]] = None  # noqa: F821
 
     @torch.no_grad()
     def to_device(self, device: torch.device) -> None:
         self.sequences = to(self.sequences, device)
+        if self.real_sample_mask is not None:
+            self.real_sample_mask = self.real_sample_mask.to(device)
         if self.action_log_probs is not None:
             self.action_log_probs = to(self.action_log_probs, device)
         if self.base_action_log_probs is not None:
@@ -119,6 +129,8 @@ class Experience:
 
     def pin_memory(self):
         self.sequences = pin_memory(self.sequences)
+        if self.real_sample_mask is not None:
+            self.real_sample_mask = self.real_sample_mask.pin_memory()
         if self.action_log_probs is not None:
             self.action_log_probs = pin_memory(self.action_log_probs)
         if self.base_action_log_probs is not None:

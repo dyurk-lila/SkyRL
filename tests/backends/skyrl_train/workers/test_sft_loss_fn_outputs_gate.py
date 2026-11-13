@@ -11,6 +11,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from skyrl.backends.skyrl_train.utils.loss_normalization import (
+    MinibatchLossNormalization,
+)
 from skyrl.backends.skyrl_train.utils.ppo_utils import PolicyLossRegistry
 from skyrl.backends.skyrl_train.workers.worker import PolicyWorkerBase
 from skyrl.train.config import SkyRLTrainConfig
@@ -52,6 +55,15 @@ def _make_cpu_policy_worker() -> PolicyWorkerBase:
     return worker
 
 
+_LOSS_NORMALIZATION = MinibatchLossNormalization(
+    num_sequences=BATCH_SIZE,
+    num_loss_tokens=BATCH_SIZE * NUM_ACTIONS,
+    num_model_tokens=BATCH_SIZE * SEQ_LEN,
+    num_segments=BATCH_SIZE,
+    min_segment_length=SEQ_LEN,
+)
+
+
 def _patch_model(worker: PolicyWorkerBase, action_log_probs: torch.Tensor) -> None:
     """Make ``worker.model(...)`` return canned logprobs."""
     model = MagicMock()
@@ -78,17 +90,18 @@ def _make_experience() -> Experience:
     )
 
 
-def _run_forward_backward_micro(return_per_token_outputs=True, loss_fn_config=None):
-    """Drive the train cross_entropy build on CPU."""
+def _run_forward_backward_micro(return_per_token_outputs=True, loss_fn_config=None, loss_fn="cross_entropy"):
+    """Drive an SFT loss build on CPU."""
     worker = _make_cpu_policy_worker()
     action_log_probs = torch.full((BATCH_SIZE, NUM_ACTIONS), -0.5)
     _patch_model(worker, action_log_probs)
     experience = _make_experience()
+    experience.base_action_log_probs = torch.full((BATCH_SIZE, NUM_ACTIONS), -0.6)
     with patch("torch.cuda.current_device", return_value="cpu"), patch("torch.autocast", MagicMock()):
         return worker._forward_backward_micro(
             experience,
-            microbatch_weight=1.0,
-            loss_fn="cross_entropy",
+            loss_normalization=_LOSS_NORMALIZATION,
+            loss_fn=loss_fn,
             loss_fn_config=loss_fn_config,
             return_per_token_outputs=return_per_token_outputs,
         )
@@ -129,13 +142,18 @@ def _run_forward_backward_micro_rl(return_per_token_outputs=True):
     with patch("torch.cuda.current_device", return_value="cpu"), patch("torch.autocast", MagicMock()):
         return worker._forward_backward_micro(
             experience,
-            microbatch_weight=1.0,
+            loss_normalization=_LOSS_NORMALIZATION,
             loss_fn="regular",
             return_per_token_outputs=return_per_token_outputs,
         )
 
 
 class TestForwardBackwardMicroGate:
+    def test_sft_loss_skips_rl_auxiliary_path(self):
+        status = _run_forward_backward_micro(return_per_token_outputs=False, loss_fn="cross_entropy")
+        assert "loss" in status
+        assert "final_loss" not in status
+
     def test_default_keeps_per_token_outputs(self):
         """Default: every sequence carries logprobs + NLL."""
         status = _run_forward_backward_micro(loss_fn_config=None)
